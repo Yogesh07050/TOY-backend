@@ -21,6 +21,8 @@ const roleBody = z.object({
     .max(80)
     .regex(/^[A-Za-z0-9 _-]+$/, 'Use letters, numbers, spaces, hyphens or underscores'),
   description: z.string().trim().max(255).optional().nullable(),
+  // 'shop' roles only take effect for shops the user is a member of (§3.2).
+  scope: z.enum(['global', 'shop']).optional().default('shop'),
   status: z.enum(['active', 'inactive']).optional().default('active'),
   permissionIds: z.array(z.coerce.number().int().positive()).optional().default([]),
 });
@@ -31,6 +33,7 @@ const mapRole = (row) => ({
   id: Number(row.id),
   name: row.name,
   description: row.description,
+  scope: row.scope,
   status: row.status,
   isSystem: Boolean(row.is_system),
   userCount: row.user_count === undefined ? undefined : Number(row.user_count),
@@ -90,8 +93,8 @@ router.post(
 
     const roleId = await transaction(async (connection) => {
       const [result] = await connection.execute(
-        'INSERT INTO roles (name, description, status) VALUES (?, ?, ?)',
-        [name, req.body.description ?? null, req.body.status],
+        'INSERT INTO roles (name, description, scope, status) VALUES (?, ?, ?, ?)',
+        [name, req.body.description ?? null, req.body.scope, req.body.status],
       );
       for (const permissionId of req.body.permissionIds) {
         await connection.execute(
@@ -137,10 +140,12 @@ router.put(
 
     await transaction(async (connection) => {
       await connection.execute(
-        'UPDATE roles SET name = ?, description = ?, status = ? WHERE id = ?',
+        'UPDATE roles SET name = ?, description = ?, scope = ?, status = ? WHERE id = ?',
         [
           req.body.name ? req.body.name.toUpperCase().replace(/\s+/g, '_') : existing.name,
           req.body.description !== undefined ? req.body.description : existing.description,
+          // The scope of a built-in role is part of the security model.
+          existing.is_system ? existing.scope : (req.body.scope ?? existing.scope),
           req.body.status ?? existing.status,
           req.params.id,
         ],

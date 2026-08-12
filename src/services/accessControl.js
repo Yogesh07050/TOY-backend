@@ -1,34 +1,37 @@
 'use strict';
 
 const { query } = require('../db/pool');
-const { SUPER_ADMIN_ROLE } = require('../config/permissions');
+const { SUPER_ADMIN_ROLE, MANAGEMENT_PERMISSIONS } = require('../config/permissions');
 
 /**
  * Resolves everything the authorization layer needs about a user:
  *
- *   - global roles (users -> user_roles -> roles)
- *   - permissions granted by those global roles
- *   - shop memberships, each with the permissions its shop-level role grants
+ *   - roles assigned directly (users -> user_roles -> roles)
+ *   - permissions those roles grant, split by the role's scope
+ *   - shop memberships, each with the permissions that apply there
+ *
+ * Scope is what makes an Admin an admin *of a particular shop* (§3.2):
+ *
+ *   global role -> permissions apply everywhere
+ *   shop role   -> permissions apply only to the shops the user is a member of
+ *
+ * So assigning ADMIN to someone grants nothing until they are also attached to
+ * a shop, and it never leaks rights over shops they have no connection to.
  *
  * Permissions are resolved per request rather than embedded in the JWT so that
- * a revoked role takes effect immediately instead of at token expiry.
+ * a revoked role or a new shop assignment takes effect immediately.
  */
 async function loadAccessContext(userId) {
-  const [roles, globalPermissions, memberships] = await Promise.all([
+  const [roles, memberships] = await Promise.all([
     query(
-      `SELECT r.id, r.name, r.description
+      `SELECT r.id, r.name, r.description, r.scope,
+              GROUP_CONCAT(DISTINCT p.name) AS permissions
          FROM user_roles ur
          JOIN roles r ON r.id = ur.role_id AND r.status = 'active'
-        WHERE ur.user_id = ?`,
-      [userId],
-    ),
-    query(
-      `SELECT DISTINCT p.name
-         FROM user_roles ur
-         JOIN roles r ON r.id = ur.role_id AND r.status = 'active'
-         JOIN role_permissions rp ON rp.role_id = r.id
-         JOIN permissions p ON p.id = rp.permission_id
-        WHERE ur.user_id = ?`,
+         LEFT JOIN role_permissions rp ON rp.role_id = r.id
+         LEFT JOIN permissions p ON p.id = rp.permission_id
+        WHERE ur.user_id = ?
+        GROUP BY r.id, r.name, r.description, r.scope`,
       [userId],
     ),
     query(
@@ -58,6 +61,22 @@ async function loadAccessContext(userId) {
   const roleNames = roles.map((role) => role.name);
   const isSuperAdmin = roleNames.includes(SUPER_ADMIN_ROLE);
 
+  const globalSet = new Set();
+  // Permissions from shop-scoped roles held directly; these are folded into
+  // every membership below rather than granted application-wide.
+  const shopScopedSet = new Set();
+  const shopScopedRoleNames = [];
+
+  for (const role of roles) {
+    const permissions = role.permissions ? role.permissions.split(',') : [];
+    if (role.scope === 'shop') {
+      shopScopedRoleNames.push(role.name);
+      for (const permission of permissions) shopScopedSet.add(permission);
+    } else {
+      for (const permission of permissions) globalSet.add(permission);
+    }
+  }
+
   const shops = memberships.map((row) => ({
     memberId: Number(row.member_id),
     shopId: Number(row.shop_id),
@@ -68,22 +87,40 @@ async function loadAccessContext(userId) {
     designation: row.designation,
     roleId: row.role_id === null ? null : Number(row.role_id),
     roleName: row.role_name,
-    permissions: row.permissions ? row.permissions.split(',') : [],
+    permissions: [
+      ...new Set([...(row.permissions ? row.permissions.split(',') : []), ...shopScopedSet]),
+    ],
   }));
 
-  const globalSet = new Set(globalPermissions.map((row) => row.name));
+  /**
+   * Shop-scoped roles the user holds that cannot take effect yet because they
+   * are not attached to any shop. The UI turns this into an explicit
+   * "you need to be assigned to a shop" message instead of failing silently.
+   */
+  const unassignedShopRoles = shops.length === 0 ? shopScopedRoleNames : [];
+
+  const effectivePermissions = [
+    ...new Set([...globalSet, ...shops.flatMap((shop) => shop.permissions)]),
+  ];
 
   return {
-    roles: roles.map((role) => ({ id: Number(role.id), name: role.name, description: role.description })),
+    roles: roles.map((role) => ({
+      id: Number(role.id),
+      name: role.name,
+      description: role.description,
+      scope: role.scope,
+    })),
     roleNames,
     isSuperAdmin,
     globalPermissions: [...globalSet],
     shops,
     shopIds: shops.map((shop) => shop.shopId),
+    unassignedShopRoles,
     /** Union of global + every shop-scoped permission; used for UI hints only. */
-    effectivePermissions: [
-      ...new Set([...globalSet, ...shops.flatMap((shop) => shop.permissions)]),
-    ],
+    effectivePermissions,
+    /** True when the user administers anything at all. */
+    canAccessAdmin:
+      isSuperAdmin || effectivePermissions.some((name) => MANAGEMENT_PERMISSIONS.includes(name)),
   };
 }
 

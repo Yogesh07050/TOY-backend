@@ -32,6 +32,9 @@ function publicUser(user, context) {
     roles: context.roleNames,
     permissions: context.effectivePermissions,
     isSuperAdmin: context.isSuperAdmin,
+    canAccessAdmin: context.canAccessAdmin,
+    /** Shop-scoped roles that are inert until the user is assigned to a shop. */
+    unassignedShopRoles: context.unassignedShopRoles,
     shops: context.shops.map((shop) => ({
       shopId: shop.shopId,
       shopName: shop.shopName,

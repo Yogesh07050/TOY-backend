@@ -26,6 +26,41 @@ function splitStatements(sql) {
     .filter(Boolean);
 }
 
+/**
+ * `CREATE TABLE IF NOT EXISTS` leaves an existing table untouched, so columns
+ * added to schema.sql after the first deploy need an explicit ALTER. Each patch
+ * is checked against information_schema first, making this safe to re-run.
+ */
+const COLUMN_PATCHES = [
+  {
+    table: 'roles',
+    column: 'scope',
+    sql: "ALTER TABLE roles ADD COLUMN scope ENUM('global','shop') NOT NULL DEFAULT 'shop' AFTER description",
+    // Existing installs pre-date scoping; keep the built-ins behaving correctly.
+    after: [
+      "UPDATE roles SET scope = 'global' WHERE name IN ('SUPER_ADMIN', 'CUSTOMER')",
+      "UPDATE roles SET scope = 'shop' WHERE name = 'ADMIN'",
+    ],
+  },
+];
+
+async function applyPatches(connection, dbName) {
+  const applied = [];
+  for (const patch of COLUMN_PATCHES) {
+    const [rows] = await connection.query(
+      `SELECT 1 FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ? LIMIT 1`,
+      [dbName, patch.table, patch.column],
+    );
+    if (rows.length) continue;
+
+    await connection.query(patch.sql);
+    for (const followUp of patch.after ?? []) await connection.query(followUp);
+    applied.push(`${patch.table}.${patch.column}`);
+  }
+  return applied;
+}
+
 async function main() {
   const connection = await mysql.createConnection({
     host: env.db.host,
@@ -52,8 +87,11 @@ async function main() {
   for (const statement of statements) {
     await connection.query(statement);
   }
-
   console.log(`Applied ${statements.length} statements to \`${dbName}\`.`);
+
+  const patched = await applyPatches(connection, dbName);
+  if (patched.length) console.log(`Patched existing tables: ${patched.join(', ')}.`);
+
   await connection.end();
 }
 

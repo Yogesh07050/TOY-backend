@@ -32,13 +32,27 @@ const PERMISSIONS = {
 
 const PERMISSION_NAMES = Object.keys(PERMISSIONS);
 
-/** Roles created by the seeder. Super Admin implicitly receives every permission. */
+/**
+ * Roles created by the seeder.
+ *
+ * `scope` decides how a role's permissions are applied when it is assigned to a
+ * user directly (via `user_roles`):
+ *
+ *   global - granted application-wide, across every shop
+ *   shop   - granted only for the shops the user is a member of
+ *
+ * ADMIN is deliberately shop-scoped: §3.2 defines an Admin as "a user assigned
+ * to a particular shop", so holding the role must never confer rights over
+ * shops the user has nothing to do with.
+ */
 const SYSTEM_ROLES = {
   SUPER_ADMIN: {
+    scope: 'global',
     description: 'Full access to every feature of the platform',
     permissions: PERMISSION_NAMES,
   },
   ADMIN: {
+    scope: 'shop',
     description: 'Manages offers for the shops they are a member of',
     permissions: [
       'VIEW_OFFERS',
@@ -52,11 +66,42 @@ const SYSTEM_ROLES = {
     ],
   },
   CUSTOMER: {
+    scope: 'global',
     description: 'Discovers and saves offers',
     permissions: ['VIEW_OFFERS', 'VIEW_SHOP'],
   },
 };
 
+/**
+ * Permissions that mean "this person administers something". Used to decide who
+ * may reach the admin area at all, regardless of which shop they hold them for.
+ */
+const MANAGEMENT_PERMISSIONS = [
+  'CREATE_OFFER',
+  'EDIT_OFFER',
+  'DELETE_OFFER',
+  'MANAGE_LOCATIONS',
+  'VIEW_SHOP_MEMBERS',
+  'MANAGE_SHOP_MEMBERS',
+  'VIEW_ANALYTICS',
+  'CREATE_SHOP',
+  'EDIT_SHOP',
+  'DELETE_SHOP',
+  'MANAGE_CATEGORIES',
+  'MANAGE_USERS',
+  'VIEW_USERS',
+  'MANAGE_ROLES',
+  'MANAGE_PERMISSIONS',
+  'MODERATE_REVIEWS',
+  'VIEW_AUDIT_LOGS',
+];
+
 const SUPER_ADMIN_ROLE = 'SUPER_ADMIN';
 
-module.exports = { PERMISSIONS, PERMISSION_NAMES, SYSTEM_ROLES, SUPER_ADMIN_ROLE };
+module.exports = {
+  PERMISSIONS,
+  PERMISSION_NAMES,
+  SYSTEM_ROLES,
+  SUPER_ADMIN_ROLE,
+  MANAGEMENT_PERMISSIONS,
+};

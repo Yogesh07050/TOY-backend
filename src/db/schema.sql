@@ -32,6 +32,10 @@ CREATE TABLE IF NOT EXISTS roles (
   id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   name        VARCHAR(80)     NOT NULL,
   description VARCHAR(255)            DEFAULT NULL,
+  -- 'global' roles grant their permissions application-wide.
+  -- 'shop' roles only ever grant them for the shops the user is a member of,
+  -- which is what makes an Admin an admin *of a particular shop* (§3.2).
+  scope       ENUM('global','shop') NOT NULL DEFAULT 'shop',
   -- system roles cannot be deleted or renamed (SUPER_ADMIN, ADMIN, CUSTOMER)
   is_system   TINYINT(1)      NOT NULL DEFAULT 0,
   status      ENUM('active','inactive') NOT NULL DEFAULT 'active',

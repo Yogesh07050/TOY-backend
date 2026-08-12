@@ -80,6 +80,32 @@ changing the id in the URL — verified by the ownership tests below.
 > on `EDIT_OFFER` / `EDIT_SHOP` / `VIEW_SHOP_MEMBERS` instead. Using a
 > browse-level permission for scoping silently widens access to every shop.
 
+### Role scope — why an Admin is an admin *of a shop*
+
+Every role carries a `scope`:
+
+| scope | permissions apply |
+|---|---|
+| `global` | application-wide, across every shop |
+| `shop` | only to the shops the user is a member of |
+
+`SUPER_ADMIN` and `CUSTOMER` are global. **`ADMIN` is shop-scoped**, because §3.2
+defines an Admin as "a user assigned to a particular shop".
+
+The practical consequence: giving someone the ADMIN role grants nothing on its
+own — they must also be attached to a shop (`shop_members`). Two ways to do it:
+
+- `POST /api/shops/:id/members` — from the shop's side, or
+- `POST /api/users/:id/memberships` — from the user's side, which is what the
+  Users admin screen uses.
+
+Until that happens the API reports the role in `unassignedShopRoles` on
+`/auth/me`, and the UI says so explicitly rather than silently showing the
+person a customer view.
+
+Without scoping, a globally-assigned ADMIN would have passed
+`hasGlobalPermission('EDIT_OFFER')` and gained control of *every* shop.
+
 ### Offer lifecycle
 
 `draft → scheduled → active → expired`, plus manual `deactivated`.
@@ -123,6 +149,7 @@ All routes are under `/api`. Responses are enveloped:
 |---|---|
 | Auth | `POST /auth/register\|login\|logout\|refresh-token\|forgot-password\|reset-password\|verify-email\|resend-verification\|change-password`, `GET /auth/me` |
 | Users | `GET /users`, `GET /users/:id`, `PUT /users/:id`, `PATCH /users/:id/status`, `PUT /users/me` |
+| Shop access | `POST /users/:id/memberships`, `PUT\|DELETE /users/:id/memberships/:membershipId` |
 | Roles | `GET|POST /roles`, `GET|PUT|DELETE /roles/:id` |
 | Permissions | `GET|POST /permissions`, `PUT|DELETE /permissions/:id` |
 | Shops | `GET|POST /shops`, `GET|PUT|DELETE /shops/:id` |

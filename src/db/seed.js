@@ -44,9 +44,10 @@ async function seedPermissions() {
 async function seedRoles() {
   for (const [name, config] of Object.entries(SYSTEM_ROLES)) {
     await execute(
-      `INSERT INTO roles (name, description, is_system, status) VALUES (?, ?, 1, 'active')
-       ON DUPLICATE KEY UPDATE description = VALUES(description), is_system = 1`,
-      [name, config.description],
+      `INSERT INTO roles (name, description, scope, is_system, status)
+       VALUES (?, ?, ?, 1, 'active')
+       ON DUPLICATE KEY UPDATE description = VALUES(description), scope = VALUES(scope), is_system = 1`,
+      [name, config.description, config.scope],
     );
     const role = await queryOne('SELECT id FROM roles WHERE name = ?', [name]);
 
