@@ -4,6 +4,9 @@ const { query, queryOne, execute, rawQuery } = require('../../db/pool');
 const ApiError = require('../../utils/ApiError');
 const { limitOffset } = require('../../utils/pagination');
 const accessControl = require('../../services/accessControl');
+const entitlements = require('../../services/entitlements');
+const subscriptions = require('../subscriptions/subscription.service');
+const { FEATURES } = require('../../config/plans');
 
 /**
  * Featured banners (§3-§14).
@@ -183,7 +186,15 @@ function resolveStatus(requested, startDate, endDate) {
 }
 
 async function create(payload, user) {
-  await assertOfferIsUsable(payload.offerId, user, 'CREATE_BANNER');
+  const offer = await assertOfferIsUsable(payload.offerId, user, 'CREATE_BANNER');
+
+  // V3 §3: featured banners are a Premium entitlement, and scheduling one for a
+  // future window is a separate entitlement again. Both are checked against the
+  // shop that owns the offer the banner points at, not the caller's other shops.
+  await entitlements.assertFeature(offer.shop_id, FEATURES.FEATURED_BANNERS);
+  if (payload.status === 'scheduled' || new Date(payload.startDate) > new Date()) {
+    await entitlements.assertFeature(offer.shop_id, FEATURES.BANNER_SCHEDULING);
+  }
 
   // Publishing is a separate permission from creating (§6), so a banner is
   // only allowed to land in a live state if the caller may publish.
@@ -215,6 +226,8 @@ async function create(payload, user) {
       user.id,
     ],
   );
+
+  if (status !== 'draft') await subscriptions.recordUsage(offer.shop_id, 'banners_published');
 
   return getById(result.insertId, user);
 }

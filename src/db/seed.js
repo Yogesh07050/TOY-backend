@@ -9,10 +9,11 @@
  * Safe to run repeatedly - every insert is an upsert.
  */
 
-const { pool, query, queryOne, execute } = require('./pool');
+const { pool, query, queryOne, execute, rawQuery } = require('./pool');
 const env = require('../config/env');
 const password = require('../utils/password');
 const { PERMISSIONS, SYSTEM_ROLES } = require('../config/permissions');
+const { PLANS } = require('../config/plans');
 const { slugify } = require('../utils/slug');
 
 const CATEGORIES = [
@@ -416,6 +417,225 @@ async function seedDemoData(superAdmin) {
   console.log('  demo users: john@zara.com / ShopAdmin@123, priya@example.com / Customer@123');
 }
 
+
+// ---------------------------------------------------------------------------
+// V3 - subscriptions, campaigns and enough analytics history to demo with
+// ---------------------------------------------------------------------------
+
+/** The plan each demo shop sits on, so all three tiers are visible at once. */
+const DEMO_PLANS = {
+  Zara: 'PREMIUM',
+  FreshMart: 'BUSINESS',
+  TechNova: 'FREE',
+};
+
+async function seedSubscriptions() {
+  // Every shop needs a row; the demo shops then get their headline plan.
+  await execute(
+    `INSERT INTO shop_subscriptions (shop_id, plan, status, price_amount, payment_status)
+     SELECT s.id, 'FREE', 'active', 0.00, 'not_required' FROM shops s
+      WHERE NOT EXISTS (SELECT 1 FROM shop_subscriptions sub WHERE sub.shop_id = s.id)`,
+  );
+
+  for (const [shopName, planKey] of Object.entries(DEMO_PLANS)) {
+    const shop = await queryOne('SELECT id FROM shops WHERE slug = ?', [slugify(shopName)]);
+    if (!shop) continue;
+
+    const plan = PLANS[planKey];
+    await execute(
+      `UPDATE shop_subscriptions
+          SET plan = ?, status = 'active', price_amount = ?, billing_cycle = 'monthly',
+              payment_status = ?, started_at = DATE_SUB(NOW(), INTERVAL 45 DAY),
+              renews_at = DATE_ADD(NOW(), INTERVAL 15 DAY)
+        WHERE shop_id = ?`,
+      [plan.key, plan.price, plan.price > 0 ? 'paid' : 'not_required', shop.id],
+    );
+
+    // One history row so the Billing screen is not empty on a fresh install.
+    const existing = await queryOne('SELECT id FROM subscription_events WHERE shop_id = ?', [shop.id]);
+    if (!existing && plan.price > 0) {
+      await execute(
+        `INSERT INTO subscription_events (shop_id, from_plan, to_plan, action, amount, created_at)
+         VALUES (?, 'FREE', ?, 'upgraded', ?, DATE_SUB(NOW(), INTERVAL 45 DAY))`,
+        [shop.id, plan.key, plan.price],
+      );
+    }
+  }
+
+  console.log('  subscriptions: %s', Object.entries(DEMO_PLANS).map(([k, v]) => `${k}=${v}`).join(', '));
+}
+
+/**
+ * Generates ~60 days of engagement for the Premium demo shop.
+ *
+ * Real dashboards are meaningless against an empty database, and §34 asks for
+ * honest empty states rather than fabricated charts - so this exists only under
+ * SEED_DEMO_DATA, and only for the demo tenant.
+ *
+ * The generator is deterministic (a seeded PRNG) so two runs produce the same
+ * numbers, and it is skipped entirely once history already exists.
+ */
+function makeRandom(seed) {
+  let state = seed;
+  return () => {
+    state = (state * 1103515245 + 12345) & 0x7fffffff;
+    return state / 0x7fffffff;
+  };
+}
+
+async function seedAnalyticsHistory() {
+  const shop = await queryOne('SELECT id FROM shops WHERE slug = ?', [slugify('Zara')]);
+  if (!shop) return;
+
+  // Look far enough back that ordinary demo browsing cannot be mistaken for a
+  // previous run of this generator - it is the only thing that writes events
+  // older than a month.
+  const already = await queryOne(
+    `SELECT COUNT(*) AS count FROM offer_views v JOIN offers o ON o.id = v.offer_id
+      WHERE o.shop_id = ? AND v.created_at < DATE_SUB(NOW(), INTERVAL 30 DAY)`,
+    [shop.id],
+  );
+  if (Number(already.count) > 0) {
+    console.log('  analytics history: already present, skipped');
+    return;
+  }
+
+  const offers = await query("SELECT id FROM offers WHERE shop_id = ? AND status = 'active'", [shop.id]);
+  const branches = await query('SELECT id, city FROM shop_branches WHERE shop_id = ?', [shop.id]);
+  const customers = await query(
+    `SELECT u.id FROM users u JOIN user_roles ur ON ur.user_id = u.id
+       JOIN roles r ON r.id = ur.role_id AND r.name = 'CUSTOMER' LIMIT 25`,
+  );
+  if (!offers.length || !branches.length || !customers.length) return;
+
+  const random = makeRandom(20260812);
+  const pick = (list) => list[Math.floor(random() * list.length)];
+  const DAYS = 60;
+
+  const viewRows = [];
+  const claimRows = [];
+  const seen = new Set();
+
+  for (let dayOffset = DAYS; dayOffset >= 1; dayOffset -= 1) {
+    const date = new Date();
+    date.setDate(date.getDate() - dayOffset);
+    // Weekends carry more traffic, which is what makes the "best day to post"
+    // dashboard show a real pattern rather than noise.
+    const weekendBoost = [0, 6].includes(date.getDay()) ? 1.8 : 1;
+    const impressions = Math.round((12 + random() * 20) * weekendBoost);
+
+    for (let index = 0; index < impressions; index += 1) {
+      const offer = pick(offers);
+      const branch = pick(branches);
+      const customer = pick(customers);
+      const at = new Date(date);
+      // Evenings skew busier, so §18's "best time" has something to find.
+      at.setHours(random() < 0.45 ? 18 + Math.floor(random() * 3) : Math.floor(random() * 24));
+      at.setMinutes(Math.floor(random() * 60));
+
+      viewRows.push([offer.id, customer.id, branch.id, 'impression', branch.city, at]);
+      if (random() < 0.42) {
+        viewRows.push([offer.id, customer.id, branch.id, 'view', branch.city, at]);
+
+        if (random() < 0.07) {
+          const key = `${customer.id}:${offer.id}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            claimRows.push([offer.id, customer.id, branch.id, at, random() < 0.46]);
+          }
+        }
+      }
+    }
+  }
+
+  // Inserted in batches: a row-at-a-time loop over a couple of thousand events
+  // turns a two-second seed into a two-minute one.
+  for (let index = 0; index < viewRows.length; index += 200) {
+    const chunk = viewRows.slice(index, index + 200);
+    await rawQuery(
+      `INSERT INTO offer_views (offer_id, user_id, branch_id, event_type, city, created_at)
+       VALUES ${chunk.map(() => '(?, ?, ?, ?, ?, ?)').join(', ')}`,
+      chunk.flat(),
+    );
+  }
+
+  for (const [offerId, userId, branchId, at, redeemed] of claimRows) {
+    await execute(
+      `INSERT IGNORE INTO offer_claims (offer_id, user_id, branch_id, code, status, claimed_at, redeemed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        offerId,
+        userId,
+        branchId,
+        `DEMO${String(offerId).padStart(3, '0')}${String(userId).padStart(3, '0')}`.slice(0, 24),
+        redeemed ? 'redeemed' : 'claimed',
+        at,
+        redeemed ? at : null,
+      ],
+    );
+  }
+
+  // Rebuild the customer roll-up from the events just generated, so the
+  // new-vs-returning split matches the history rather than today's date.
+  await execute(
+    `INSERT INTO shop_customers (shop_id, user_id, first_seen_at, last_seen_at, visit_count)
+     SELECT o.shop_id, v.user_id, MIN(v.created_at), MAX(v.created_at), COUNT(*)
+       FROM offer_views v JOIN offers o ON o.id = v.offer_id
+      WHERE v.user_id IS NOT NULL AND o.shop_id = ?
+      GROUP BY o.shop_id, v.user_id
+     ON DUPLICATE KEY UPDATE first_seen_at = VALUES(first_seen_at),
+                             last_seen_at  = VALUES(last_seen_at),
+                             visit_count   = VALUES(visit_count)`,
+    [shop.id],
+  );
+  await execute(
+    `UPDATE shop_customers sc
+        SET sc.claim_count = (SELECT COUNT(*) FROM offer_claims c JOIN offers o ON o.id = c.offer_id
+                               WHERE o.shop_id = sc.shop_id AND c.user_id = sc.user_id),
+            sc.redeem_count = (SELECT COUNT(*) FROM offer_claims c JOIN offers o ON o.id = c.offer_id
+                                WHERE o.shop_id = sc.shop_id AND c.user_id = sc.user_id
+                                  AND c.status = 'redeemed'),
+            sc.save_count = (SELECT COUNT(*) FROM favorites f JOIN offers o ON o.id = f.offer_id
+                              WHERE o.shop_id = sc.shop_id AND f.user_id = sc.user_id)
+      WHERE sc.shop_id = ?`,
+    [shop.id],
+  );
+
+  console.log('  analytics history: %d events, %d claims', viewRows.length, claimRows.length);
+}
+
+async function seedCampaign() {
+  const shop = await queryOne('SELECT id FROM shops WHERE slug = ?', [slugify('Zara')]);
+  if (!shop) return;
+
+  const existing = await queryOne('SELECT id FROM campaigns WHERE shop_id = ?', [shop.id]);
+  if (existing) return;
+
+  const result = await execute(
+    `INSERT INTO campaigns (shop_id, name, description, start_date, end_date, cost,
+                            avg_order_value, avg_margin_percent, status)
+     VALUES (?, 'Season End Sale', 'Season-end promotion across clothing and footwear.',
+             DATE_SUB(NOW(), INTERVAL 30 DAY), DATE_ADD(NOW(), INTERVAL 15 DAY),
+             5000.00, 1800.00, 35.00, 'running')`,
+    [shop.id],
+  );
+
+  // Attaching the shop's live offers is what gives the ROI dashboard (§25)
+  // something to attribute redemptions to.
+  await execute(
+    `INSERT IGNORE INTO campaign_offers (campaign_id, offer_id)
+     SELECT ?, id FROM offers WHERE shop_id = ? AND status = 'active'`,
+    [result.insertId, shop.id],
+  );
+  await execute(
+    `UPDATE banners b JOIN offers o ON o.id = b.offer_id
+        SET b.campaign_id = ? WHERE o.shop_id = ? AND b.campaign_id IS NULL`,
+    [result.insertId, shop.id],
+  );
+
+  console.log('  campaign: Season End Sale');
+}
+
 async function main() {
   console.log('Seeding %s ...', env.db.database);
   await seedPermissions();
@@ -425,6 +645,13 @@ async function main() {
 
   if (env.seed.demoData) {
     await seedDemoData(superAdmin);
+  }
+
+  // ---- V3 ----
+  await seedSubscriptions();
+  if (env.seed.demoData) {
+    await seedAnalyticsHistory();
+    await seedCampaign();
   }
 
   const counts = await query(

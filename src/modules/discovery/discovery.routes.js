@@ -9,6 +9,7 @@ const { ok, noContent } = require('../../utils/respond');
 const bannerService = require('../banners/banner.service');
 const offerService = require('../offers/offer.service');
 const recommendations = require('../../services/recommendations');
+const analyticsEvents = require('../../services/analyticsEvents');
 const env = require('../../config/env');
 
 const router = express.Router();
@@ -95,6 +96,8 @@ router.get(
         expiringInHours: req.query.withinHours,
         latitude: position?.latitude,
         longitude: position?.longitude,
+        // V3 §3: Ending Soon is a Business and Premium placement.
+        minPlanRank: 1,
       },
       req.user,
     );
@@ -122,6 +125,15 @@ router.get(
       },
       req.user,
     );
+
+    // §28: a nearby lookup is the location signal behind the radius analysis in
+    // §11, so the position is recorded once per request rather than per result.
+    analyticsEvents.record(analyticsEvents.EVENT_TYPES.NEARBY_OFFER_VIEW, {
+      userId: req.user?.id ?? null,
+      latitude: req.query.latitude,
+      longitude: req.query.longitude,
+    });
+
     ok(res, items);
   }),
 );

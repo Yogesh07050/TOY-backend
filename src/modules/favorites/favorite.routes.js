@@ -8,6 +8,7 @@ const validate = require('../../middleware/validate');
 const asyncHandler = require('../../utils/asyncHandler');
 const { authenticate } = require('../../middleware/auth');
 const offerService = require('../offers/offer.service');
+const analyticsEvents = require('../../services/analyticsEvents');
 const { listOffersSchema } = require('../offers/offer.schema');
 const { ok, created, noContent, paginated } = require('../../utils/respond');
 
@@ -33,7 +34,7 @@ router.post(
   '/:offerId',
   validate({ params: offerIdParam }),
   asyncHandler(async (req, res) => {
-    const offer = await queryOne('SELECT id FROM offers WHERE id = ?', [req.params.offerId]);
+    const offer = await queryOne('SELECT id, shop_id FROM offers WHERE id = ?', [req.params.offerId]);
     if (!offer) throw ApiError.notFound('Offer not found');
 
     const result = await execute(
@@ -44,6 +45,15 @@ router.post(
       await execute('UPDATE offers SET favorite_count = favorite_count + 1 WHERE id = ?', [
         req.params.offerId,
       ]);
+      // V3 §13: a save is the engagement signal behind the "offer saver"
+      // segment. Re-saving an offer already saved must not count twice, which
+      // is why this sits inside the affectedRows branch.
+      await analyticsEvents.touchShopCustomer(offer.shop_id, req.user.id, 'save');
+      await analyticsEvents.record(analyticsEvents.EVENT_TYPES.OFFER_SAVE, {
+        shopId: offer.shop_id,
+        offerId: Number(req.params.offerId),
+        userId: req.user.id,
+      });
     }
     created(res, { offerId: Number(req.params.offerId), isFavorite: true });
   }),

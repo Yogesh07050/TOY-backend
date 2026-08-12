@@ -24,4 +24,8 @@ router.use('/banners', require('./modules/banners/banner.routes'));
 router.use('/discovery', require('./modules/discovery/discovery.routes'));
 router.use('/claims', require('./modules/claims/claim.routes'));
 
+// ---- V3 ----
+router.use('/subscriptions', require('./modules/subscriptions/subscription.routes'));
+router.use('/campaigns', require('./modules/campaigns/campaign.routes'));
+
 module.exports = router;

@@ -185,6 +185,81 @@ redemptions — where each stage reports its conversion against the previous one
 `/api/analytics/funnel` and `/growth` accept `days` or an explicit `from`/`to`
 range, and every query in a response uses the same resolved window.
 
+### V3: subscription plans
+
+Three merchant tiers, defined once in `config/plans.js` — pricing, feature
+flags and usage limits together. The API serves that same object to the
+frontend, so the pricing table, the upgrade prompts and the server-side checks
+cannot drift apart.
+
+| | Free | Business | Premium |
+|---|---|---|---|
+| Price / month | ₹0 | ₹999 | ₹2,500 |
+| Offers | 1 per month | unlimited | unlimited |
+| Branches | 1 | 2 | unlimited |
+| Categories | 1 | 5 | unlimited |
+| Featured banners | — | — | unlimited |
+| Analytics | basic views | standard | advanced |
+| Export | — | — | CSV + Excel |
+| Discovery | basic | standard | priority eligibility |
+
+Enforcement lives in `services/entitlements.js`, which knows nothing about
+Express so a rule can be checked at the point it actually applies —
+`offer.service` checks the monthly allowance where an offer is published, not
+at the edge. `middleware/subscription.js` wraps the same checks for route-level
+gating. Every refusal is a 403 with code `PLAN_UPGRADE_REQUIRED` and details
+naming the plan required, which is what lets the UI render a contextual upgrade
+prompt without hard-coding the ladder:
+
+```jsonc
+{ "success": false, "error": {
+    "code": "PLAN_UPGRADE_REQUIRED",
+    "message": "Featured banners is available with the ₹2,500 Premium plan.",
+    "details": { "requiredPlan": "PREMIUM", "feature": "FEATURED_BANNERS", "currentPlan": "BUSINESS" } } }
+```
+
+Limits are checked against the source tables (offers, branches, categories),
+never against the counters — a counter that drifted can therefore never unblock
+a limit. `subscription_usage` is the audit trail of what was published, not the
+gate. Super Admins are exempt from plan gates throughout: they administer the
+platform rather than subscribe to it.
+
+### V3: premium analytics
+
+Seventeen dashboards under `/api/analytics/premium`, all sharing one filter
+contract (date preset or custom range, branch, category, offer, campaign,
+location) and one scope resolver. Ownership is resolved first and is never
+relaxed by a plan: a paid plan widens what a merchant sees about *their own*
+shops, never whose shops they can see.
+
+Counts come from the raw event tables over an explicit window, using correlated
+subqueries rather than joins — joining `offers` to both `offer_views` and
+`offer_claims` multiplies each offer by its claims and silently inflates every
+view count. Conversions follow §10 rather than strict adjacency: claims convert
+from **views**, not from saves, because claiming an offer never required saving
+it first (dividing by saves reports rates above 100% as soon as claims outnumber
+saves).
+
+`analytics_daily_snapshots` holds nightly per-shop and per-offer roll-ups for
+trend queries, rebuilt idempotently by the `analytics-snapshots` job.
+`shop_customers` records first/last engagement per shop, which is what makes
+new-vs-returning answerable without scanning the whole event stream.
+
+Exports are generated in-process: `utils/exporters.js` writes CSV (with a BOM,
+so Excel on Windows reads UTF-8 rather than mangling the rupee sign) and a real
+OOXML `.xlsx` package — a genuine ZIP with content types, relationships and
+styles, not a renamed CSV — so no dependency was added for it.
+
+### V3: premium discovery
+
+Premium buys priority **eligibility**, not placement (§36). The boost is a
+tie-breaker *inside* a relevance band, never a key that outranks relevance:
+offers are bucketed first by what the customer asked for — the kilometre they
+sit in, the day they were posted, how soon they end — and only within a bucket
+does a paid plan surface first. A Premium shop can win a tie at the same
+distance; it can never jump ahead of a genuinely nearer offer. Management
+listings are never reordered by plan.
+
 ### Images
 
 Uploads are buffered in memory, re-encoded through `sharp` (which also
@@ -227,6 +302,22 @@ All routes are under `/api`. Responses are enveloped:
 | Discovery (V2) | `GET /discovery/featured\|ending-soon\|nearby\|recommended`, `POST /discovery/featured/:id/track` |
 | Claims (V2) | `GET /claims`, `POST /claims/:offerId`, `GET /claims/lookup/:code`, `POST /claims/lookup/:code/redeem` |
 | Analytics (V2) | `GET /analytics/funnel`, `GET /analytics/growth` |
+| Subscriptions (V3) | `GET /subscriptions/plans\|me`, `GET /subscriptions/shops/:shopId\|/usage\|/history\|/invoices`, `PUT /subscriptions/shops/:shopId`, `POST /subscriptions/shops/:shopId/confirm-payment\|cancel` |
+| Campaigns (V3) | `GET\|POST /campaigns`, `GET\|PUT\|DELETE /campaigns/:id` |
+| Premium analytics (V3) | `GET /analytics/premium/overview\|offer-performance\|funnel\|locations\|branches\|customers\|acquisition\|retention\|campaigns\|offer-comparison\|discount-effectiveness\|best-time\|ending-soon\|offer-health\|recommendations\|category-insights\|roi\|offer-intelligence` |
+| Reports (V3) | `GET /analytics/premium/reports`, `GET /analytics/premium/reports/export?type=&format=csv\|xlsx` |
+| Event ingest (V3) | `POST /analytics/events`, `POST /analytics/events/batch`, `GET /analytics/events/types` |
+
+### Premium analytics parameters
+
+```
+?preset=today|yesterday|last7|last30|last90|thisMonth|lastMonth|custom
+&from=2026-07-01       &to=2026-07-31       (custom range)
+&shopId=1              &branchId=3          &categoryId=2
+&offerId=7             &campaignId=1        &city=Coimbatore
+&offerType=percentage  &discountType=flat   &status=active
+&sort=views|claims|redemptions|conversion|saves|newest   &limit=50
+```
 
 ### Offer listing parameters
 
@@ -281,4 +372,5 @@ See `.env.example`. Notable values:
 |---|---|---|
 | `offer-lifecycle` | every 5 min | scheduled → active → expired |
 | `expiring-favourites` | daily 09:00 | emails customers about saved offers ending within 48h |
+| `analytics-snapshots` | daily 00:20 | folds yesterday's events into `analytics_daily_snapshots` (V3) |
 | `prune` | daily 03:30 | deletes spent tokens and read notifications older than 60 days |

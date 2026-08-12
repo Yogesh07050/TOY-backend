@@ -4,6 +4,7 @@ const cron = require('node-cron');
 const offerService = require('../modules/offers/offer.service');
 const bannerService = require('../modules/banners/banner.service');
 const notifications = require('../services/notifications');
+const analyticsSnapshots = require('../services/analyticsSnapshots');
 const authService = require('../modules/auth/auth.service');
 
 /**
@@ -41,6 +42,16 @@ const jobs = [
     run: async () => {
       const sent = await notifications.notifyExpiringOffers();
       if (sent) console.log('[jobs] expiry reminders sent: %d', sent);
+    },
+  },
+  {
+    name: 'analytics-snapshots',
+    // 00:20 daily: fold yesterday's events into the daily roll-ups the premium
+    // dashboards read (V3 §29). Idempotent - it replaces the day it covers.
+    schedule: '20 0 * * *',
+    run: async () => {
+      const { day, rows } = await analyticsSnapshots.rebuildDay();
+      console.log('[jobs] analytics snapshot for %s: %d rows', day, rows);
     },
   },
   {

@@ -67,6 +67,14 @@ function scopeClause(scope, column = 'o.shop_id') {
   return { sql: ` AND ${column} IN (${scope.map(() => '?').join(',')})`, params: scope };
 }
 
+// ---- V3 --------------------------------------------------------------------
+// Both sub-routers carry their own authentication: event ingest is open to
+// signed-out customers, and the premium dashboards add a subscription gate on
+// top of VIEW_ANALYTICS. Mounting them ahead of the guards below keeps those
+// rules local to each router instead of inherited from this one.
+router.use('/events', require('./events.routes'));
+router.use('/premium', require('./premium.routes'));
+
 router.use(authenticate);
 router.use(requirePermission('VIEW_ANALYTICS'));
 
@@ -490,7 +498,10 @@ router.get(
         { key: 'impressions', label: 'Impressions', value: impressions, conversion: null },
         { key: 'views', label: 'Views', value: views, conversion: rate(views, impressions) },
         { key: 'saves', label: 'Saves', value: savesCount, conversion: rate(savesCount, views) },
-        { key: 'claims', label: 'Claims', value: claimsCount, conversion: rate(claimsCount, savesCount) },
+        // Claims convert from views, not from saves: claiming an offer never
+        // required saving it first, so dividing by saves reports rates above
+        // 100% as soon as claims outnumber saves (V3 §10).
+        { key: 'claims', label: 'Claims', value: claimsCount, conversion: rate(claimsCount, views) },
         {
           key: 'redemptions',
           label: 'Redemptions',

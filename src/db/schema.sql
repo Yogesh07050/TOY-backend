@@ -358,12 +358,20 @@ CREATE TABLE IF NOT EXISTS offer_views (
   offer_id   BIGINT UNSIGNED NOT NULL,
   user_id    BIGINT UNSIGNED         DEFAULT NULL,
   branch_id  BIGINT UNSIGNED         DEFAULT NULL,
-  event_type ENUM('view','click','share') NOT NULL DEFAULT 'view',
+  event_type ENUM('view','click','share','impression') NOT NULL DEFAULT 'view',
   ip_address VARCHAR(64)             DEFAULT NULL,
+  -- V3: coarse location of the customer at the time of the event, which is what
+  -- the location intelligence dashboard (§11) aggregates.
+  city       VARCHAR(120)            DEFAULT NULL,
+  latitude   DECIMAL(10,7)           DEFAULT NULL,
+  longitude  DECIMAL(10,7)           DEFAULT NULL,
   created_at DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   KEY idx_ov_offer (offer_id, event_type),
   KEY idx_ov_created (created_at),
+  -- Dashboards always slice by offer + type + window together.
+  KEY idx_ov_offer_type_time (offer_id, event_type, created_at),
+  KEY idx_ov_city (city),
   KEY idx_ov_user (user_id),
   CONSTRAINT fk_ov_offer FOREIGN KEY (offer_id) REFERENCES offers (id) ON DELETE CASCADE,
   CONSTRAINT fk_ov_user  FOREIGN KEY (user_id)  REFERENCES users (id)  ON DELETE SET NULL
@@ -447,6 +455,9 @@ CREATE TABLE IF NOT EXISTS banners (
   display_order    INT             NOT NULL DEFAULT 0,
   impression_count INT UNSIGNED    NOT NULL DEFAULT 0,
   click_count      INT UNSIGNED    NOT NULL DEFAULT 0,
+  -- V3: optional campaign grouping for the campaign performance dashboard (§15).
+  -- The FK is added by the migration patch so this file stays re-runnable.
+  campaign_id      BIGINT UNSIGNED         DEFAULT NULL,
   created_by       BIGINT UNSIGNED         DEFAULT NULL,
   updated_by       BIGINT UNSIGNED         DEFAULT NULL,
   created_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -510,4 +521,192 @@ CREATE TABLE IF NOT EXISTS search_history (
   PRIMARY KEY (id),
   KEY idx_search_user (user_id, created_at),
   CONSTRAINT fk_search_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- =====================================================================
+--  V3 additions - subscriptions, campaigns and the analytics warehouse
+-- =====================================================================
+
+-- ---------------------------------------------------------------------
+-- One subscription row per shop (§2, §38). The plan is the single source
+-- of truth for feature entitlements; everything else here is billing
+-- bookkeeping that a payment provider can later drive.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS shop_subscriptions (
+  id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  shop_id        BIGINT UNSIGNED NOT NULL,
+  plan           ENUM('FREE','BUSINESS','PREMIUM') NOT NULL DEFAULT 'FREE',
+  status         ENUM('active','past_due','cancelled','expired') NOT NULL DEFAULT 'active',
+  billing_cycle  ENUM('monthly','yearly') NOT NULL DEFAULT 'monthly',
+  price_amount   DECIMAL(10,2)   NOT NULL DEFAULT 0.00,
+  currency       CHAR(3)         NOT NULL DEFAULT 'INR',
+  payment_status ENUM('not_required','pending','paid','failed') NOT NULL DEFAULT 'not_required',
+  started_at     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  renews_at      DATETIME                DEFAULT NULL,
+  cancelled_at   DATETIME                DEFAULT NULL,
+  provider       VARCHAR(40)             DEFAULT NULL,
+  provider_ref   VARCHAR(120)            DEFAULT NULL,
+  created_at     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  -- A shop has exactly one subscription; upgrades mutate this row.
+  UNIQUE KEY uq_subscription_shop (shop_id),
+  KEY idx_subscription_plan (plan, status),
+  CONSTRAINT fk_subscription_shop FOREIGN KEY (shop_id) REFERENCES shops (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Plan change history. Kept separate from audit_logs so billing can be
+-- reconstructed without trawling the generic trail.
+CREATE TABLE IF NOT EXISTS subscription_events (
+  id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  shop_id    BIGINT UNSIGNED NOT NULL,
+  from_plan  ENUM('FREE','BUSINESS','PREMIUM')         DEFAULT NULL,
+  to_plan    ENUM('FREE','BUSINESS','PREMIUM') NOT NULL,
+  action     ENUM('created','upgraded','downgraded','renewed','cancelled','reactivated') NOT NULL,
+  amount     DECIMAL(10,2)   NOT NULL DEFAULT 0.00,
+  actor_id   BIGINT UNSIGNED         DEFAULT NULL,
+  note       VARCHAR(255)            DEFAULT NULL,
+  created_at DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_sub_event_shop (shop_id, created_at),
+  CONSTRAINT fk_sub_event_shop  FOREIGN KEY (shop_id)  REFERENCES shops (id) ON DELETE CASCADE,
+  CONSTRAINT fk_sub_event_actor FOREIGN KEY (actor_id) REFERENCES users (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Per-period usage counters (§38). `period` is the billing month (YYYY-MM),
+-- which is what makes the Free plan's "one offer per month" cheap to enforce.
+CREATE TABLE IF NOT EXISTS subscription_usage (
+  id                BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  shop_id           BIGINT UNSIGNED NOT NULL,
+  period            CHAR(7)         NOT NULL,
+  offers_published  INT UNSIGNED    NOT NULL DEFAULT 0,
+  banners_published INT UNSIGNED    NOT NULL DEFAULT 0,
+  exports_generated INT UNSIGNED    NOT NULL DEFAULT 0,
+  created_at        DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at        DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_usage_shop_period (shop_id, period),
+  CONSTRAINT fk_usage_shop FOREIGN KEY (shop_id) REFERENCES shops (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------
+-- Campaigns (§15, §25). A campaign groups banners and offers so their
+-- combined performance - and optionally ROI - can be reported on.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS campaigns (
+  id                 BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  shop_id            BIGINT UNSIGNED NOT NULL,
+  name               VARCHAR(160)    NOT NULL,
+  description        VARCHAR(500)            DEFAULT NULL,
+  start_date         DATETIME        NOT NULL,
+  end_date           DATETIME        NOT NULL,
+  -- Optional merchant inputs behind the ROI dashboard. NULL means "not
+  -- provided", which is what keeps ROI hidden rather than guessed (§25).
+  cost               DECIMAL(12,2)           DEFAULT NULL,
+  avg_order_value    DECIMAL(12,2)           DEFAULT NULL,
+  avg_margin_percent DECIMAL(5,2)            DEFAULT NULL,
+  status             ENUM('draft','running','completed','archived') NOT NULL DEFAULT 'running',
+  created_by         BIGINT UNSIGNED         DEFAULT NULL,
+  created_at         DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at         DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_campaign_shop (shop_id, status),
+  CONSTRAINT fk_campaign_shop    FOREIGN KEY (shop_id)    REFERENCES shops (id) ON DELETE CASCADE,
+  CONSTRAINT fk_campaign_creator FOREIGN KEY (created_by) REFERENCES users (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS campaign_offers (
+  campaign_id BIGINT UNSIGNED NOT NULL,
+  offer_id    BIGINT UNSIGNED NOT NULL,
+  PRIMARY KEY (campaign_id, offer_id),
+  KEY idx_co_offer (offer_id),
+  CONSTRAINT fk_co_campaign FOREIGN KEY (campaign_id) REFERENCES campaigns (id) ON DELETE CASCADE,
+  CONSTRAINT fk_co_offer    FOREIGN KEY (offer_id)    REFERENCES offers (id)    ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------
+-- Generic analytics event stream (§28). Offer and banner events keep their
+-- dedicated tables - this covers the discovery/customer events that have no
+-- home, and carries the coarse location every location dashboard needs.
+--
+-- Only the fields the dashboards actually aggregate are stored; nothing here
+-- identifies a customer beyond the user id already present elsewhere (§13).
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS analytics_events (
+  id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  event_type  VARCHAR(40)     NOT NULL,
+  shop_id     BIGINT UNSIGNED         DEFAULT NULL,
+  offer_id    BIGINT UNSIGNED         DEFAULT NULL,
+  banner_id   BIGINT UNSIGNED         DEFAULT NULL,
+  branch_id   BIGINT UNSIGNED         DEFAULT NULL,
+  category_id BIGINT UNSIGNED         DEFAULT NULL,
+  user_id     BIGINT UNSIGNED         DEFAULT NULL,
+  city        VARCHAR(120)            DEFAULT NULL,
+  pincode     VARCHAR(20)             DEFAULT NULL,
+  latitude    DECIMAL(10,7)           DEFAULT NULL,
+  longitude   DECIMAL(10,7)           DEFAULT NULL,
+  term        VARCHAR(160)            DEFAULT NULL,
+  created_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  -- The shape every dashboard query uses: one shop, one event type, a window.
+  KEY idx_ae_shop_type_time (shop_id, event_type, created_at),
+  KEY idx_ae_type_time (event_type, created_at),
+  KEY idx_ae_offer (offer_id, created_at),
+  KEY idx_ae_user (user_id, created_at),
+  KEY idx_ae_city (city),
+  CONSTRAINT fk_ae_shop   FOREIGN KEY (shop_id)   REFERENCES shops (id)         ON DELETE CASCADE,
+  CONSTRAINT fk_ae_offer  FOREIGN KEY (offer_id)  REFERENCES offers (id)        ON DELETE CASCADE,
+  CONSTRAINT fk_ae_banner FOREIGN KEY (banner_id) REFERENCES banners (id)       ON DELETE CASCADE,
+  CONSTRAINT fk_ae_branch FOREIGN KEY (branch_id) REFERENCES shop_branches (id) ON DELETE SET NULL,
+  CONSTRAINT fk_ae_user   FOREIGN KEY (user_id)   REFERENCES users (id)         ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------
+-- Pre-aggregated daily rollups (§29). Dashboards read these instead of
+-- scanning the raw event tables for every KPI card.
+--
+-- offer_id / branch_id use 0 rather than NULL for the "all" rollup so the
+-- unique key actually de-duplicates (NULLs never collide in MySQL).
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS analytics_daily_snapshots (
+  id                  BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  shop_id             BIGINT UNSIGNED NOT NULL,
+  snapshot_date       DATE            NOT NULL,
+  offer_id            BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  branch_id           BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  impressions         INT UNSIGNED    NOT NULL DEFAULT 0,
+  views               INT UNSIGNED    NOT NULL DEFAULT 0,
+  saves               INT UNSIGNED    NOT NULL DEFAULT 0,
+  shares              INT UNSIGNED    NOT NULL DEFAULT 0,
+  clicks              INT UNSIGNED    NOT NULL DEFAULT 0,
+  claims              INT UNSIGNED    NOT NULL DEFAULT 0,
+  redemptions         INT UNSIGNED    NOT NULL DEFAULT 0,
+  unique_customers    INT UNSIGNED    NOT NULL DEFAULT 0,
+  new_customers       INT UNSIGNED    NOT NULL DEFAULT 0,
+  returning_customers INT UNSIGNED    NOT NULL DEFAULT 0,
+  created_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_snapshot (shop_id, snapshot_date, offer_id, branch_id),
+  KEY idx_snapshot_date (snapshot_date),
+  CONSTRAINT fk_snapshot_shop FOREIGN KEY (shop_id) REFERENCES shops (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- First time a customer engaged with a shop, which is what makes
+-- "new vs returning" (§14) answerable without scanning every event.
+CREATE TABLE IF NOT EXISTS shop_customers (
+  id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  shop_id        BIGINT UNSIGNED NOT NULL,
+  user_id        BIGINT UNSIGNED NOT NULL,
+  first_seen_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  last_seen_at   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  visit_count    INT UNSIGNED    NOT NULL DEFAULT 1,
+  save_count     INT UNSIGNED    NOT NULL DEFAULT 0,
+  claim_count    INT UNSIGNED    NOT NULL DEFAULT 0,
+  redeem_count   INT UNSIGNED    NOT NULL DEFAULT 0,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_shop_customer (shop_id, user_id),
+  KEY idx_sc_first_seen (shop_id, first_seen_at),
+  CONSTRAINT fk_shopcust_shop FOREIGN KEY (shop_id) REFERENCES shops (id) ON DELETE CASCADE,
+  CONSTRAINT fk_shopcust_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

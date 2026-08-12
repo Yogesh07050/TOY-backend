@@ -2,6 +2,7 @@
 
 const service = require('./offer.service');
 const reviewService = require('../reviews/review.service');
+const analyticsEvents = require('../../services/analyticsEvents');
 const audit = require('../../utils/audit');
 const { ok, created, noContent, paginated } = require('../../utils/respond');
 
@@ -13,6 +14,18 @@ const positionFrom = (query) =>
 
 exports.list = async (req, res) => {
   const { items, pagination } = await service.list(req.query, req.user);
+
+  // V3 §28. Recorded after the results are in hand so a tracking failure can
+  // never cost the customer their search, and awaited nowhere for the same reason.
+  if (req.query.search) {
+    analyticsEvents.record(analyticsEvents.EVENT_TYPES.SEARCH, {
+      userId: req.user?.id ?? null,
+      term: req.query.search,
+      city: req.query.city ?? null,
+      categoryId: req.query.categoryId ?? null,
+    });
+  }
+
   paginated(res, items, pagination);
 };
 

@@ -6,6 +6,8 @@ const geo = require('../../utils/geo');
 const { uniqueSlug } = require('../../utils/slug');
 const { limitOffset } = require('../../utils/pagination');
 const accessControl = require('../../services/accessControl');
+const entitlements = require('../../services/entitlements');
+const { PLANS, minimumPlanForLimit } = require('../../config/plans');
 const passwordUtil = require('../../utils/password');
 const tokens = require('../../utils/tokens');
 const mailer = require('../../utils/mailer');
@@ -256,6 +258,17 @@ function mapBranch(row) {
 async function create(payload, user) {
   const slug = await uniqueSlug('shops', payload.name);
 
+  // A new shop always starts on Free, so its category allowance is known before
+  // the row exists - which is the only reason this check can run up front.
+  const freeCategories = PLANS.FREE.limits.categories;
+  if ((payload.categoryIds?.length ?? 0) > freeCategories) {
+    throw entitlements.upgradeRequired(
+      `A new shop starts on the Free plan, which includes ${entitlements.allowanceText('categories', freeCategories)}. Upgrade the shop for more.`,
+      minimumPlanForLimit('categories', payload.categoryIds.length),
+      { limit: freeCategories, used: payload.categoryIds.length, limitKey: 'categories', currentPlan: 'FREE' },
+    );
+  }
+
   const shopId = await transaction(async (connection) => {
     const [result] = await connection.execute(
       `INSERT INTO shops (name, slug, description, logo_url, cover_url, contact_number, email,
@@ -285,6 +298,15 @@ async function create(payload, user) {
       );
     }
 
+    // Every shop needs a subscription row; creating it here means no code path
+    // ever has to cope with a shop that has none (§38).
+    await connection.execute(
+      `INSERT INTO shop_subscriptions (shop_id, plan, status, price_amount, payment_status)
+       VALUES (?, 'FREE', 'active', 0.00, 'not_required')
+       ON DUPLICATE KEY UPDATE shop_id = VALUES(shop_id)`,
+      [newId],
+    );
+
     if (payload.primaryBranch) {
       const branch = payload.primaryBranch;
       await connection.execute(
@@ -313,9 +335,26 @@ async function create(payload, user) {
   return getById(shopId, user);
 }
 
+/**
+ * V3 §3: category breadth is part of the plan (1 / 5 / unlimited).
+ *
+ * The check is against the *requested* set rather than an increment, so
+ * replacing five categories with five others stays allowed while adding a sixth
+ * does not. `assertWithinLimit` asks "would one more fit", so it is given
+ * `count - 1`.
+ */
+async function assertCategoriesWithinPlan(shopId, categoryIds) {
+  if (!categoryIds || categoryIds.length === 0) return;
+  await entitlements.assertWithinLimit(shopId, 'categories', categoryIds.length - 1);
+}
+
 async function update(shopId, payload, user) {
   const existing = await queryOne('SELECT * FROM shops WHERE id = ?', [shopId]);
   if (!existing) throw ApiError.notFound('Shop not found');
+
+  if (payload.categoryIds !== undefined) {
+    await assertCategoriesWithinPlan(shopId, payload.categoryIds);
+  }
 
   const slug = payload.name && payload.name !== existing.name
     ? await uniqueSlug('shops', payload.name, shopId)
@@ -393,6 +432,10 @@ async function listBranches(shopId, { includeInactive = false } = {}) {
 }
 
 async function createBranch(shopId, payload) {
+  // V3 §3: Free is a single location, Business up to two, Premium unlimited.
+  // Only active branches count, so deactivating one frees the slot back up.
+  await entitlements.assertUsageWithinLimit(shopId, 'branches', 'branches');
+
   const branchId = await transaction(async (connection) => {
     if (payload.isPrimary) {
       await connection.execute('UPDATE shop_branches SET is_primary = 0 WHERE shop_id = ?', [shopId]);
@@ -616,6 +659,7 @@ async function removeMember(shopId, memberId) {
 }
 
 module.exports = {
+  assertCategoriesWithinPlan,
   list,
   getById,
   create,

@@ -5,6 +5,10 @@ const ApiError = require('../../utils/ApiError');
 const geo = require('../../utils/geo');
 const { limitOffset } = require('../../utils/pagination');
 const accessControl = require('../../services/accessControl');
+const entitlements = require('../../services/entitlements');
+const analyticsEvents = require('../../services/analyticsEvents');
+const subscriptions = require('../subscriptions/subscription.service');
+const { FEATURES } = require('../../config/plans');
 const notifications = require('../../services/notifications');
 
 /**
@@ -64,6 +68,38 @@ const SORT_SQL = {
   mostViewed: 'o.view_count DESC, o.id DESC',
   mostPopular: '(o.favorite_count * 3 + o.click_count * 2 + o.view_count) DESC, o.id DESC',
   nearest: 'distance_km IS NULL, distance_km ASC',
+};
+
+/**
+ * Subscription rank of the offer's shop: Premium 2, Business 1, Free 0 (V3 §36).
+ * A lapsed subscription scores 0, so an unpaid Premium plan stops boosting.
+ */
+const PLAN_RANK_SQL = `(CASE
+  WHEN sub.status = 'active' AND sub.plan = 'PREMIUM'  THEN 2
+  WHEN sub.status = 'active' AND sub.plan = 'BUSINESS' THEN 1
+  ELSE 0 END)`;
+
+/**
+ * Discovery ordering with the premium boost applied (§36, §37).
+ *
+ * The boost is deliberately a *tie-breaker inside a relevance band*, never a
+ * key that outranks relevance: offers are first bucketed by the thing the
+ * customer actually asked for - the day it was posted, the kilometre it sits
+ * in, how soon it ends - and only within that bucket does a paid plan surface
+ * first. That is what keeps §36's "priority eligibility, not guaranteed
+ * placement" true, and stops the feed degrading into a paid-ad list.
+ */
+const BOOSTED_SORT_SQL = {
+  newest: 'DATE(o.created_at) DESC, plan_rank DESC, o.created_at DESC, o.id DESC',
+  endingSoon: 'DATE(o.end_date) ASC, plan_rank DESC, o.end_date ASC, o.id ASC',
+  highestDiscount:
+    "ROUND((CASE WHEN o.discount_type = 'percentage' THEN o.discount_value ELSE 0 END) / 10) DESC, plan_rank DESC, o.discount_value DESC",
+  mostViewed: 'ROUND(o.view_count / 100) DESC, plan_rank DESC, o.view_count DESC, o.id DESC',
+  mostPopular:
+    'ROUND((o.favorite_count * 3 + o.click_count * 2 + o.view_count) / 100) DESC, plan_rank DESC, o.id DESC',
+  // Distance is bucketed to the kilometre: a Premium shop can win a tie at the
+  // same distance, but never jump ahead of a genuinely nearer one.
+  nearest: 'distance_km IS NULL, ROUND(distance_km, 0) ASC, plan_rank DESC, distance_km ASC',
 };
 
 /** Maps a joined offer row onto the API representation. */
@@ -273,6 +309,14 @@ function buildListQuery(params, user) {
     whereParams.push(params.endDate);
   }
 
+  // --- subscription eligibility (V3 §3) ------------------------------------
+  // The Ending Soon rail is a Business/Premium placement, so Free shops are
+  // filtered out of it here rather than merely hidden by the client.
+  if (params.minPlanRank) {
+    where.push(`${PLAN_RANK_SQL} >= ?`);
+    whereParams.push(params.minPlanRank);
+  }
+
   // --- personalised collections -------------------------------------------
   if (params.favorites) {
     if (!user) throw ApiError.unauthorized('Sign in to view saved offers');
@@ -292,10 +336,14 @@ function buildListQuery(params, user) {
   const from = `
       FROM offers o
       JOIN shops s ON s.id = o.shop_id
-      LEFT JOIN categories c ON c.id = o.category_id`;
+      LEFT JOIN categories c ON c.id = o.category_id
+      LEFT JOIN shop_subscriptions sub ON sub.shop_id = o.shop_id`;
 
   return {
     from,
+    // Management listings are the merchant's own inventory, so a paid plan must
+    // not reorder them - the boost only applies to customer discovery (§36).
+    managing,
     whereSql: `WHERE ${where.join('\n       AND ')}`,
     having,
     distanceSelect,
@@ -314,7 +362,8 @@ async function list(params, user) {
   const built = buildListQuery(params, user);
   const { limit, page, offset } = limitOffset(params);
 
-  const orderBy = SORT_SQL[params.sort] || SORT_SQL.newest;
+  const sortTable = built.managing ? SORT_SQL : BOOSTED_SORT_SQL;
+  const orderBy = sortTable[params.sort] || sortTable.newest;
 
   const sql = `
     SELECT o.*,
@@ -322,6 +371,7 @@ async function list(params, user) {
            c.name AS category_name, c.slug AS category_slug,
            ${PRIMARY_IMAGE_SQL} AS image_url,
            ${PRIMARY_THUMB_SQL} AS thumbnail_url,
+           ${PLAN_RANK_SQL} AS plan_rank,
            ${built.distanceSelect},
            ${built.labelSelect},
            ${built.favoriteSelect}
@@ -481,9 +531,34 @@ async function assertBranchesBelongToShop(connection, shopId, branchIds) {
   }
 }
 
+/**
+ * Subscription rules that apply to publishing an offer (V3 §4, §5, §30).
+ *
+ * Drafts are exempt from the monthly allowance: a Free merchant can keep
+ * working on next month's offer, they just cannot publish a second one now.
+ */
+async function assertPublishingAllowed(shopId, payload, { isNew }) {
+  if (payload.isRecurring) {
+    await entitlements.assertFeature(shopId, FEATURES.RECURRING_OFFERS);
+  }
+
+  // Scheduling means "publish later" - either an explicit scheduled status or a
+  // start date the merchant has pushed into the future.
+  const startsLater = new Date(payload.startDate) > new Date();
+  if (payload.status === 'scheduled' || startsLater) {
+    await entitlements.assertFeature(shopId, FEATURES.OFFER_SCHEDULING);
+  }
+
+  if (isNew && payload.status !== 'draft') {
+    await entitlements.assertUsageWithinLimit(shopId, 'offersPerMonth', 'offersThisMonth');
+  }
+}
+
 async function create(payload, user) {
   const shop = await queryOne('SELECT id, name, status FROM shops WHERE id = ?', [payload.shopId]);
   if (!shop) throw ApiError.badRequest('Shop not found');
+
+  await assertPublishingAllowed(payload.shopId, payload, { isNew: true });
 
   const status = resolveStatus(payload.status, payload.startDate, payload.endDate);
 
@@ -549,6 +624,12 @@ async function create(payload, user) {
     return newId;
   });
 
+  if (status !== 'draft') {
+    // The counter is the audit trail of what was published; the limit itself is
+    // checked against the offers table, so a drifted counter cannot unblock it.
+    await subscriptions.recordUsage(payload.shopId, 'offers_published');
+  }
+
   if (status === 'active') {
     // Fan-out runs after the transaction so a notification failure cannot roll
     // back a published offer.
@@ -565,6 +646,11 @@ async function update(offerId, payload, user, previous) {
     // Moving an offer between shops would bypass the ownership check.
     throw ApiError.forbidden('An offer cannot be moved to a different shop');
   }
+
+  // An edit never consumes another month's allowance - the offer is already
+  // published - but it must not be a way to add scheduling or recurrence to an
+  // offer on a plan that does not include them.
+  await assertPublishingAllowed(previous.shop_id, payload, { isNew: false });
 
   const keepStatus = ['deactivated', 'draft'].includes(previous.status)
     ? previous.status
@@ -681,13 +767,32 @@ async function remove(offerId) {
  * Records a view/click/share. The denormalised counters on `offers` keep the
  * card listings cheap; `offer_views` retains the raw events for analytics.
  */
-async function trackEvent(offerId, { event, branchId }, user, ip) {
-  const offer = await queryOne('SELECT id FROM offers WHERE id = ?', [offerId]);
+async function trackEvent(offerId, { event, branchId, city, latitude, longitude }, user, ip) {
+  const offer = await queryOne('SELECT id, shop_id FROM offers WHERE id = ?', [offerId]);
   if (!offer) throw ApiError.notFound('Offer not found');
 
+  // V3 §11: the customer's coarse location is stored on the event itself, which
+  // is what the location intelligence dashboard aggregates. It falls back to the
+  // branch city when the customer has not shared a position.
+  const resolvedCity =
+    city ??
+    (branchId
+      ? (await queryOne('SELECT city FROM shop_branches WHERE id = ?', [branchId]))?.city ?? null
+      : null);
+
   await execute(
-    'INSERT INTO offer_views (offer_id, user_id, branch_id, event_type, ip_address) VALUES (?, ?, ?, ?, ?)',
-    [offerId, user?.id ?? null, branchId ?? null, event, ip ?? null],
+    `INSERT INTO offer_views (offer_id, user_id, branch_id, event_type, ip_address, city, latitude, longitude)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      offerId,
+      user?.id ?? null,
+      branchId ?? null,
+      event,
+      ip ?? null,
+      resolvedCity,
+      latitude ?? null,
+      longitude ?? null,
+    ],
   );
 
   if (event === 'view') {
@@ -695,6 +800,9 @@ async function trackEvent(offerId, { event, branchId }, user, ip) {
   } else if (event === 'click') {
     await execute('UPDATE offers SET click_count = click_count + 1 WHERE id = ?', [offerId]);
   }
+
+  // Feeds the new-vs-returning split (§14) without a second pass over events.
+  if (user) await analyticsEvents.touchShopCustomer(offer.shop_id, user.id);
 }
 
 /**
@@ -718,6 +826,7 @@ module.exports = {
   list,
   getById,
   create,
+  assertPublishingAllowed,
   update,
   changeStatus,
   remove,

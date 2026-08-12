@@ -7,6 +7,7 @@ const password = require('../../utils/password');
 const tokens = require('../../utils/tokens');
 const mailer = require('../../utils/mailer');
 const access = require('../../services/accessControl');
+const analyticsEvents = require('../../services/analyticsEvents');
 
 const VERIFY_TTL_MS = 24 * 60 * 60 * 1000;
 const RESET_TTL_MS = 60 * 60 * 1000;
@@ -115,6 +116,11 @@ async function register(payload, req) {
   });
 
   const user = await queryOne('SELECT * FROM users WHERE id = ?', [userId]);
+
+  // V3 §28. Platform-level, so no shop is attached - shop-level acquisition is
+  // recorded the first time the customer engages with that shop's offers.
+  analyticsEvents.record(analyticsEvents.EVENT_TYPES.CUSTOMER_SIGNUP, { userId });
+
   await sendVerificationEmail(user);
 
   const context = await access.loadAccessContext(userId);
@@ -137,6 +143,10 @@ async function login({ email, password: plain }, req) {
   if (!matches) throw invalid;
   if (user.status !== 'active') throw ApiError.forbidden('This account has been deactivated');
 
+  // A return is only interesting when there was a previous visit to return from.
+  if (user.last_login_at) {
+    analyticsEvents.record(analyticsEvents.EVENT_TYPES.CUSTOMER_RETURN, { userId: user.id });
+  }
   await execute('UPDATE users SET last_login_at = NOW() WHERE id = ?', [user.id]);
 
   const context = await access.loadAccessContext(user.id);

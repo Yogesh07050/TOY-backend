@@ -136,8 +136,13 @@ const updateStatusSchema = z.object({
 });
 
 const trackEventSchema = z.object({
-  event: z.enum(['view', 'click', 'share']).default('view'),
+  // V3 §28 closes the top of the funnel by tracking impressions alongside views.
+  event: z.enum(['view', 'click', 'share', 'impression']).default('view'),
   branchId: z.coerce.number().int().positive().optional(),
+  // Where the customer was, when they chose to share it (§11).
+  city: z.string().trim().max(120).optional(),
+  latitude: z.coerce.number().min(-90).max(90).optional(),
+  longitude: z.coerce.number().min(-180).max(180).optional(),
 });
 
 const idParam = z.object({ id: z.coerce.number().int().positive() });

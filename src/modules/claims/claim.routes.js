@@ -11,6 +11,7 @@ const audit = require('../../utils/audit');
 const { authenticate } = require('../../middleware/auth');
 const { requirePermission } = require('../../middleware/authorize');
 const accessControl = require('../../services/accessControl');
+const analyticsEvents = require('../../services/analyticsEvents');
 const { limitOffset, paginationSchema } = require('../../utils/pagination');
 const { ok, created, paginated } = require('../../utils/respond');
 
@@ -104,7 +105,7 @@ router.post(
   validate({ params: offerIdParam }),
   asyncHandler(async (req, res) => {
     const offer = await queryOne(
-      `SELECT o.id, o.status, o.end_date, o.start_date, s.status AS shop_status
+      `SELECT o.id, o.shop_id, o.status, o.end_date, o.start_date, s.status AS shop_status
          FROM offers o JOIN shops s ON s.id = o.shop_id WHERE o.id = ?`,
       [req.params.offerId],
     );
@@ -131,6 +132,15 @@ router.post(
         [req.params.offerId, req.user.id, generateCode()],
       );
       claimId = result.insertId;
+
+      // Only a genuinely new claim counts - re-claiming returns the same code
+      // and must not inflate the funnel (§10) or the frequent-claimer segment.
+      await analyticsEvents.touchShopCustomer(offer.shop_id, req.user.id, 'claim');
+      await analyticsEvents.record(analyticsEvents.EVENT_TYPES.OFFER_CLAIM, {
+        shopId: offer.shop_id,
+        offerId: Number(req.params.offerId),
+        userId: req.user.id,
+      });
     }
 
     const rows = await rawQuery(`${CLAIM_SELECT} WHERE c.id = ?`, [claimId]);
@@ -178,6 +188,14 @@ router.post(
         WHERE id = ?`,
       [req.user.id, claim.id],
     );
+    await analyticsEvents.touchShopCustomer(claim.shop_id, Number(claim.user_id), 'redeem');
+    await analyticsEvents.record(analyticsEvents.EVENT_TYPES.OFFER_REDEMPTION, {
+      shopId: claim.shop_id,
+      offerId: Number(claim.offer_id),
+      userId: Number(claim.user_id),
+      branchId: claim.branch_id === null ? null : Number(claim.branch_id),
+    });
+
     await audit.record(req, {
       action: 'CLAIM_REDEEMED',
       entityType: 'offer_claim',

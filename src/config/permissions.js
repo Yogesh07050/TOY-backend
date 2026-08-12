@@ -38,6 +38,18 @@ const PERMISSIONS = {
 
   VIEW_ANALYTICS: { category: 'Insights', description: 'View analytics dashboards' },
   VIEW_AUDIT_LOGS: { category: 'Insights', description: 'View audit logs' },
+  // V3 §26: exporting takes data off the platform, so it is granted separately
+  // from merely viewing a dashboard - on top of the plan entitlement.
+  EXPORT_ANALYTICS: { category: 'Insights', description: 'Export analytics reports' },
+
+  // V3 §38. Viewing the plan is safe for any shop member; changing it (and so
+  // committing the merchant to a charge) is a deliberate, separate grant.
+  VIEW_SUBSCRIPTION: { category: 'Subscription', description: 'View the shop subscription plan' },
+  MANAGE_SUBSCRIPTION: {
+    category: 'Subscription',
+    description: 'Change the subscription plan and manage billing',
+  },
+  MANAGE_CAMPAIGNS: { category: 'Campaigns', description: 'Create and manage marketing campaigns' },
 };
 
 const PERMISSION_NAMES = Object.keys(PERMISSIONS);
@@ -73,7 +85,13 @@ const SYSTEM_ROLES = {
       'VIEW_SHOP_MEMBERS',
       'MANAGE_LOCATIONS',
       'VIEW_ANALYTICS',
+      'EXPORT_ANALYTICS',
       'REDEEM_CLAIM',
+      // The merchant owns their own plan, so an Admin of the shop can see it
+      // and change it. What the plan then unlocks is enforced separately (§30).
+      'VIEW_SUBSCRIPTION',
+      'MANAGE_SUBSCRIPTION',
+      'MANAGE_CAMPAIGNS',
       // Deliberately no *_BANNER permissions here: §6 requires a Super Admin to
       // grant those explicitly, per Admin.
     ],
@@ -112,6 +130,10 @@ const MANAGEMENT_PERMISSIONS = [
   'MANAGE_PERMISSIONS',
   'MODERATE_REVIEWS',
   'VIEW_AUDIT_LOGS',
+  'EXPORT_ANALYTICS',
+  'VIEW_SUBSCRIPTION',
+  'MANAGE_SUBSCRIPTION',
+  'MANAGE_CAMPAIGNS',
 ];
 
 const SUPER_ADMIN_ROLE = 'SUPER_ADMIN';

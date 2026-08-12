@@ -4,6 +4,19 @@ const { rawQuery } = require('../db/pool');
 const geo = require('../utils/geo');
 
 /**
+ * Subscription rank of the offer's shop (V3 §36, §37).
+ *
+ * Premium buys priority *eligibility*, so this is applied after the relevance
+ * score has already ordered the list - a paid plan breaks a tie between two
+ * equally relevant offers and does nothing more. A recommendation the customer
+ * has given no signal for still scores zero and never appears.
+ */
+const PLAN_RANK_SQL = `(CASE
+  WHEN sub.status = 'active' AND sub.plan = 'PREMIUM'  THEN 2
+  WHEN sub.status = 'active' AND sub.plan = 'BUSINESS' THEN 1
+  ELSE 0 END)`;
+
+/**
  * Rule-based recommendations (§20, §21).
  *
  * Deliberately not an ML engine: this scores live offers against a handful of
@@ -139,14 +152,16 @@ async function recommend(user, { position = null, radiusKm = 10, limit = 8 } = {
             (SELECT oi.thumbnail_url FROM offer_images oi
               WHERE oi.offer_id = o.id ORDER BY oi.display_order, oi.id LIMIT 1) AS thumbnail_url,
             (${scoreSql}) AS score,
+            ${PLAN_RANK_SQL} AS plan_rank,
             ${flagSelects}
        FROM offers o
        JOIN shops s ON s.id = o.shop_id AND s.status = 'active'
        LEFT JOIN categories c ON c.id = o.category_id
+      LEFT JOIN shop_subscriptions sub ON sub.shop_id = o.shop_id
       WHERE o.status = 'active' AND o.start_date <= NOW() AND o.end_date >= NOW()
         ${userId ? 'AND NOT EXISTS (SELECT 1 FROM favorites fx WHERE fx.offer_id = o.id AND fx.user_id = ?)' : ''}
       HAVING score > 0
-      ORDER BY score DESC, o.favorite_count DESC, o.created_at DESC
+      ORDER BY score DESC, plan_rank DESC, o.favorite_count DESC, o.created_at DESC
       LIMIT ${safeLimit}`,
     userId ? [...doubledParams, userId] : doubledParams,
   );
