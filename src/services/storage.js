@@ -20,6 +20,7 @@ const ALLOWED_MIME = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gi
 
 const SIZES = {
   offer: { width: 1200, height: 900 },
+  banner: { width: 1920, height: 640 },
   shopLogo: { width: 512, height: 512 },
   avatar: { width: 256, height: 256 },
 };
