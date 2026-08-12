@@ -86,7 +86,7 @@ async function createAuthToken(userId, purpose, ttlMs) {
 async function sendVerificationEmail(user) {
   const token = await createAuthToken(user.id, 'email_verification', VERIFY_TTL_MS);
   const url = `${env.appUrl}/auth/verify-email?token=${token}`;
-  await mailer.send({ to: user.email, ...mailer.templates.verifyEmail(user.name, url) });
+  return mailer.send({ to: user.email, ...mailer.templates.verifyEmail(user.name, url) });
 }
 
 // ---------------------------------------------------------------------------
@@ -190,12 +190,14 @@ async function logout(refreshToken, userId) {
 
 async function forgotPassword(email) {
   const user = await queryOne('SELECT * FROM users WHERE email = ?', [email]);
-  // Always report success - otherwise this endpoint enumerates accounts.
-  if (!user || user.status !== 'active') return;
+  // Always report the same outcome - otherwise this endpoint enumerates
+  // accounts. Whether mail delivery is configured is a property of the server,
+  // not of the address, so it is safe to report.
+  if (!user || user.status !== 'active') return { delivered: mailer.isConfigured };
 
   const token = await createAuthToken(user.id, 'password_reset', RESET_TTL_MS);
   const url = `${env.appUrl}/auth/reset-password?token=${token}`;
-  await mailer.send({ to: user.email, ...mailer.templates.resetPassword(user.name, url) });
+  return mailer.send({ to: user.email, ...mailer.templates.resetPassword(user.name, url) });
 }
 
 async function consumeToken(token, purpose) {
@@ -229,8 +231,10 @@ async function verifyEmail(token) {
 
 async function resendVerification(email) {
   const user = await queryOne('SELECT * FROM users WHERE email = ?', [email]);
-  if (!user || user.email_verified) return;
-  await sendVerificationEmail(user);
+  // Same response shape whether or not the address exists, again to avoid
+  // leaking which addresses are registered.
+  if (!user || user.email_verified) return { delivered: mailer.isConfigured };
+  return sendVerificationEmail(user);
 }
 
 async function changePassword(userId, { currentPassword, password: plain }) {

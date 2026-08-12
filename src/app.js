@@ -11,6 +11,7 @@ const cookieParser = require('cookie-parser');
 const env = require('./config/env');
 const routes = require('./routes');
 const { healthCheck } = require('./db/pool');
+const mailer = require('./utils/mailer');
 const { apiLimiter } = require('./middleware/rateLimit');
 const { notFoundHandler, errorHandler } = require('./middleware/errorHandler');
 
@@ -61,7 +62,13 @@ app.get('/health', async (_req, res) => {
   const database = await healthCheck().catch(() => false);
   res.status(database ? 200 : 503).json({
     success: database,
-    data: { status: database ? 'ok' : 'degraded', database, uptime: process.uptime() },
+    data: {
+      status: database ? 'ok' : 'degraded',
+      database,
+      // Surfaced so "why did no email arrive?" is answerable without log access.
+      email: mailer.isConfigured ? 'smtp' : 'not-configured',
+      uptime: process.uptime(),
+    },
   });
 });
 

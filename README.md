@@ -126,6 +126,22 @@ Distance is computed in SQL, never in the client (§33):
 3. `HAVING distance_km <= radius` applies the radius, and `sort=nearest`
    orders by it.
 
+### Email
+
+Verification and password-reset links go out over SMTP. **With `SMTP_HOST`
+empty nothing is sent** — messages are written to `mail-outbox/*.html` and the
+link is printed to the server log, so signup can still be completed locally.
+
+The API never claims otherwise: `/auth/forgot-password` and
+`/auth/resend-verification` return `delivered: true|false`, `/health` reports
+`email: smtp | not-configured`, and the transport is checked once at boot so a
+bad password surfaces on startup rather than at a customer's first reset.
+
+`.env.example` has working Gmail and Mailtrap settings to copy.
+
+Tokens are never returned in an API response — only emailed, logged or written
+to the outbox — so the fallback cannot be used to take over an account.
+
 ### Images
 
 Uploads are buffered in memory, re-encoded through `sharp` (which also

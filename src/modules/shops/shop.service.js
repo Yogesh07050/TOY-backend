@@ -70,12 +70,29 @@ async function list(params, user) {
     : '0 AS is_following';
   const followParams = user ? [user.id] : [];
 
-  // Only staff may see inactive shops, and only the ones they belong to.
   const wantsInactive = params.status && params.status !== 'active';
-  if (wantsInactive) {
-    if (!user) throw ApiError.unauthorized('Sign in to view inactive shops');
+
+  if (params.mine) {
+    // "My shops" is always allowed for a signed-in member: these are the shops
+    // the caller belongs to, so seeing a deactivated one needs no extra
+    // permission. This is what the Post an Offer form asks for.
+    if (!user) throw ApiError.unauthorized('Sign in to view your shops');
+    const ids = user.isSuperAdmin ? null : user.shopIds;
+    if (ids && !ids.length) return { items: [], pagination: { page, limit, total: 0 } };
+    if (ids) {
+      where.push(`s.id IN (${ids.map(() => '?').join(',')})`);
+      whereParams.push(...ids);
+    }
+    if (!wantsInactive) where.push("s.status = 'active'");
+    else if (params.status !== 'all') {
+      where.push('s.status = ?');
+      whereParams.push(params.status);
+    }
+  } else if (wantsInactive) {
+    // Listing every shop including deactivated ones is a different, wider ask.
     // EDIT_SHOP rather than VIEW_SHOP: customers hold VIEW_SHOP globally, which
     // would otherwise expose every deactivated shop to them.
+    if (!user) throw ApiError.unauthorized('Sign in to view inactive shops');
     const scope = accessControl.shopScopeFor(user, 'EDIT_SHOP');
     if (scope !== null) {
       if (!scope.length) throw ApiError.forbidden('You are not assigned to any shop');
@@ -88,14 +105,6 @@ async function list(params, user) {
     }
   } else {
     where.push("s.status = 'active'");
-  }
-
-  if (params.mine) {
-    if (!user) throw ApiError.unauthorized('Sign in to view your shops');
-    const ids = user.shopIds;
-    if (!ids.length) return { items: [], pagination: { page, limit, total: 0 } };
-    where.push(`s.id IN (${ids.map(() => '?').join(',')})`);
-    whereParams.push(...ids);
   }
 
   if (params.search) {

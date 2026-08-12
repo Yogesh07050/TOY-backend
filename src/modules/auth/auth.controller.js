@@ -58,8 +58,13 @@ exports.logout = async (req, res) => {
 };
 
 exports.forgotPassword = async (req, res) => {
-  await service.forgotPassword(req.body.email);
-  ok(res, { message: 'If an account exists for that address, a reset link has been sent.' });
+  const result = await service.forgotPassword(req.body.email);
+  ok(res, {
+    message: result?.delivered
+      ? 'If an account exists for that address, a reset link has been sent.'
+      : 'Email delivery is not configured on this server, so no message could be sent.',
+    delivered: Boolean(result?.delivered),
+  });
 };
 
 exports.resetPassword = async (req, res) => {
@@ -74,8 +79,13 @@ exports.verifyEmail = async (req, res) => {
 };
 
 exports.resendVerification = async (req, res) => {
-  await service.resendVerification(req.body.email);
-  ok(res, { message: 'If the address needs verification, a new link has been sent.' });
+  const result = await service.resendVerification(req.body.email);
+  ok(res, {
+    message: result?.delivered
+      ? 'If the address needs verification, a new link has been sent.'
+      : 'Email delivery is not configured on this server, so no message could be sent.',
+    delivered: Boolean(result?.delivered),
+  });
 };
 
 exports.changePassword = async (req, res) => {

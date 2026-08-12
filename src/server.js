@@ -4,6 +4,7 @@ const app = require('./app');
 const env = require('./config/env');
 const { pool, healthCheck } = require('./db/pool');
 const jobs = require('./jobs');
+const mailer = require('./utils/mailer');
 
 async function main() {
   const connected = await healthCheck().catch((error) => {
@@ -19,6 +20,9 @@ async function main() {
   });
 
   jobs.start();
+
+  // Surfaces a broken SMTP password at boot rather than at the first reset.
+  await mailer.verifyTransport();
 
   const shutdown = async (signal) => {
     console.log('\n%s received, shutting down...', signal);
