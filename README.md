@@ -142,6 +142,49 @@ bad password surfaces on startup rather than at a customer's first reset.
 Tokens are never returned in an API response — only emailed, logged or written
 to the outbox — so the fallback cannot be used to take over an account.
 
+### V2: featured banners
+
+A banner promotes exactly one offer, so `offer_id` is `NOT NULL`. The offer's
+validity always beats the banner's (§10): an expired or deactivated offer pulls
+its banner off the customer page even while the banner's own window is open.
+
+That rule lives in one place — `LIVE_BANNER_CONDITION` in
+`modules/banners/banner.service.js` — used by both the customer feed and the
+admin `isLive` flag, so the two can never disagree.
+
+Banner permissions are granted **individually**. `VIEW_BANNERS`, `CREATE_BANNER`,
+`EDIT_BANNER`, `DELETE_BANNER` and `PUBLISH_BANNER` are deliberately absent from
+the built-in ADMIN role (§6): a Super Admin grants them per Admin, typically via
+a custom shop-scoped role. Creating and publishing are separate, so an Admin can
+hold `CREATE_BANNER` and still be refused a published banner — it saves as a
+draft instead.
+
+### V2: discovery
+
+`/api/discovery/featured|ending-soon|nearby|recommended` are read-only and
+anonymous-friendly (`optionalAuth`), so the future mobile app (§26) can call
+them before login and get a personalised response afterwards.
+
+Recommendations live in `services/recommendations.js` as a standalone,
+rule-based scorer using the §21 weights. Each result carries the `score` and a
+human `reason` ("Because you follow this shop"), and the module has a single
+entry point so a model can replace the internals later without touching the
+routes.
+
+Ending Soon thresholds and the default radius are configurable via
+`DISCOVERY_*` env vars rather than hardcoded (§16).
+
+### V2: claims, redemptions and the funnel
+
+A claim reserves an offer and issues a short code (no O/0/I/1, so it survives
+being read aloud); shop staff redeem it with `REDEEM_CLAIM`, scoped to their own
+shop. Claiming twice returns the same code rather than issuing a second one.
+
+Together these close the §24 funnel — impressions → views → saves → claims →
+redemptions — where each stage reports its conversion against the previous one.
+`/api/analytics/funnel` and `/growth` accept `days` or an explicit `from`/`to`
+range, and every query in a response uses the same resolved window.
+
 ### Images
 
 Uploads are buffered in memory, re-encoded through `sharp` (which also
@@ -180,6 +223,10 @@ All routes are under `/api`. Responses are enveloped:
 | Analytics | `GET /analytics/overview\|offers\|shops\|categories\|locations`, `GET /analytics/shops/:shopId` |
 | Audit | `GET /audit-logs`, `GET /audit-logs/filters` |
 | Uploads | `POST /uploads/:type` (`offers\|shops\|categories\|avatars`), `POST /uploads/offers/batch` |
+| Banners (V2) | `GET\|POST /banners`, `GET\|PUT\|DELETE /banners/:id`, `PATCH /banners/:id/status`, `GET /banners/selectable-offers`, `GET /banners/analytics` |
+| Discovery (V2) | `GET /discovery/featured\|ending-soon\|nearby\|recommended`, `POST /discovery/featured/:id/track` |
+| Claims (V2) | `GET /claims`, `POST /claims/:offerId`, `GET /claims/lookup/:code`, `POST /claims/lookup/:code/redeem` |
+| Analytics (V2) | `GET /analytics/funnel`, `GET /analytics/growth` |
 
 ### Offer listing parameters
 

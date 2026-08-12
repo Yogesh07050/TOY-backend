@@ -260,6 +260,10 @@ function buildListQuery(params, user) {
     where.push('o.end_date BETWEEN NOW() AND DATE_ADD(NOW(), INTERVAL ? DAY)');
     whereParams.push(params.expiringInDays);
   }
+  if (params.expiringInHours) {
+    where.push('o.end_date BETWEEN NOW() AND DATE_ADD(NOW(), INTERVAL ? HOUR)');
+    whereParams.push(params.expiringInHours);
+  }
   if (params.startDate) {
     where.push('o.end_date >= ?');
     whereParams.push(params.startDate);

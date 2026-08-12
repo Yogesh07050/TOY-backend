@@ -59,6 +59,13 @@ const env = {
     maxUploadBytes: int(process.env.MAX_UPLOAD_MB, 5) * 1024 * 1024,
   },
 
+  /** Discovery tuning (§16, §18). Configurable rather than hardcoded. */
+  discovery: {
+    defaultRadiusKm: int(process.env.DISCOVERY_DEFAULT_RADIUS_KM, 10),
+    endingSoonHours: int(process.env.DISCOVERY_ENDING_SOON_HOURS, 72),
+    urgentHours: int(process.env.DISCOVERY_URGENT_HOURS, 6),
+  },
+
   seed: {
     superAdminEmail: process.env.SEED_SUPERADMIN_EMAIL || 'superadmin@offers.app',
     superAdminPassword: process.env.SEED_SUPERADMIN_PASSWORD || 'SuperAdmin@123',

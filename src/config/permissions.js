@@ -26,6 +26,16 @@ const PERMISSIONS = {
 
   MANAGE_CATEGORIES: { category: 'Catalogue', description: 'Manage offer categories' },
 
+  // Banner permissions are granted individually (§6). Holding the Admin role
+  // is deliberately not enough - a Super Admin must grant each one.
+  VIEW_BANNERS: { category: 'Banners', description: 'View featured banners' },
+  CREATE_BANNER: { category: 'Banners', description: 'Create featured banners' },
+  EDIT_BANNER: { category: 'Banners', description: 'Edit featured banners' },
+  DELETE_BANNER: { category: 'Banners', description: 'Delete featured banners' },
+  PUBLISH_BANNER: { category: 'Banners', description: 'Publish or deactivate banners' },
+
+  REDEEM_CLAIM: { category: 'Offers', description: 'Redeem a customer offer claim' },
+
   VIEW_ANALYTICS: { category: 'Insights', description: 'View analytics dashboards' },
   VIEW_AUDIT_LOGS: { category: 'Insights', description: 'View audit logs' },
 };
@@ -63,6 +73,9 @@ const SYSTEM_ROLES = {
       'VIEW_SHOP_MEMBERS',
       'MANAGE_LOCATIONS',
       'VIEW_ANALYTICS',
+      'REDEEM_CLAIM',
+      // Deliberately no *_BANNER permissions here: §6 requires a Super Admin to
+      // grant those explicitly, per Admin.
     ],
   },
   CUSTOMER: {
@@ -77,6 +90,11 @@ const SYSTEM_ROLES = {
  * may reach the admin area at all, regardless of which shop they hold them for.
  */
 const MANAGEMENT_PERMISSIONS = [
+  'VIEW_BANNERS',
+  'CREATE_BANNER',
+  'EDIT_BANNER',
+  'DELETE_BANNER',
+  'PUBLISH_BANNER',
   'CREATE_OFFER',
   'EDIT_OFFER',
   'DELETE_OFFER',

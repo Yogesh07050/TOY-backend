@@ -2,6 +2,7 @@
 
 const cron = require('node-cron');
 const offerService = require('../modules/offers/offer.service');
+const bannerService = require('../modules/banners/banner.service');
 const notifications = require('../services/notifications');
 const authService = require('../modules/auth/auth.service');
 
@@ -18,6 +19,18 @@ const jobs = [
       const { activated, expired } = await offerService.syncLifecycleStatuses();
       if (activated || expired) {
         console.log('[jobs] offer lifecycle: %d activated, %d expired', activated, expired);
+      }
+
+      // Banners follow the same clock. Their customer-facing visibility is
+      // computed live from the offer too, so a stale status can never leak an
+      // expired offer onto the page - this just keeps the admin list honest.
+      const banners = await bannerService.syncLifecycleStatuses();
+      if (banners.published || banners.expired) {
+        console.log(
+          '[jobs] banner lifecycle: %d published, %d expired',
+          banners.published,
+          banners.expired,
+        );
       }
     },
   },

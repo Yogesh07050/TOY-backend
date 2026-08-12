@@ -420,3 +420,94 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   KEY idx_audit_created (created_at),
   CONSTRAINT fk_audit_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- =====================================================================
+--  V2 additions
+-- =====================================================================
+
+-- ---------------------------------------------------------------------
+-- Featured banners (§13). Every banner promotes one specific offer, so
+-- offer_id is NOT NULL: a banner without a destination has no purpose.
+-- ON DELETE CASCADE means deleting an offer takes its banners with it.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS banners (
+  id               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  title            VARCHAR(200)    NOT NULL,
+  subtitle         VARCHAR(300)            DEFAULT NULL,
+  description      TEXT                    DEFAULT NULL,
+  image_url        VARCHAR(500)            DEFAULT NULL,
+  mobile_image_url VARCHAR(500)            DEFAULT NULL,
+  desktop_image_url VARCHAR(500)           DEFAULT NULL,
+  offer_id         BIGINT UNSIGNED NOT NULL,
+  button_text      VARCHAR(60)     NOT NULL DEFAULT 'View Offer',
+  start_date       DATETIME        NOT NULL,
+  end_date         DATETIME        NOT NULL,
+  status           ENUM('draft','scheduled','published','expired','deactivated')
+                                   NOT NULL DEFAULT 'draft',
+  display_order    INT             NOT NULL DEFAULT 0,
+  impression_count INT UNSIGNED    NOT NULL DEFAULT 0,
+  click_count      INT UNSIGNED    NOT NULL DEFAULT 0,
+  created_by       BIGINT UNSIGNED         DEFAULT NULL,
+  updated_by       BIGINT UNSIGNED         DEFAULT NULL,
+  created_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_banner_offer (offer_id),
+  -- The customer query filters on status + window and orders by display_order.
+  KEY idx_banner_live (status, start_date, end_date, display_order),
+  CONSTRAINT fk_banner_offer      FOREIGN KEY (offer_id)   REFERENCES offers (id) ON DELETE CASCADE,
+  CONSTRAINT fk_banner_created_by FOREIGN KEY (created_by) REFERENCES users (id)  ON DELETE SET NULL,
+  CONSTRAINT fk_banner_updated_by FOREIGN KEY (updated_by) REFERENCES users (id)  ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS banner_events (
+  id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  banner_id  BIGINT UNSIGNED NOT NULL,
+  user_id    BIGINT UNSIGNED         DEFAULT NULL,
+  event_type ENUM('impression','click') NOT NULL,
+  ip_address VARCHAR(64)             DEFAULT NULL,
+  created_at DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_be_banner (banner_id, event_type),
+  KEY idx_be_created (created_at),
+  CONSTRAINT fk_be_banner FOREIGN KEY (banner_id) REFERENCES banners (id) ON DELETE CASCADE,
+  CONSTRAINT fk_be_user   FOREIGN KEY (user_id)   REFERENCES users (id)   ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------
+-- Claims and redemptions (§22-§24). A claim is the customer reserving an
+-- offer; redemption is staff marking it used, which is what closes the
+-- funnel. The code is what a QR scan resolves to.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS offer_claims (
+  id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  offer_id     BIGINT UNSIGNED NOT NULL,
+  user_id      BIGINT UNSIGNED NOT NULL,
+  branch_id    BIGINT UNSIGNED         DEFAULT NULL,
+  code         VARCHAR(24)     NOT NULL,
+  status       ENUM('claimed','redeemed','expired','cancelled') NOT NULL DEFAULT 'claimed',
+  claimed_at   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  redeemed_at  DATETIME                DEFAULT NULL,
+  redeemed_by  BIGINT UNSIGNED         DEFAULT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_claim_code (code),
+  -- One live claim per customer per offer; re-claiming returns the same code.
+  UNIQUE KEY uq_claim_user_offer (user_id, offer_id),
+  KEY idx_claim_offer (offer_id, status),
+  KEY idx_claim_claimed (claimed_at),
+  CONSTRAINT fk_claim_offer       FOREIGN KEY (offer_id)    REFERENCES offers (id)        ON DELETE CASCADE,
+  CONSTRAINT fk_claim_user        FOREIGN KEY (user_id)     REFERENCES users (id)         ON DELETE CASCADE,
+  CONSTRAINT fk_claim_branch      FOREIGN KEY (branch_id)   REFERENCES shop_branches (id) ON DELETE SET NULL,
+  CONSTRAINT fk_claim_redeemed_by FOREIGN KEY (redeemed_by) REFERENCES users (id)         ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Search terms, used only as a mild recommendation signal (§20).
+CREATE TABLE IF NOT EXISTS search_history (
+  id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  user_id    BIGINT UNSIGNED NOT NULL,
+  term       VARCHAR(120)    NOT NULL,
+  created_at DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_search_user (user_id, created_at),
+  CONSTRAINT fk_search_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

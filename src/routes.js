@@ -19,4 +19,9 @@ router.use('/analytics', require('./modules/analytics/analytics.routes'));
 router.use('/audit-logs', require('./modules/audit/audit.routes'));
 router.use('/uploads', require('./modules/uploads/upload.routes'));
 
+// ---- V2 ----
+router.use('/banners', require('./modules/banners/banner.routes'));
+router.use('/discovery', require('./modules/discovery/discovery.routes'));
+router.use('/claims', require('./modules/claims/claim.routes'));
+
 module.exports = router;

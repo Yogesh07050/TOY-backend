@@ -44,6 +44,8 @@ const listOffersSchema = z
     offerType: z.enum(OFFER_TYPES).optional(),
     status: z.enum([...STATUSES, 'all']).optional(),
     expiringInDays: z.coerce.number().int().min(1).max(365).optional(),
+    // Hour granularity matters for Ending Soon, where "3 hours left" is the point.
+    expiringInHours: z.coerce.number().int().min(1).max(8760).optional(),
     startDate: z.coerce.date().optional(),
     endDate: z.coerce.date().optional(),
     favorites: z.coerce.boolean().optional(),

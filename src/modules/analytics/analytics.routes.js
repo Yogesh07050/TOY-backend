@@ -7,7 +7,7 @@ const ApiError = require('../../utils/ApiError');
 const validate = require('../../middleware/validate');
 const asyncHandler = require('../../utils/asyncHandler');
 const { authenticate } = require('../../middleware/auth');
-const { requirePermission } = require('../../middleware/authorize');
+const { requirePermission, requireGlobalPermission } = require('../../middleware/authorize');
 const accessControl = require('../../services/accessControl');
 const { ok } = require('../../utils/respond');
 
@@ -15,9 +15,28 @@ const router = express.Router();
 
 const rangeQuery = z.object({
   days: z.coerce.number().int().min(1).max(365).default(30),
+  // Custom range (§22). When both are given they win over `days`.
+  from: z.coerce.date().optional(),
+  to: z.coerce.date().optional(),
   shopId: z.coerce.number().int().positive().optional(),
   limit: z.coerce.number().int().min(1).max(50).default(10),
 });
+
+/**
+ * Resolves the time filter to an explicit window so every query in a response
+ * covers exactly the same period. `days` is kept as the simple default.
+ */
+function resolveRange(query) {
+  if (query.from && query.to) {
+    const to = new Date(query.to);
+    // An inclusive "to" date should cover the whole day the user picked.
+    if (to.getHours() === 0 && to.getMinutes() === 0) to.setHours(23, 59, 59, 999);
+    return { from: new Date(query.from), to, label: 'custom' };
+  }
+  const to = new Date();
+  const from = new Date(to.getTime() - query.days * 86400000);
+  return { from, to, label: `${query.days}d` };
+}
 
 const shopIdParam = z.object({ shopId: z.coerce.number().int().positive() });
 
@@ -81,6 +100,13 @@ router.get(
       offerScope.params,
     );
 
+    const claimTotals = await rawQuery(
+      `SELECT COUNT(*) AS claims, SUM(c.status = 'redeemed') AS redemptions
+         FROM offer_claims c JOIN offers o ON o.id = c.offer_id
+        WHERE 1 = 1${offerScope.sql}`,
+      offerScope.params,
+    );
+
     const data = {
       scope: scope === null ? 'platform' : 'shop',
       shopIds: scope,
@@ -97,6 +123,8 @@ router.get(
         views: Number(engagement[0].views),
         clicks: Number(engagement[0].clicks),
         favorites: Number(engagement[0].favorites),
+        claims: Number(claimTotals[0].claims),
+        redemptions: Number(claimTotals[0].redemptions ?? 0),
       },
     };
 
@@ -109,9 +137,22 @@ router.get(
         queryOne("SELECT COUNT(*) AS total, SUM(status = 'active') AS active FROM shop_branches"),
         queryOne('SELECT COUNT(*) AS total FROM followed_shops'),
       ]);
+      // §23 asks for customers and admins separately: an "admin" is anyone who
+      // belongs to a shop or holds a global role beyond CUSTOMER.
+      const staff = await queryOne(
+        `SELECT COUNT(DISTINCT u.id) AS total FROM users u
+          WHERE u.status = 'active'
+            AND (EXISTS (SELECT 1 FROM shop_members sm
+                          WHERE sm.user_id = u.id AND sm.status = 'active')
+              OR EXISTS (SELECT 1 FROM user_roles ur JOIN roles r ON r.id = ur.role_id
+                          WHERE ur.user_id = u.id AND r.name <> 'CUSTOMER'))`,
+      );
+
       data.platform = {
         totalUsers: Number(users.total),
         activeUsers: Number(users.active ?? 0),
+        totalAdmins: Number(staff.total),
+        totalCustomers: Math.max(Number(users.total) - Number(staff.total), 0),
         totalShops: Number(shops.total),
         activeShops: Number(shops.active ?? 0),
         totalBranches: Number(branches.total),
@@ -389,6 +430,122 @@ router.get(
         followers: Number(row.followers),
       })),
     );
+  }),
+);
+
+/**
+ * Offer funnel (§24): impressions -> views -> saves -> claims -> redemptions.
+ *
+ * Impressions, views and shares live in `offer_views`; saves come from
+ * `favorites`; claims and redemptions from `offer_claims`. All five are counted
+ * over the same window so the drop-off between stages is meaningful.
+ */
+router.get(
+  '/funnel',
+  validate({ query: rangeQuery }),
+  asyncHandler(async (req, res) => {
+    const scope = analyticsScope(req.user, req.query.shopId);
+    const offerScope = scopeClause(scope);
+    const { from, to } = resolveRange(req.query);
+    const window = [from, to];
+
+    const [events, saves, claims] = await Promise.all([
+      rawQuery(
+        `SELECT v.event_type, COUNT(*) AS count
+           FROM offer_views v JOIN offers o ON o.id = v.offer_id
+          WHERE v.created_at BETWEEN ? AND ?${offerScope.sql}
+          GROUP BY v.event_type`,
+        [...window, ...offerScope.params],
+      ),
+      rawQuery(
+        `SELECT COUNT(*) AS count FROM favorites f JOIN offers o ON o.id = f.offer_id
+          WHERE f.created_at BETWEEN ? AND ?${offerScope.sql}`,
+        [...window, ...offerScope.params],
+      ),
+      rawQuery(
+        `SELECT
+            COUNT(*) AS claims,
+            SUM(c.status = 'redeemed') AS redemptions
+           FROM offer_claims c JOIN offers o ON o.id = c.offer_id
+          WHERE c.claimed_at BETWEEN ? AND ?${offerScope.sql}`,
+        [...window, ...offerScope.params],
+      ),
+    ]);
+
+    const byType = Object.fromEntries(events.map((row) => [row.event_type, Number(row.count)]));
+    const impressions = byType.impression ?? 0;
+    const views = byType.view ?? 0;
+    const savesCount = Number(saves[0].count);
+    const claimsCount = Number(claims[0].claims);
+    const redemptions = Number(claims[0].redemptions ?? 0);
+
+    // Conversion is expressed against the previous stage, which is what shows
+    // where customers actually drop out.
+    const rate = (value, previous) =>
+      previous > 0 ? Number(((value / previous) * 100).toFixed(1)) : null;
+
+    ok(res, {
+      range: { from, to },
+      stages: [
+        { key: 'impressions', label: 'Impressions', value: impressions, conversion: null },
+        { key: 'views', label: 'Views', value: views, conversion: rate(views, impressions) },
+        { key: 'saves', label: 'Saves', value: savesCount, conversion: rate(savesCount, views) },
+        { key: 'claims', label: 'Claims', value: claimsCount, conversion: rate(claimsCount, savesCount) },
+        {
+          key: 'redemptions',
+          label: 'Redemptions',
+          value: redemptions,
+          conversion: rate(redemptions, claimsCount),
+        },
+      ],
+      totals: { impressions, views, saves: savesCount, claims: claimsCount, redemptions },
+    });
+  }),
+);
+
+/** Platform growth series for the Super Admin dashboard (§23). */
+router.get(
+  '/growth',
+  requireGlobalPermission('VIEW_ANALYTICS'),
+  validate({ query: rangeQuery }),
+  asyncHandler(async (req, res) => {
+    const { from, to } = resolveRange(req.query);
+    const window = [from, to];
+
+    const series = async (table, column) =>
+      rawQuery(
+        `SELECT DATE(${column}) AS day, COUNT(*) AS count FROM ${table}
+          WHERE ${column} BETWEEN ? AND ? GROUP BY day ORDER BY day`,
+        window,
+      );
+
+    const [customers, shops, offers, claims] = await Promise.all([
+      series('users', 'created_at'),
+      series('shops', 'created_at'),
+      series('offers', 'created_at'),
+      series('offer_claims', 'claimed_at'),
+    ]);
+
+    const merge = (rows, key, into) => {
+      for (const row of rows) {
+        const day = String(row.day);
+        into.set(day, { ...(into.get(day) ?? { day: row.day }), [key]: Number(row.count) });
+      }
+      return into;
+    };
+
+    const timeline = new Map();
+    merge(customers, 'customers', timeline);
+    merge(shops, 'shops', timeline);
+    merge(offers, 'offers', timeline);
+    merge(claims, 'claims', timeline);
+
+    ok(res, {
+      range: { from, to },
+      timeline: [...timeline.values()]
+        .map((entry) => ({ customers: 0, shops: 0, offers: 0, claims: 0, ...entry }))
+        .sort((a, b) => String(a.day).localeCompare(String(b.day))),
+    });
   }),
 );
 

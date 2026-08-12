@@ -44,6 +44,28 @@ const COLUMN_PATCHES = [
   },
 ];
 
+/**
+ * Patches that are not "add a missing column" - each carries its own check so
+ * re-running the migration is still a no-op.
+ */
+const STATEMENT_PATCHES = [
+  {
+    name: "offer_views.event_type += 'impression'",
+    // V2 tracks impressions to close the top of the funnel (§24).
+    check: async (connection, dbName) => {
+      const [rows] = await connection.query(
+        `SELECT COLUMN_TYPE AS t FROM information_schema.COLUMNS
+          WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'offer_views' AND COLUMN_NAME = 'event_type'`,
+        [dbName],
+      );
+      return rows.length > 0 && !rows[0].t.includes('impression');
+    },
+    sql: `ALTER TABLE offer_views
+            MODIFY COLUMN event_type ENUM('view','click','share','impression')
+            NOT NULL DEFAULT 'view'`,
+  },
+];
+
 async function applyPatches(connection, dbName) {
   const applied = [];
   for (const patch of COLUMN_PATCHES) {
@@ -58,6 +80,13 @@ async function applyPatches(connection, dbName) {
     for (const followUp of patch.after ?? []) await connection.query(followUp);
     applied.push(`${patch.table}.${patch.column}`);
   }
+
+  for (const patch of STATEMENT_PATCHES) {
+    if (!(await patch.check(connection, dbName))) continue;
+    await connection.query(patch.sql);
+    applied.push(patch.name);
+  }
+
   return applied;
 }
 
