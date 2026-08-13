@@ -969,12 +969,18 @@ async function acquisition(context) {
     ),
   ]);
 
+  // Restricted to the customers acquired in this window, not everyone who
+  // viewed something. This is an acquisition funnel: every stage has to be a
+  // subset of the cohort at the top of it, or the conversions read above 100%.
   const viewed = await rawQuery(
     `SELECT COUNT(DISTINCT v.user_id) AS count
-       FROM offer_views v JOIN offers o ON o.id = v.offer_id
+       FROM offer_views v
+       JOIN offers o ON o.id = v.offer_id
+       JOIN shop_customers sc ON sc.shop_id = o.shop_id AND sc.user_id = v.user_id
       WHERE v.user_id IS NOT NULL AND v.event_type = 'view'
-        AND v.created_at BETWEEN ? AND ?${scope.sql}`,
-    [from, to, ...scope.params],
+        AND v.created_at BETWEEN ? AND ?
+        AND sc.first_seen_at BETWEEN ? AND ?${scope.sql}`,
+    [from, to, from, to, ...scope.params],
   );
 
   const newCustomers = num(current[0].count);
