@@ -61,6 +61,19 @@ const COLUMN_PATCHES = [
     column: 'campaign_id',
     sql: 'ALTER TABLE banners ADD COLUMN campaign_id BIGINT UNSIGNED DEFAULT NULL AFTER click_count',
   },
+
+  // ---- V2 personalization ---------------------------------------------------
+  // Lives on users (like pref_city/pref_latitude/pref_longitude above) so it
+  // rides along on /auth/me, login and register for free — the mobile app's
+  // boot-time onboarding check needs it with no extra request.
+  {
+    table: 'users',
+    column: 'preferences_completed',
+    sql: 'ALTER TABLE users ADD COLUMN preferences_completed TINYINT(1) NOT NULL DEFAULT 0 AFTER pref_longitude',
+    after: [
+      'ALTER TABLE users ADD COLUMN minimum_discount_percent TINYINT UNSIGNED DEFAULT NULL AFTER preferences_completed',
+    ],
+  },
 ];
 
 /**

@@ -22,6 +22,11 @@ function publicUser(user, context) {
     status: user.status,
     emailVerified: Boolean(user.email_verified),
     avatarUrl: user.avatar_url,
+    preferencesCompleted: Boolean(user.preferences_completed),
+    minimumDiscountPercent:
+      user.minimum_discount_percent === null || user.minimum_discount_percent === undefined
+        ? null
+        : Number(user.minimum_discount_percent),
     preferredLocation:
       user.pref_city || user.pref_latitude
         ? {

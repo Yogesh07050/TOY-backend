@@ -330,6 +330,41 @@ CREATE TABLE IF NOT EXISTS followed_categories (
   CONSTRAINT fk_fc_category FOREIGN KEY (category_id) REFERENCES categories (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- ---------------------------------------------------------------------
+-- Customer personalization (V2 §23) — explicit onboarding preferences.
+-- Distinct from followed_shops/followed_categories above: those are
+-- notification opt-ins the customer can toggle from anywhere, these are
+-- the weighted taste profile collected once at onboarding (categories
+-- require a minimum of 5, enforced at the application layer) and reused
+-- as recommendation-scoring signals. Favorite shops intentionally reuse
+-- followed_shops rather than a parallel table — see preferences module.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS customer_category_preferences (
+  id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  user_id     BIGINT UNSIGNED NOT NULL,
+  category_id BIGINT UNSIGNED NOT NULL,
+  created_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_ccp_user_category (user_id, category_id),
+  KEY idx_ccp_category (category_id),
+  CONSTRAINT fk_ccp_user     FOREIGN KEY (user_id)     REFERENCES users (id)      ON DELETE CASCADE,
+  CONSTRAINT fk_ccp_category FOREIGN KEY (category_id) REFERENCES categories (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- offer_type here is an app-level vocabulary (PERCENTAGE_DISCOUNT, CASHBACK,
+-- APP_EXCLUSIVE, ...) distinct from offers.offer_type's ENUM, which doesn't
+-- cover deal shapes like cashback/combo/clearance. VARCHAR, not a FK/ENUM,
+-- for the same "add a value without a migration" reason as analytics_events.
+CREATE TABLE IF NOT EXISTS customer_preferred_offer_types (
+  id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  user_id    BIGINT UNSIGNED NOT NULL,
+  offer_type VARCHAR(40)     NOT NULL,
+  created_at DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_cpot_user_type (user_id, offer_type),
+  CONSTRAINT fk_cpot_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS reviews (
   id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   user_id    BIGINT UNSIGNED NOT NULL,

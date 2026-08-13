@@ -81,6 +81,11 @@ const mapUser = (row) => ({
   status: row.status,
   emailVerified: Boolean(row.email_verified),
   avatarUrl: row.avatar_url,
+  preferencesCompleted: Boolean(row.preferences_completed),
+  minimumDiscountPercent:
+    row.minimum_discount_percent === null || row.minimum_discount_percent === undefined
+      ? null
+      : Number(row.minimum_discount_percent),
   preferredLocation: {
     city: row.pref_city,
     latitude: row.pref_latitude === null ? null : Number(row.pref_latitude),

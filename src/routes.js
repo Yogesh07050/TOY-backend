@@ -13,6 +13,7 @@ router.use('/categories', require('./modules/categories/category.routes'));
 router.use('/offers', require('./modules/offers/offer.routes'));
 router.use('/favorites', require('./modules/favorites/favorite.routes'));
 router.use('/following', require('./modules/following/following.routes'));
+router.use('/preferences', require('./modules/preferences/preferences.routes'));
 router.use('/reviews', require('./modules/reviews/review.routes'));
 router.use('/notifications', require('./modules/notifications/notification.routes'));
 router.use('/analytics', require('./modules/analytics/analytics.routes'));

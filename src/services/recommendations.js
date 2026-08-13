@@ -27,9 +27,14 @@ const PLAN_RANK_SQL = `(CASE
  * Weights come straight from §21.
  */
 const WEIGHTS = {
+  // V2 §12/§21: explicit onboarding preferences outrank passive/behavioral
+  // signals below - the customer told us this directly, once, on purpose.
+  preferredCategory: 6,
   followedShop: 5,
   followedCategory: 5,
   savedSimilar: 4,
+  minDiscountMet: 3,
+  preferredOfferType: 3,
   viewedCategory: 3,
   viewedShop: 3,
   searched: 2,
@@ -40,9 +45,12 @@ const WEIGHTS = {
 
 /** Signals in the order we prefer to explain a recommendation by. */
 const REASONS = [
+  ['preferredCategory', (offer) => `Because you like ${offer.category?.name ?? 'this category'}`],
   ['followedShop', 'Because you follow this shop'],
   ['followedCategory', 'Because you follow this category'],
   ['savedSimilar', 'Similar to an offer you saved'],
+  ['minDiscountMet', 'Matches your discount preference'],
+  ['preferredOfferType', 'A deal type you like'],
   ['viewedCategory', (offer) => `Because you viewed ${offer.category?.name ?? 'this category'}`],
   ['viewedShop', 'Because you viewed this shop'],
   ['searched', 'Matches something you searched for'],
@@ -68,6 +76,15 @@ async function recommend(user, { position = null, radiusKm = 10, limit = 8 } = {
   const signals = {};
 
   if (userId) {
+    // V2 §5/§9: explicit onboarding preference, distinct from followedCategory
+    // (a notification opt-in) even though both are "user likes category X".
+    signals.preferredCategory = `CASE WHEN EXISTS (
+      SELECT 1 FROM customer_category_preferences ccp
+       WHERE ccp.user_id = ? AND ccp.category_id IN (o.category_id, o.subcategory_id)
+    ) THEN 1 ELSE 0 END`;
+    // Favorite shops (V2 §6) intentionally reuse followed_shops - see schema.sql -
+    // so this one signal already covers both "follows for notifications" and
+    // "selected as a favorite shop during onboarding".
     signals.followedShop = `CASE WHEN EXISTS (
       SELECT 1 FROM followed_shops fs WHERE fs.user_id = ? AND fs.shop_id = o.shop_id
     ) THEN 1 ELSE 0 END`;
@@ -78,6 +95,28 @@ async function recommend(user, { position = null, radiusKm = 10, limit = 8 } = {
     signals.savedSimilar = `CASE WHEN EXISTS (
       SELECT 1 FROM favorites f JOIN offers so ON so.id = f.offer_id
        WHERE f.user_id = ? AND so.id <> o.id AND so.category_id = o.category_id
+    ) THEN 1 ELSE 0 END`;
+    // V2 §7: "discount >= X%" only makes sense against a percentage discount -
+    // a flat-amount or non-discount offer has no percentage to compare.
+    signals.minDiscountMet = `CASE WHEN EXISTS (
+      SELECT 1 FROM users u
+       WHERE u.id = ? AND u.minimum_discount_percent IS NOT NULL
+         AND o.discount_type = 'percentage' AND o.discount_value >= u.minimum_discount_percent
+    ) THEN 1 ELSE 0 END`;
+    // V2 §8: maps the customer-facing deal-type vocabulary onto the offer
+    // columns that actually distinguish them. CASHBACK/FREE_ITEM/COMBO_OFFER/
+    // CLEARANCE_SALE/APP_EXCLUSIVE have no corresponding offer column yet (see
+    // preferences.constants.js) so they deliberately match nothing here rather
+    // than guessing.
+    signals.preferredOfferType = `CASE WHEN EXISTS (
+      SELECT 1 FROM customer_preferred_offer_types cpot
+       WHERE cpot.user_id = ?
+         AND ((cpot.offer_type = 'PERCENTAGE_DISCOUNT' AND o.offer_type = 'percentage')
+           OR (cpot.offer_type = 'FLAT_DISCOUNT' AND o.offer_type = 'flat')
+           OR (cpot.offer_type = 'BUY_ONE_GET_ONE' AND o.offer_type = 'buy_x_get_y'
+               AND o.buy_quantity = 1 AND o.get_quantity = 1)
+           OR (cpot.offer_type = 'BUY_TWO_GET_ONE' AND o.offer_type = 'buy_x_get_y'
+               AND o.buy_quantity = 2 AND o.get_quantity = 1))
     ) THEN 1 ELSE 0 END`;
     signals.viewedCategory = `CASE WHEN EXISTS (
       SELECT 1 FROM offer_views v JOIN offers vo ON vo.id = v.offer_id
@@ -95,10 +134,20 @@ async function recommend(user, { position = null, radiusKm = 10, limit = 8 } = {
          AND (o.title LIKE CONCAT('%', sh.term, '%')
            OR o.product_name LIKE CONCAT('%', sh.term, '%'))
     ) THEN 1 ELSE 0 END`;
-    params.push(userId, userId, userId, userId, userId, userId);
+    params.push(userId, userId, userId, userId, userId, userId, userId, userId, userId);
   } else {
     // Anonymous visitors get the non-personal signals only.
-    for (const key of ['followedShop', 'followedCategory', 'savedSimilar', 'viewedCategory', 'viewedShop', 'searched']) {
+    for (const key of [
+      'preferredCategory',
+      'followedShop',
+      'followedCategory',
+      'savedSimilar',
+      'minDiscountMet',
+      'preferredOfferType',
+      'viewedCategory',
+      'viewedShop',
+      'searched',
+    ]) {
       signals[key] = '0';
     }
   }
