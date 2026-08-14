@@ -62,6 +62,7 @@ async function hasFeature(shopId, feature) {
  */
 const LIMIT_LABELS = {
   offersPerMonth: { one: 'one published offer per month', many: 'published offers per month' },
+  servicesPerMonth: { one: 'one published service per month', many: 'published services per month' },
   branches: { one: 'a single branch', many: 'branches' },
   categories: { one: 'a single category', many: 'categories' },
   banners: { one: 'one featured banner', many: 'featured banners' },

@@ -44,6 +44,11 @@ const FEATURES = {
   NOTIFICATIONS_ADVANCED: 'NOTIFICATIONS_ADVANCED',
   PRIORITY_SUPPORT: 'PRIORITY_SUPPORT',
   PRIORITY_DISCOVERY: 'PRIORITY_DISCOVERY',
+
+  // Services (V4)
+  SERVICE_SCHEDULING: 'SERVICE_SCHEDULING',
+  SERVICE_ANALYTICS_BASIC: 'SERVICE_ANALYTICS_BASIC',
+  SERVICE_ANALYTICS_ADVANCED: 'SERVICE_ANALYTICS_ADVANCED',
 };
 
 const FEATURE_LABELS = {
@@ -73,6 +78,9 @@ const FEATURE_LABELS = {
   NOTIFICATIONS_ADVANCED: 'Advanced notifications',
   PRIORITY_SUPPORT: 'Priority support',
   PRIORITY_DISCOVERY: 'Priority customer app discovery',
+  SERVICE_SCHEDULING: 'Service scheduling',
+  SERVICE_ANALYTICS_BASIC: 'Basic service analytics',
+  SERVICE_ANALYTICS_ADVANCED: 'Advanced service analytics',
 };
 
 /** `null` for a limit means unlimited. */
@@ -87,6 +95,7 @@ const PLANS = {
     description: 'Discover and try the platform with a single offer per month.',
     limits: {
       offersPerMonth: 1,
+      servicesPerMonth: 1,
       branches: 1,
       categories: 1,
       banners: 0,
@@ -107,6 +116,7 @@ const PLANS = {
     description: 'For merchants who actively publish and promote offers.',
     limits: {
       offersPerMonth: null,
+      servicesPerMonth: null,
       branches: 2,
       categories: 5,
       banners: 0,
@@ -123,6 +133,8 @@ const PLANS = {
       FEATURES.LOCATION_ANALYTICS_BASIC,
       FEATURES.FUNNEL_BASIC,
       FEATURES.CLAIMS_ANALYTICS,
+      FEATURES.SERVICE_SCHEDULING,
+      FEATURES.SERVICE_ANALYTICS_BASIC,
     ],
   },
 
@@ -137,6 +149,7 @@ const PLANS = {
       'Promotion plus customer, location and campaign intelligence with actionable recommendations.',
     limits: {
       offersPerMonth: null,
+      servicesPerMonth: null,
       branches: null,
       categories: null,
       banners: null,
@@ -171,6 +184,9 @@ const PLANS = {
       FEATURES.NOTIFICATIONS_ADVANCED,
       FEATURES.PRIORITY_SUPPORT,
       FEATURES.PRIORITY_DISCOVERY,
+      FEATURES.SERVICE_SCHEDULING,
+      FEATURES.SERVICE_ANALYTICS_BASIC,
+      FEATURES.SERVICE_ANALYTICS_ADVANCED,
     ],
   },
 };
@@ -232,6 +248,9 @@ const COMPARISON_MATRIX = [
   { label: 'Notifications', values: ['Basic', 'Standard', 'Advanced'] },
   { label: 'Priority support', values: [false, 'Standard', 'Priority'] },
   { label: 'Customer app exposure', values: [true, true, 'Priority discovery'] },
+  { label: 'Services per month', values: ['1', 'Unlimited', 'Unlimited'] },
+  { label: 'Service scheduling', values: [false, true, true] },
+  { label: 'Service analytics', values: [false, 'Basic', 'Advanced'] },
 ];
 
 module.exports = {

@@ -50,6 +50,22 @@ const PERMISSIONS = {
     description: 'Change the subscription plan and manage billing',
   },
   MANAGE_CAMPAIGNS: { category: 'Campaigns', description: 'Create and manage marketing campaigns' },
+
+  // V4 §18: Services are a first-class listing type alongside offers, with
+  // their own permission set mirroring the offer permissions above.
+  CREATE_SERVICE: { category: 'Services', description: 'Create services' },
+  VIEW_SERVICE: { category: 'Services', description: 'View services' },
+  EDIT_SERVICE: { category: 'Services', description: 'Edit services' },
+  DELETE_SERVICE: { category: 'Services', description: 'Delete or deactivate services' },
+  PUBLISH_SERVICE: { category: 'Services', description: 'Publish or deactivate services' },
+  SCHEDULE_SERVICE: { category: 'Services', description: 'Schedule services for future publishing' },
+  MANAGE_SERVICE_OFFER: {
+    category: 'Services',
+    description: 'Create and manage offers attached to a service',
+  },
+  MANAGE_SERVICE_BOOKING: { category: 'Services', description: 'Manage customer service bookings' },
+  VIEW_SERVICE_ANALYTICS: { category: 'Insights', description: 'View service analytics dashboards' },
+  EXPORT_SERVICE_ANALYTICS: { category: 'Insights', description: 'Export service analytics reports' },
 };
 
 const PERMISSION_NAMES = Object.keys(PERMISSIONS);
@@ -94,12 +110,22 @@ const SYSTEM_ROLES = {
       'MANAGE_CAMPAIGNS',
       // Deliberately no *_BANNER permissions here: §6 requires a Super Admin to
       // grant those explicitly, per Admin.
+      'CREATE_SERVICE',
+      'VIEW_SERVICE',
+      'EDIT_SERVICE',
+      'DELETE_SERVICE',
+      'PUBLISH_SERVICE',
+      'SCHEDULE_SERVICE',
+      'MANAGE_SERVICE_OFFER',
+      'MANAGE_SERVICE_BOOKING',
+      'VIEW_SERVICE_ANALYTICS',
+      'EXPORT_SERVICE_ANALYTICS',
     ],
   },
   CUSTOMER: {
     scope: 'global',
     description: 'Discovers and saves offers',
-    permissions: ['VIEW_OFFERS', 'VIEW_SHOP'],
+    permissions: ['VIEW_OFFERS', 'VIEW_SHOP', 'VIEW_SERVICE'],
   },
 };
 
@@ -134,6 +160,10 @@ const MANAGEMENT_PERMISSIONS = [
   'VIEW_SUBSCRIPTION',
   'MANAGE_SUBSCRIPTION',
   'MANAGE_CAMPAIGNS',
+  'CREATE_SERVICE',
+  'EDIT_SERVICE',
+  'DELETE_SERVICE',
+  'VIEW_SERVICE_ANALYTICS',
 ];
 
 const SUPER_ADMIN_ROLE = 'SUPER_ADMIN';

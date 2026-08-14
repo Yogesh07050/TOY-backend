@@ -41,6 +41,7 @@ const mapCategory = (row, user) => ({
   parentId: row.parent_id === null ? null : Number(row.parent_id),
   status: row.status,
   offerCount: row.offer_count === undefined ? undefined : Number(row.offer_count),
+  serviceCount: row.service_count === undefined ? undefined : Number(row.service_count),
   shopCount: row.shop_count === undefined ? undefined : Number(row.shop_count),
   isFollowing: user ? Boolean(row.is_following) : undefined,
   createdAt: row.created_at,
@@ -78,6 +79,8 @@ router.get(
       `SELECT c.*,
               (SELECT COUNT(*) FROM offers o
                 WHERE o.status = 'active' AND (o.category_id = c.id OR o.subcategory_id = c.id)) AS offer_count,
+              (SELECT COUNT(*) FROM services sv
+                WHERE sv.status = 'active' AND (sv.category_id = c.id OR sv.subcategory_id = c.id)) AS service_count,
               (SELECT COUNT(*) FROM shop_categories sc WHERE sc.category_id = c.id) AS shop_count,
               ${followSelect}
          FROM categories c
@@ -187,12 +190,14 @@ router.delete(
     if (!existing) throw ApiError.notFound('Category not found');
 
     const inUse = await queryOne(
-      'SELECT COUNT(*) AS count FROM offers WHERE category_id = ? OR subcategory_id = ?',
-      [req.params.id, req.params.id],
+      `SELECT
+         (SELECT COUNT(*) FROM offers WHERE category_id = ? OR subcategory_id = ?) AS offers,
+         (SELECT COUNT(*) FROM services WHERE category_id = ? OR subcategory_id = ?) AS services`,
+      [req.params.id, req.params.id, req.params.id, req.params.id],
     );
-    if (Number(inUse.count) > 0) {
+    if (Number(inUse.offers) > 0 || Number(inUse.services) > 0) {
       throw ApiError.conflict(
-        'Offers are still using this category. Deactivate it instead of deleting it.',
+        'Offers or services are still using this category. Deactivate it instead of deleting it.',
       );
     }
 

@@ -72,6 +72,47 @@ const loadOfferForWrite = (permission) => async (req, _res, next) => {
   }
 };
 
+/**
+ * Loads the service named by `:id` and checks the caller may write to it.
+ * Puts the row on `req.service` so handlers do not re-query.
+ */
+const loadServiceForWrite = (permission) => async (req, _res, next) => {
+  try {
+    if (!req.user) throw ApiError.unauthorized();
+    const service = await queryOne('SELECT * FROM services WHERE id = ?', [req.params.id]);
+    if (!service) throw ApiError.notFound('Service not found');
+    if (!access.hasShopPermission(req.user, service.shop_id, permission)) {
+      throw ApiError.forbidden('This service belongs to another shop');
+    }
+    req.service = service;
+    next();
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Loads the service offer named by `:offerId`, scoped to `:id` (the service),
+ * and checks the caller may write to it via the owning service's shop.
+ */
+const loadServiceOfferForWrite = (permission) => async (req, _res, next) => {
+  try {
+    if (!req.user) throw ApiError.unauthorized();
+    const offer = await queryOne(
+      'SELECT * FROM service_offers WHERE id = ? AND service_id = ?',
+      [req.params.offerId, req.params.id],
+    );
+    if (!offer) throw ApiError.notFound('Service offer not found');
+    if (!access.hasShopPermission(req.user, offer.shop_id, permission)) {
+      throw ApiError.forbidden('This service offer belongs to another shop');
+    }
+    req.serviceOffer = offer;
+    next();
+  } catch (error) {
+    next(error);
+  }
+};
+
 /** Ensures the shop in `:id`/`:shopId` exists, and exposes it as `req.shop`. */
 const loadShop = (param = 'id') => async (req, _res, next) => {
   try {
@@ -90,5 +131,7 @@ module.exports = {
   requireSuperAdmin,
   requireShopScope,
   loadOfferForWrite,
+  loadServiceForWrite,
+  loadServiceOfferForWrite,
   loadShop,
 };

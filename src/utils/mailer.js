@@ -173,6 +173,16 @@ const templates = {
        <p>${button(url, 'View offer')}</p>`,
     ),
   }),
+
+  serviceOfferExpiring: (name, offer, url) => ({
+    subject: `Ending soon: ${offer.title}`,
+    text: `Hi ${name},\n\nA saved service deal is about to expire: ${offer.title}\n\n${url}`,
+    html: layout(
+      "Don't miss this service deal",
+      `<p>Hi ${name},</p><p><strong>${offer.title}</strong> at ${offer.shop_name} expires soon.</p>
+       <p>${button(url, 'View service')}</p>`,
+    ),
+  }),
 };
 
 module.exports = { send, templates, verifyTransport, isConfigured, OUTBOX_DIR };

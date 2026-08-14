@@ -8,7 +8,7 @@ const validate = require('../../middleware/validate');
 const asyncHandler = require('../../utils/asyncHandler');
 const audit = require('../../utils/audit');
 const { authenticate } = require('../../middleware/auth');
-const { requireGlobalPermission } = require('../../middleware/authorize');
+const { requireGlobalPermission, requireSuperAdmin } = require('../../middleware/authorize');
 const { limitOffset, paginationSchema } = require('../../utils/pagination');
 const { ok, noContent, paginated } = require('../../utils/respond');
 const notificationService = require('../../services/notifications');
@@ -26,8 +26,21 @@ const preferencesSchema = z.object({
   followedCategoryOffers: z.coerce.boolean().optional(),
   nearbyOffers: z.coerce.boolean().optional(),
   favoriteExpiring: z.coerce.boolean().optional(),
+  savedServiceOfferExpiring: z.coerce.boolean().optional(),
   offerUpdates: z.coerce.boolean().optional(),
   adminAnnouncements: z.coerce.boolean().optional(),
+});
+
+const thresholdBody = z.object({
+  hoursBefore: z.coerce.number().int().min(1).max(8760),
+  label: z.string().trim().max(60).optional().nullable(),
+  isActive: z.coerce.boolean().optional().default(true),
+});
+
+const thresholdPatchBody = z.object({
+  hoursBefore: z.coerce.number().int().min(1).max(8760).optional(),
+  label: z.string().trim().max(60).optional().nullable(),
+  isActive: z.coerce.boolean().optional(),
 });
 
 const announcementSchema = z.object({
@@ -139,6 +152,7 @@ router.get(
       followedCategoryOffers: Boolean(row.followed_category_offers),
       nearbyOffers: Boolean(row.nearby_offers),
       favoriteExpiring: Boolean(row.favorite_expiring),
+      savedServiceOfferExpiring: Boolean(row.saved_service_offer_expiring),
       offerUpdates: Boolean(row.offer_updates),
       adminAnnouncements: Boolean(row.admin_announcements),
     });
@@ -158,7 +172,7 @@ router.put(
     await execute(
       `UPDATE notification_preferences SET email_enabled = ?, followed_shop_offers = ?,
               followed_category_offers = ?, nearby_offers = ?, favorite_expiring = ?,
-              offer_updates = ?, admin_announcements = ?
+              saved_service_offer_expiring = ?, offer_updates = ?, admin_announcements = ?
         WHERE user_id = ?`,
       [
         flag(req.body.emailEnabled, existing.email_enabled),
@@ -166,6 +180,7 @@ router.put(
         flag(req.body.followedCategoryOffers, existing.followed_category_offers),
         flag(req.body.nearbyOffers, existing.nearby_offers),
         flag(req.body.favoriteExpiring, existing.favorite_expiring),
+        flag(req.body.savedServiceOfferExpiring, existing.saved_service_offer_expiring),
         flag(req.body.offerUpdates, existing.offer_updates),
         flag(req.body.adminAnnouncements, existing.admin_announcements),
         req.user.id,
@@ -179,9 +194,87 @@ router.put(
       followedCategoryOffers: Boolean(row.followed_category_offers),
       nearbyOffers: Boolean(row.nearby_offers),
       favoriteExpiring: Boolean(row.favorite_expiring),
+      savedServiceOfferExpiring: Boolean(row.saved_service_offer_expiring),
       offerUpdates: Boolean(row.offer_updates),
       adminAnnouncements: Boolean(row.admin_announcements),
     });
+  }),
+);
+
+// ---- Expiry notification thresholds (§25, Super Admin) ---------------------
+
+const mapThreshold = (row) => ({
+  id: Number(row.id),
+  hoursBefore: Number(row.hours_before),
+  label: row.label,
+  isActive: Boolean(row.is_active),
+});
+
+router.get(
+  '/thresholds',
+  requireSuperAdmin,
+  asyncHandler(async (req, res) => {
+    const rows = await rawQuery('SELECT * FROM notification_thresholds ORDER BY hours_before DESC');
+    ok(res, rows.map(mapThreshold));
+  }),
+);
+
+router.post(
+  '/thresholds',
+  requireSuperAdmin,
+  validate({ body: thresholdBody }),
+  asyncHandler(async (req, res) => {
+    const result = await execute(
+      'INSERT INTO notification_thresholds (hours_before, label, is_active) VALUES (?, ?, ?)',
+      [req.body.hoursBefore, req.body.label ?? null, req.body.isActive ? 1 : 0],
+    );
+    const row = await queryOne('SELECT * FROM notification_thresholds WHERE id = ?', [result.insertId]);
+    await audit.record(req, {
+      action: 'NOTIFICATION_THRESHOLD_CREATED',
+      entityType: 'notification_threshold',
+      entityId: result.insertId,
+      newValue: { hoursBefore: req.body.hoursBefore, isActive: req.body.isActive },
+    });
+    ok(res, mapThreshold(row));
+  }),
+);
+
+router.patch(
+  '/thresholds/:id',
+  requireSuperAdmin,
+  validate({ params: idParam, body: thresholdPatchBody }),
+  asyncHandler(async (req, res) => {
+    const existing = await queryOne('SELECT * FROM notification_thresholds WHERE id = ?', [req.params.id]);
+    if (!existing) throw ApiError.notFound('Threshold not found');
+
+    await execute(
+      'UPDATE notification_thresholds SET hours_before = ?, label = ?, is_active = ? WHERE id = ?',
+      [
+        req.body.hoursBefore ?? existing.hours_before,
+        req.body.label === undefined ? existing.label : req.body.label,
+        req.body.isActive === undefined ? existing.is_active : req.body.isActive ? 1 : 0,
+        req.params.id,
+      ],
+    );
+    const row = await queryOne('SELECT * FROM notification_thresholds WHERE id = ?', [req.params.id]);
+    await audit.record(req, {
+      action: 'NOTIFICATION_THRESHOLD_UPDATED',
+      entityType: 'notification_threshold',
+      entityId: Number(req.params.id),
+      oldValue: mapThreshold(existing),
+      newValue: mapThreshold(row),
+    });
+    ok(res, mapThreshold(row));
+  }),
+);
+
+router.delete(
+  '/thresholds/:id',
+  requireSuperAdmin,
+  validate({ params: idParam }),
+  asyncHandler(async (req, res) => {
+    await execute('DELETE FROM notification_thresholds WHERE id = ?', [req.params.id]);
+    noContent(res);
   }),
 );
 

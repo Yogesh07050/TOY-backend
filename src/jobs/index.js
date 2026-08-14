@@ -2,6 +2,8 @@
 
 const cron = require('node-cron');
 const offerService = require('../modules/offers/offer.service');
+const serviceService = require('../modules/services/service.service');
+const serviceOfferService = require('../modules/services/serviceOffer.service');
 const bannerService = require('../modules/banners/banner.service');
 const notifications = require('../services/notifications');
 const analyticsSnapshots = require('../services/analyticsSnapshots');
@@ -36,12 +38,36 @@ const jobs = [
     },
   },
   {
-    name: 'expiring-favourites',
-    // Once a day at 09:00: warn customers about saved offers ending soon (§24).
+    name: 'service-lifecycle',
+    // Same clock as offer-lifecycle, for the parallel services domain (V4 §4, §14).
+    schedule: '*/5 * * * *',
+    run: async () => {
+      const { activated, expired } = await serviceService.syncLifecycleStatuses();
+      const offers = await serviceOfferService.syncLifecycleStatuses();
+      if (activated || expired || offers.activated || offers.expired) {
+        console.log(
+          '[jobs] service lifecycle: %d activated, %d expired (offers: %d activated, %d expired)',
+          activated,
+          expired,
+          offers.activated,
+          offers.expired,
+        );
+      }
+    },
+  },
+  {
+    name: 'expiring-saved',
+    // Once a day at 09:00: warn customers about saved offers ending soon, at
+    // every configured threshold, for both products and services (§24-§26, §36).
     schedule: '0 9 * * *',
     run: async () => {
-      const sent = await notifications.notifyExpiringOffers();
-      if (sent) console.log('[jobs] expiry reminders sent: %d', sent);
+      const [offers, serviceOffers] = await Promise.all([
+        notifications.notifyExpiringSaved('offer'),
+        notifications.notifyExpiringSaved('service_offer'),
+      ]);
+      if (offers || serviceOffers) {
+        console.log('[jobs] expiry reminders sent: %d offers, %d service offers', offers, serviceOffers);
+      }
     },
   },
   {
@@ -80,6 +106,12 @@ function start() {
   offerService
     .syncLifecycleStatuses()
     .catch((error) => console.error('[jobs] initial lifecycle sync failed: %s', error.message));
+  serviceService
+    .syncLifecycleStatuses()
+    .catch((error) => console.error('[jobs] initial service lifecycle sync failed: %s', error.message));
+  serviceOfferService
+    .syncLifecycleStatuses()
+    .catch((error) => console.error('[jobs] initial service offer lifecycle sync failed: %s', error.message));
 }
 
 module.exports = { start, jobs };

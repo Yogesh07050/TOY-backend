@@ -5,11 +5,13 @@ const { z } = require('zod');
 const asyncHandler = require('../../utils/asyncHandler');
 const validate = require('../../middleware/validate');
 const { optionalAuth } = require('../../middleware/auth');
-const { ok, noContent } = require('../../utils/respond');
+const { ok, noContent, paginated } = require('../../utils/respond');
 const bannerService = require('../banners/banner.service');
 const offerService = require('../offers/offer.service');
+const offerDiscovery = require('../../services/offerDiscovery');
 const recommendations = require('../../services/recommendations');
 const analyticsEvents = require('../../services/analyticsEvents');
+const { paginationSchema } = require('../../utils/pagination');
 const env = require('../../config/env');
 
 const router = express.Router();
@@ -41,6 +43,19 @@ const endingSoonQuery = z.object({
 const featuredQuery = z.object({ limit: z.coerce.number().int().min(1).max(20).default(8) });
 const trackParams = z.object({ id: z.coerce.number().int().positive() });
 const trackBody = z.object({ event: z.enum(['impression', 'click']).default('impression') });
+
+/** "View Offers" (§8, §14): product offers and service offers, unioned. */
+const allOffersQuery = z.object({
+  ...paginationSchema,
+  search: z.string().trim().max(120).optional(),
+  categoryId: z.coerce.number().int().positive().optional(),
+  shopId: z.coerce.number().int().positive().optional(),
+  city: z.string().trim().max(120).optional(),
+  latitude: latitude.optional(),
+  longitude: longitude.optional(),
+  type: z.enum(['all', 'product', 'service']).default('all'),
+  sort: z.enum(['newest', 'endingSoon', 'mostViewed', 'nearest']).default('newest'),
+});
 
 /**
  * Customer-facing discovery (§14, §16, §18, §20).
@@ -135,6 +150,19 @@ router.get(
     });
 
     ok(res, items);
+  }),
+);
+
+/**
+ * "View Offers" (§8): every listing - product or service - with an active
+ * offer, unioned server-side so pagination stays correct across both.
+ */
+router.get(
+  '/offers',
+  validate({ query: allOffersQuery }),
+  asyncHandler(async (req, res) => {
+    const { items, pagination } = await offerDiscovery.listAllOffers(req.query, req.user);
+    paginated(res, items, pagination);
   }),
 );
 

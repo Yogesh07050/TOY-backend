@@ -834,4 +834,7 @@ module.exports = {
   syncLifecycleStatuses,
   mapOffer,
   resolveStatus,
+  buildListQuery,
+  branchPredicate,
+  PLAN_RANK_SQL,
 };

@@ -14,6 +14,7 @@ const geo = require('../utils/geo');
  */
 
 const offerUrl = (offerId) => `${env.appUrl}/offers/${offerId}`;
+const serviceUrl = (serviceId) => `${env.appUrl}/services/${serviceId}`;
 
 /** Preference column that gates each notification type. */
 const PREFERENCE_COLUMN = {
@@ -21,6 +22,7 @@ const PREFERENCE_COLUMN = {
   NEW_OFFER_FOLLOWED_CATEGORY: 'followed_category_offers',
   NEW_OFFER_NEARBY: 'nearby_offers',
   FAVORITE_EXPIRING: 'favorite_expiring',
+  SAVED_SERVICE_OFFER_EXPIRING: 'saved_service_offer_expiring',
   OFFER_UPDATED: 'offer_updates',
   OFFER_DEACTIVATED: 'offer_updates',
   ADMIN_ANNOUNCEMENT: 'admin_announcements',
@@ -252,37 +254,139 @@ async function notifyOfferDeactivated(offerId) {
 }
 
 /**
- * Scheduled sweep: warns customers about saved offers expiring within 48 hours,
- * and shop staff about their own offers nearing expiry.
+ * Configurable saved-offer expiry reminders (§24-§26, §36). One parameterized
+ * sweep handles both product offers and service offers - the notification
+ * types differ, but the "find who saved something ending soon, check
+ * preferences, avoid duplicates" logic must not be implemented twice.
+ *
+ * Thresholds are Super-Admin-configurable (`notification_thresholds`); a
+ * saved listing can fire once per active threshold, deduped via
+ * `notification_deliveries` rather than the `notifications` table itself, so
+ * a suppressed notification (preference off) still counts as "handled" for
+ * that threshold and is not re-evaluated on every run.
  */
-async function notifyExpiringOffers() {
-  const rows = await query(
+async function findExpiringOffers(hoursBefore) {
+  return query(
     `SELECT f.user_id, u.name, u.email, o.id AS offer_id, o.title, s.name AS shop_name
        FROM favorites f
        JOIN offers o ON o.id = f.offer_id AND o.status = 'active'
        JOIN shops s ON s.id = o.shop_id
        JOIN users u ON u.id = f.user_id AND u.status = 'active'
-      WHERE o.end_date BETWEEN NOW() AND DATE_ADD(NOW(), INTERVAL 2 DAY)
+      WHERE o.end_date BETWEEN NOW() AND DATE_ADD(NOW(), INTERVAL ? HOUR)
         AND NOT EXISTS (
-          SELECT 1 FROM notifications n
-           WHERE n.user_id = f.user_id AND n.entity_type = 'offer'
-             AND n.entity_id = o.id AND n.type = 'FAVORITE_EXPIRING'
+          SELECT 1 FROM offer_claims oc
+           WHERE oc.user_id = f.user_id AND oc.offer_id = o.id AND oc.status = 'redeemed'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM notification_deliveries nd
+           WHERE nd.user_id = f.user_id AND nd.type = 'FAVORITE_EXPIRING'
+             AND nd.entity_type = 'offer' AND nd.entity_id = o.id AND nd.threshold_hours = ?
         )`,
+    [hoursBefore, hoursBefore],
   );
+}
 
+async function findExpiringServiceOffers(hoursBefore) {
+  return query(
+    `SELECT ss.user_id, u.name, u.email, so.id AS service_offer_id, sv.name AS service_name, s.name AS shop_name
+       FROM saved_services ss
+       JOIN services sv ON sv.id = ss.service_id AND sv.status = 'active'
+       JOIN service_offers so ON so.service_id = sv.id AND so.status = 'active'
+       JOIN shops s ON s.id = sv.shop_id
+       JOIN users u ON u.id = ss.user_id AND u.status = 'active'
+      WHERE so.end_date BETWEEN NOW() AND DATE_ADD(NOW(), INTERVAL ? HOUR)
+        AND NOT EXISTS (
+          SELECT 1 FROM service_offer_claims soc
+           WHERE soc.user_id = ss.user_id AND soc.service_offer_id = so.id AND soc.status = 'redeemed'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM notification_deliveries nd
+           WHERE nd.user_id = ss.user_id AND nd.type = 'SAVED_SERVICE_OFFER_EXPIRING'
+             AND nd.entity_type = 'service_offer' AND nd.entity_id = so.id AND nd.threshold_hours = ?
+        )`,
+    [hoursBefore, hoursBefore],
+  );
+}
+
+/** Dispatches one expiry reminder and records it in the dedup ledger. */
+async function sendExpiryReminder({ userId, name, email, type, title, message, entityType, entityId, thresholdHours, emailTemplate }) {
+  await dispatch([{ id: Number(userId), name, email }], {
+    type,
+    title,
+    message,
+    entityType,
+    entityId,
+    email: emailTemplate,
+  });
+  await execute(
+    `INSERT IGNORE INTO notification_deliveries (user_id, type, entity_type, entity_id, threshold_hours)
+     VALUES (?, ?, ?, ?, ?)`,
+    [userId, type, entityType, entityId, thresholdHours],
+  );
+}
+
+async function notifyExpiringOffersAtThreshold(hoursBefore) {
+  const rows = await findExpiringOffers(hoursBefore);
   for (const row of rows) {
     const offer = { id: Number(row.offer_id), title: row.title, shop_name: row.shop_name };
-    await dispatch([{ id: Number(row.user_id), name: row.name, email: row.email }], {
+    await sendExpiryReminder({
+      userId: row.user_id,
+      name: row.name,
+      email: row.email,
       type: 'FAVORITE_EXPIRING',
       title: 'A saved offer is ending soon',
       message: `${row.shop_name}: ${row.title}`,
       entityType: 'offer',
       entityId: offer.id,
-      email: (recipient) => mailer.templates.offerExpiring(recipient.name, offer, offerUrl(offer.id)),
+      thresholdHours: hoursBefore,
+      emailTemplate: (recipient) => mailer.templates.offerExpiring(recipient.name, offer, offerUrl(offer.id)),
     });
   }
   return rows.length;
 }
+
+async function notifyExpiringServiceOffersAtThreshold(hoursBefore) {
+  const rows = await findExpiringServiceOffers(hoursBefore);
+  for (const row of rows) {
+    const offer = { id: Number(row.service_offer_id), title: row.service_name, shop_name: row.shop_name };
+    await sendExpiryReminder({
+      userId: row.user_id,
+      name: row.name,
+      email: row.email,
+      type: 'SAVED_SERVICE_OFFER_EXPIRING',
+      title: "Don't miss this service deal",
+      message: `${row.shop_name}: ${row.service_name}`,
+      entityType: 'service_offer',
+      entityId: offer.id,
+      thresholdHours: hoursBefore,
+      emailTemplate: (recipient) =>
+        mailer.templates.serviceOfferExpiring(recipient.name, offer, serviceUrl(offer.id)),
+    });
+  }
+  return rows.length;
+}
+
+const EXPIRY_SWEEPS = {
+  offer: notifyExpiringOffersAtThreshold,
+  service_offer: notifyExpiringServiceOffersAtThreshold,
+};
+
+/** Runs every configured, active threshold for one listing kind. */
+async function notifyExpiringSaved(kind) {
+  const sweep = EXPIRY_SWEEPS[kind];
+  if (!sweep) throw new Error(`Unknown expiry kind: ${kind}`);
+
+  const thresholds = await query('SELECT hours_before FROM notification_thresholds WHERE is_active = 1');
+  let sent = 0;
+  for (const { hours_before: hoursBefore } of thresholds) {
+    sent += await sweep(Number(hoursBefore));
+  }
+  return sent;
+}
+
+/** Back-compat name for the `expiring-favourites` job history. */
+const notifyExpiringOffers = () => notifyExpiringSaved('offer');
+const notifyExpiringServiceOffers = () => notifyExpiringSaved('service_offer');
 
 /** Broadcast used by Super Admins for platform-wide announcements. */
 async function announce({ title, message, audience = 'all' }) {
@@ -316,6 +420,8 @@ module.exports = {
   notifyOfferUpdated,
   notifyOfferDeactivated,
   notifyExpiringOffers,
+  notifyExpiringServiceOffers,
+  notifyExpiringSaved,
   announce,
   pruneOld,
   dispatch,

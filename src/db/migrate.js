@@ -74,6 +74,19 @@ const COLUMN_PATCHES = [
       'ALTER TABLE users ADD COLUMN minimum_discount_percent TINYINT UNSIGNED DEFAULT NULL AFTER preferences_completed',
     ],
   },
+
+  // ---- V4 (Services) -------------------------------------------------------
+  {
+    table: 'analytics_events',
+    column: 'service_id',
+    sql: 'ALTER TABLE analytics_events ADD COLUMN service_id BIGINT UNSIGNED DEFAULT NULL AFTER offer_id',
+    after: ['ALTER TABLE analytics_events ADD KEY idx_ae_service (service_id, created_at)'],
+  },
+  {
+    table: 'notification_preferences',
+    column: 'saved_service_offer_expiring',
+    sql: "ALTER TABLE notification_preferences ADD COLUMN saved_service_offer_expiring TINYINT(1) NOT NULL DEFAULT 1 AFTER favorite_expiring",
+  },
 ];
 
 /**
@@ -127,6 +140,23 @@ const STATEMENT_PATCHES = [
     sql: `INSERT INTO shop_subscriptions (shop_id, plan, status, price_amount, payment_status)
           SELECT s.id, 'FREE', 'active', 0.00, 'not_required' FROM shops s
            WHERE NOT EXISTS (SELECT 1 FROM shop_subscriptions sub WHERE sub.shop_id = s.id)`,
+  },
+  {
+    name: 'analytics_events.service_id -> services FK',
+    // `services` is created later in schema.sql than `analytics_events`, so on
+    // a fresh install the constraint has to be attached after both exist.
+    check: async (connection, dbName) => {
+      const [rows] = await connection.query(
+        `SELECT 1 FROM information_schema.TABLE_CONSTRAINTS
+          WHERE CONSTRAINT_SCHEMA = ? AND TABLE_NAME = 'analytics_events'
+            AND CONSTRAINT_NAME = 'fk_ae_service' LIMIT 1`,
+        [dbName],
+      );
+      return rows.length === 0;
+    },
+    sql: `ALTER TABLE analytics_events
+            ADD CONSTRAINT fk_ae_service FOREIGN KEY (service_id)
+            REFERENCES services (id) ON DELETE CASCADE`,
   },
 ];
 

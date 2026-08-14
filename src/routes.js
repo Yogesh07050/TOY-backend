@@ -29,4 +29,10 @@ router.use('/claims', require('./modules/claims/claim.routes'));
 router.use('/subscriptions', require('./modules/subscriptions/subscription.routes'));
 router.use('/campaigns', require('./modules/campaigns/campaign.routes'));
 
+// ---- V4: Services ----
+router.use('/services', require('./modules/services/service.routes'));
+router.use('/service-offer-claims', require('./modules/services/serviceOfferClaim.routes'));
+router.use('/saved-services', require('./modules/savedServices/savedService.routes'));
+router.use('/service-analytics', require('./modules/services/serviceAnalytics.routes'));
+
 module.exports = router;

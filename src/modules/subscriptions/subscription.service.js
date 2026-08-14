@@ -83,9 +83,14 @@ async function planKeyForShop(shopId) {
 async function usageForShop(shopId, period = currentPeriod()) {
   const [start, end] = periodBounds(period);
 
-  const [offers, branches, categories, banners, counters] = await Promise.all([
+  const [offers, services, branches, categories, banners, counters] = await Promise.all([
     queryOne(
       `SELECT COUNT(*) AS count FROM offers
+        WHERE shop_id = ? AND status <> 'draft' AND created_at >= ? AND created_at < ?`,
+      [shopId, start, end],
+    ),
+    queryOne(
+      `SELECT COUNT(*) AS count FROM services
         WHERE shop_id = ? AND status <> 'draft' AND created_at >= ? AND created_at < ?`,
       [shopId, start, end],
     ),
@@ -104,6 +109,7 @@ async function usageForShop(shopId, period = currentPeriod()) {
   return {
     period,
     offersThisMonth: Number(offers.count),
+    servicesThisMonth: Number(services.count),
     branches: Number(branches.count),
     categories: Number(categories.count),
     banners: Number(banners.count),
@@ -146,6 +152,7 @@ async function entitlements(shopId) {
     usage,
     remaining: {
       offersThisMonth: remaining(limits.offersPerMonth, usage.offersThisMonth),
+      servicesThisMonth: remaining(limits.servicesPerMonth, usage.servicesThisMonth),
       branches: remaining(limits.branches, usage.branches),
       categories: remaining(limits.categories, usage.categories),
       banners: remaining(limits.banners, usage.banners),

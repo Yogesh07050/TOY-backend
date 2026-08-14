@@ -28,6 +28,20 @@ const CATEGORIES = [
   ['Home & Furniture', 'Furnishing, decor and appliances'],
   ['Sports', 'Fitness gear and sportswear'],
   ['Accessories', 'Bags, watches and jewellery'],
+  // ---- V4: shared with services (§9, §37) - categories are one flat tree for
+  // both listing types, not a separate service_categories table.
+  ['Beauty & Salon', 'Haircuts, spa and grooming services'],
+  ['Home Services', 'Cleaning, repair and home maintenance'],
+  ['Automotive', 'Car wash, servicing and repair'],
+  ['Education', 'Tuition, coaching and training'],
+  ['Professional Services', 'Legal, consulting and business services'],
+  ['Health & Wellness', 'Clinics, therapy and wellness services'],
+  ['Repair & Maintenance', 'Appliance and device repair'],
+  ['Photography', 'Photo and video services'],
+  ['Events', 'Event planning and management'],
+  ['Fitness', 'Gyms, trainers and fitness classes'],
+  ['Cleaning', 'Home and office cleaning services'],
+  ['Technology', 'IT support and tech services'],
   ['Other', 'Everything else'],
 ];
 
@@ -61,6 +75,22 @@ async function seedRoles() {
     }
   }
   console.log('  roles: %s', Object.keys(SYSTEM_ROLES).join(', '));
+}
+
+/** Default expiry-reminder windows (§25): 24h on by default, 6h off. */
+async function seedNotificationThresholds() {
+  const defaults = [
+    [24, '1 day before', 1],
+    [6, '6 hours before', 0],
+  ];
+  for (const [hoursBefore, label, isActive] of defaults) {
+    await execute(
+      `INSERT INTO notification_thresholds (hours_before, label, is_active) VALUES (?, ?, ?)
+       ON DUPLICATE KEY UPDATE label = VALUES(label)`,
+      [hoursBefore, label, isActive],
+    );
+  }
+  console.log('  notification thresholds: %s', defaults.map(([h]) => `${h}h`).join(', '));
 }
 
 async function seedCategories() {
@@ -641,6 +671,7 @@ async function main() {
   await seedPermissions();
   await seedRoles();
   await seedCategories();
+  await seedNotificationThresholds();
   const superAdmin = await seedSuperAdmin();
 
   if (env.seed.demoData) {

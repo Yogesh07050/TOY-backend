@@ -745,3 +745,208 @@ CREATE TABLE IF NOT EXISTS shop_customers (
   CONSTRAINT fk_shopcust_shop FOREIGN KEY (shop_id) REFERENCES shops (id) ON DELETE CASCADE,
   CONSTRAINT fk_shopcust_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- =====================================================================
+--  V4 additions - Services (a parallel listing type to offers) and
+--  configurable saved-offer expiry notifications
+-- =====================================================================
+
+-- ---------------------------------------------------------------------
+-- Services mirror the offers table's conventions (shop/category/branch/
+-- image ownership, status lifecycle, denormalized counters) but carry
+-- service-specific fields (pricing model, duration, availability,
+-- booking) instead of discount fields. Categories are shared with
+-- offers - no separate service_categories table.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS services (
+  id                    BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  shop_id               BIGINT UNSIGNED NOT NULL,
+  category_id           BIGINT UNSIGNED         DEFAULT NULL,
+  subcategory_id        BIGINT UNSIGNED         DEFAULT NULL,
+  name                  VARCHAR(200)    NOT NULL,
+  description           TEXT                    DEFAULT NULL,
+  pricing_type          ENUM('fixed','starting_from','price_on_enquiry') NOT NULL DEFAULT 'fixed',
+  price                 DECIMAL(12,2)           DEFAULT NULL,
+  duration_minutes      INT UNSIGNED            DEFAULT NULL,
+  duration_label        VARCHAR(60)             DEFAULT NULL,
+  -- CSV of 3-letter day codes, e.g. 'mon,tue,wed'.
+  available_days        VARCHAR(120)            DEFAULT NULL,
+  available_time_start  TIME                    DEFAULT NULL,
+  available_time_end    TIME                    DEFAULT NULL,
+  home_service          TINYINT(1)      NOT NULL DEFAULT 0,
+  walk_in_available     TINYINT(1)      NOT NULL DEFAULT 0,
+  appointment_required  TINYINT(1)      NOT NULL DEFAULT 0,
+  booking_type          ENUM('walk_in','appointment','both','enquiry_only') NOT NULL DEFAULT 'walk_in',
+  service_area          VARCHAR(255)            DEFAULT NULL,
+  terms_conditions      TEXT                    DEFAULT NULL,
+  applicability_type    ENUM('shop_wide','selected_branches','online') NOT NULL DEFAULT 'shop_wide',
+  status                ENUM('draft','scheduled','active','paused','expired','deactivated') NOT NULL DEFAULT 'draft',
+  start_date            DATETIME                DEFAULT NULL,
+  end_date              DATETIME                DEFAULT NULL,
+  view_count            INT UNSIGNED    NOT NULL DEFAULT 0,
+  click_count           INT UNSIGNED    NOT NULL DEFAULT 0,
+  save_count            INT UNSIGNED    NOT NULL DEFAULT 0,
+  created_by            BIGINT UNSIGNED         DEFAULT NULL,
+  updated_by            BIGINT UNSIGNED         DEFAULT NULL,
+  created_at            DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at            DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_services_shop (shop_id),
+  KEY idx_services_category (category_id),
+  KEY idx_services_status_end (status, end_date),
+  KEY idx_services_status_start (status, start_date),
+  KEY idx_services_created (created_at),
+  FULLTEXT KEY ft_services_search (name, description),
+  CONSTRAINT fk_services_shop        FOREIGN KEY (shop_id)        REFERENCES shops (id)      ON DELETE CASCADE,
+  CONSTRAINT fk_services_category    FOREIGN KEY (category_id)    REFERENCES categories (id) ON DELETE SET NULL,
+  CONSTRAINT fk_services_subcategory FOREIGN KEY (subcategory_id) REFERENCES categories (id) ON DELETE SET NULL,
+  CONSTRAINT fk_services_created_by  FOREIGN KEY (created_by)     REFERENCES users (id)      ON DELETE SET NULL,
+  CONSTRAINT fk_services_updated_by  FOREIGN KEY (updated_by)     REFERENCES users (id)      ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS service_locations (
+  id        BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  service_id BIGINT UNSIGNED NOT NULL,
+  branch_id BIGINT UNSIGNED NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_service_branch (service_id, branch_id),
+  KEY idx_sl_branch (branch_id),
+  CONSTRAINT fk_sl_service FOREIGN KEY (service_id) REFERENCES services (id)      ON DELETE CASCADE,
+  CONSTRAINT fk_sl_branch  FOREIGN KEY (branch_id)  REFERENCES shop_branches (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS service_images (
+  id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  service_id    BIGINT UNSIGNED NOT NULL,
+  image_url     VARCHAR(500)    NOT NULL,
+  thumbnail_url VARCHAR(500)            DEFAULT NULL,
+  display_order INT             NOT NULL DEFAULT 0,
+  created_at    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_si_service (service_id, display_order),
+  CONSTRAINT fk_si_service FOREIGN KEY (service_id) REFERENCES services (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- The promotional layer on a service (§6: "an Offer belongs to a Listing").
+-- One service can carry many offers over time; this is never merged back
+-- into the services row.
+CREATE TABLE IF NOT EXISTS service_offers (
+  id               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  service_id       BIGINT UNSIGNED NOT NULL,
+  -- Denormalized so shop-scope checks/joins don't always need `services`.
+  shop_id          BIGINT UNSIGNED NOT NULL,
+  offer_text       VARCHAR(200)            DEFAULT NULL,
+  offer_type       ENUM('percentage','flat','price_drop','other') NOT NULL DEFAULT 'percentage',
+  discount_type    ENUM('percentage','flat','none') NOT NULL DEFAULT 'percentage',
+  discount_value   DECIMAL(10,2)           DEFAULT NULL,
+  original_price   DECIMAL(12,2)           DEFAULT NULL,
+  offer_price      DECIMAL(12,2)           DEFAULT NULL,
+  terms_conditions TEXT                    DEFAULT NULL,
+  is_recurring     TINYINT(1)      NOT NULL DEFAULT 0,
+  recurrence_type  ENUM('daily','weekly','monthly') DEFAULT NULL,
+  start_date       DATETIME        NOT NULL,
+  end_date         DATETIME        NOT NULL,
+  status           ENUM('draft','scheduled','active','expired','deactivated') NOT NULL DEFAULT 'draft',
+  view_count       INT UNSIGNED    NOT NULL DEFAULT 0,
+  claim_count      INT UNSIGNED    NOT NULL DEFAULT 0,
+  created_by       BIGINT UNSIGNED         DEFAULT NULL,
+  updated_by       BIGINT UNSIGNED         DEFAULT NULL,
+  created_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_so_service (service_id),
+  KEY idx_so_shop (shop_id),
+  KEY idx_so_status_end (status, end_date),
+  CONSTRAINT fk_so_service FOREIGN KEY (service_id) REFERENCES services (id) ON DELETE CASCADE,
+  CONSTRAINT fk_so_shop    FOREIGN KEY (shop_id)    REFERENCES shops (id)    ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS service_offer_claims (
+  id               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  service_offer_id BIGINT UNSIGNED NOT NULL,
+  user_id          BIGINT UNSIGNED NOT NULL,
+  branch_id        BIGINT UNSIGNED         DEFAULT NULL,
+  code             VARCHAR(24)     NOT NULL,
+  status           ENUM('claimed','redeemed','expired','cancelled') NOT NULL DEFAULT 'claimed',
+  claimed_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  redeemed_at      DATETIME                DEFAULT NULL,
+  redeemed_by      BIGINT UNSIGNED         DEFAULT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_service_claim_code (code),
+  UNIQUE KEY uq_service_claim_user_offer (user_id, service_offer_id),
+  KEY idx_service_claim_offer (service_offer_id, status),
+  KEY idx_service_claim_claimed (claimed_at),
+  CONSTRAINT fk_soc_offer       FOREIGN KEY (service_offer_id) REFERENCES service_offers (id) ON DELETE CASCADE,
+  CONSTRAINT fk_soc_user        FOREIGN KEY (user_id)          REFERENCES users (id)          ON DELETE CASCADE,
+  CONSTRAINT fk_soc_branch      FOREIGN KEY (branch_id)        REFERENCES shop_branches (id)  ON DELETE SET NULL,
+  CONSTRAINT fk_soc_redeemed_by FOREIGN KEY (redeemed_by)      REFERENCES users (id)          ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- "Saved offers" for services, mirroring `favorites`.
+CREATE TABLE IF NOT EXISTS saved_services (
+  id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  user_id    BIGINT UNSIGNED NOT NULL,
+  service_id BIGINT UNSIGNED NOT NULL,
+  created_at DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_saved_service (user_id, service_id),
+  KEY idx_ss_service (service_id),
+  CONSTRAINT fk_ss_user    FOREIGN KEY (user_id)    REFERENCES users (id)    ON DELETE CASCADE,
+  CONSTRAINT fk_ss_service FOREIGN KEY (service_id) REFERENCES services (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Minimal booking-request entity backing MANAGE_SERVICE_BOOKING and the
+-- SERVICE_BOOK/SERVICE_CANCEL analytics events.
+CREATE TABLE IF NOT EXISTS service_bookings (
+  id               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  service_id       BIGINT UNSIGNED NOT NULL,
+  user_id          BIGINT UNSIGNED NOT NULL,
+  branch_id        BIGINT UNSIGNED         DEFAULT NULL,
+  service_offer_id BIGINT UNSIGNED         DEFAULT NULL,
+  requested_at     DATETIME                DEFAULT NULL,
+  status           ENUM('requested','confirmed','completed','cancelled') NOT NULL DEFAULT 'requested',
+  notes            VARCHAR(500)            DEFAULT NULL,
+  created_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_sb_service (service_id, status),
+  KEY idx_sb_user (user_id),
+  CONSTRAINT fk_sb_service FOREIGN KEY (service_id)      REFERENCES services (id)       ON DELETE CASCADE,
+  CONSTRAINT fk_sb_user    FOREIGN KEY (user_id)          REFERENCES users (id)          ON DELETE CASCADE,
+  CONSTRAINT fk_sb_branch  FOREIGN KEY (branch_id)        REFERENCES shop_branches (id)  ON DELETE SET NULL,
+  CONSTRAINT fk_sb_offer   FOREIGN KEY (service_offer_id) REFERENCES service_offers (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------
+-- Configurable saved-offer expiry reminders (§24-§26). Thresholds are
+-- shared across product offers and service offers - "do not implement
+-- separate expiry logic" applies across listing types too, not just
+-- across web/mobile.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS notification_thresholds (
+  id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  hours_before INT UNSIGNED    NOT NULL,
+  label        VARCHAR(60)             DEFAULT NULL,
+  is_active    TINYINT(1)      NOT NULL DEFAULT 1,
+  created_at   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_threshold_hours (hours_before)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Dedup ledger: one row per (user, notification type, entity, threshold)
+-- that has already fired, kept separate from the user-facing
+-- `notifications` table so its `type` values stay stable and readable.
+CREATE TABLE IF NOT EXISTS notification_deliveries (
+  id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  user_id         BIGINT UNSIGNED NOT NULL,
+  type            VARCHAR(60)     NOT NULL,
+  entity_type     VARCHAR(60)     NOT NULL,
+  entity_id       BIGINT UNSIGNED NOT NULL,
+  threshold_hours INT UNSIGNED    NOT NULL,
+  sent_at         DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_notif_delivery (user_id, type, entity_type, entity_id, threshold_hours),
+  KEY idx_nd_entity (entity_type, entity_id),
+  CONSTRAINT fk_nd_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

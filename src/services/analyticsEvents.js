@@ -61,6 +61,21 @@ const EVENT_TYPES = {
 
   RECOMMENDATION_CLICK: 'RECOMMENDATION_CLICK',
   RECOMMENDATION_DISMISS: 'RECOMMENDATION_DISMISS',
+
+  // ---- V4 Services -----------------------------------------------------
+  // Services have no dedicated raw-event table (unlike offers/offer_views) -
+  // these all land in analytics_events, tagged with service_id.
+  SERVICE_VIEW: 'SERVICE_VIEW',
+  SERVICE_SAVE: 'SERVICE_SAVE',
+  SERVICE_SHARE: 'SERVICE_SHARE',
+  SERVICE_ENQUIRE: 'SERVICE_ENQUIRE',
+  SERVICE_BOOK: 'SERVICE_BOOK',
+  SERVICE_CANCEL: 'SERVICE_CANCEL',
+  SERVICE_CLAIM: 'SERVICE_CLAIM',
+  SERVICE_REDEEM: 'SERVICE_REDEEM',
+  SERVICE_OFFER_VIEW: 'SERVICE_OFFER_VIEW',
+  SERVICE_OFFER_CLAIM: 'SERVICE_OFFER_CLAIM',
+  SERVICE_OFFER_REDEEM: 'SERVICE_OFFER_REDEEM',
 };
 
 const EVENT_TYPE_NAMES = Object.keys(EVENT_TYPES);
@@ -93,13 +108,14 @@ async function record(eventType, payload = {}) {
   try {
     await execute(
       `INSERT INTO analytics_events
-         (event_type, shop_id, offer_id, banner_id, branch_id, category_id, user_id,
+         (event_type, shop_id, offer_id, service_id, banner_id, branch_id, category_id, user_id,
           city, pincode, latitude, longitude, term, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         eventType,
         payload.shopId ?? null,
         payload.offerId ?? null,
+        payload.serviceId ?? null,
         payload.bannerId ?? null,
         payload.branchId ?? null,
         payload.categoryId ?? null,
@@ -158,6 +174,19 @@ async function shopContextForOffer(offerId) {
   );
 }
 
+/** Resolves the shop (and its city) behind a service, for event enrichment. */
+async function shopContextForService(serviceId) {
+  if (!serviceId) return null;
+  return queryOne(
+    `SELECT sv.shop_id AS shopId, sv.category_id AS categoryId,
+            (SELECT b.city FROM shop_branches b
+              WHERE b.shop_id = sv.shop_id AND b.status = 'active'
+              ORDER BY b.is_primary DESC, b.id LIMIT 1) AS city
+       FROM services sv WHERE sv.id = ?`,
+    [serviceId],
+  );
+}
+
 module.exports = {
   EVENT_TYPES,
   EVENT_TYPE_NAMES,
@@ -165,4 +194,5 @@ module.exports = {
   record,
   touchShopCustomer,
   shopContextForOffer,
+  shopContextForService,
 };
