@@ -331,6 +331,11 @@ async function list(params, user) {
            ${PRIMARY_IMAGE_SQL} AS image_url,
            ${PRIMARY_THUMB_SQL} AS thumbnail_url,
            ${ACTIVE_OFFER_SQL} AS active_offer_id,
+           (SELECT so.offer_text FROM service_offers so WHERE so.id = ${ACTIVE_OFFER_SQL}) AS active_offer_text,
+           (SELECT so.discount_type FROM service_offers so WHERE so.id = ${ACTIVE_OFFER_SQL}) AS active_offer_discount_type,
+           (SELECT so.discount_value FROM service_offers so WHERE so.id = ${ACTIVE_OFFER_SQL}) AS active_offer_discount_value,
+           (SELECT so.offer_price FROM service_offers so WHERE so.id = ${ACTIVE_OFFER_SQL}) AS active_offer_price,
+           (SELECT so.end_date FROM service_offers so WHERE so.id = ${ACTIVE_OFFER_SQL}) AS active_offer_end_date,
            ${PLAN_RANK_SQL} AS plan_rank,
            ${built.distanceSelect},
            ${built.labelSelect},
@@ -758,6 +763,21 @@ async function trackEvent(serviceId, { event, branchId, city, latitude, longitud
   if (user) await analyticsEvents.touchShopCustomer(service.shop_id, user.id);
 }
 
+function mapBooking(row) {
+  return {
+    id: Number(row.id),
+    serviceId: Number(row.service_id),
+    userId: Number(row.user_id),
+    branchId: row.branch_id === null ? null : Number(row.branch_id),
+    serviceOfferId: row.service_offer_id === null ? null : Number(row.service_offer_id),
+    requestedAt: row.requested_at,
+    status: row.status,
+    notes: row.notes,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 async function createBooking(serviceId, payload, user) {
   const service = await queryOne('SELECT id, shop_id, status FROM services WHERE id = ?', [serviceId]);
   if (!service) throw ApiError.notFound('Service not found');
@@ -784,7 +804,7 @@ async function createBooking(serviceId, payload, user) {
   });
   await analyticsEvents.touchShopCustomer(service.shop_id, user.id);
 
-  return queryOne('SELECT * FROM service_bookings WHERE id = ?', [result.insertId]);
+  return mapBooking(await queryOne('SELECT * FROM service_bookings WHERE id = ?', [result.insertId]));
 }
 
 async function updateBookingStatus(bookingId, status, user) {
@@ -807,7 +827,7 @@ async function updateBookingStatus(bookingId, status, user) {
     });
   }
 
-  return queryOne('SELECT * FROM service_bookings WHERE id = ?', [bookingId]);
+  return mapBooking(await queryOne('SELECT * FROM service_bookings WHERE id = ?', [bookingId]));
 }
 
 /** Lifecycle maintenance, run on a schedule alongside offer-lifecycle. */

@@ -288,7 +288,8 @@ async function findExpiringOffers(hoursBefore) {
 
 async function findExpiringServiceOffers(hoursBefore) {
   return query(
-    `SELECT ss.user_id, u.name, u.email, so.id AS service_offer_id, sv.name AS service_name, s.name AS shop_name
+    `SELECT ss.user_id, u.name, u.email, so.id AS service_offer_id, sv.id AS service_id,
+            sv.name AS service_name, s.name AS shop_name
        FROM saved_services ss
        JOIN services sv ON sv.id = ss.service_id AND sv.status = 'active'
        JOIN service_offers so ON so.service_id = sv.id AND so.status = 'active'
@@ -308,8 +309,28 @@ async function findExpiringServiceOffers(hoursBefore) {
   );
 }
 
-/** Dispatches one expiry reminder and records it in the dedup ledger. */
-async function sendExpiryReminder({ userId, name, email, type, title, message, entityType, entityId, thresholdHours, emailTemplate }) {
+/**
+ * Dispatches one expiry reminder and records it in the dedup ledger.
+ *
+ * `entityId` is what the customer-facing notification/email link to - it must
+ * be a real detail page. `dedupEntityId` is what the ledger tracks "already
+ * handled" against, which is the specific thing that's expiring; the two
+ * differ for service offers, where the offer itself has no standalone page
+ * (only its parent service does) but each offer still needs its own dedup.
+ */
+async function sendExpiryReminder({
+  userId,
+  name,
+  email,
+  type,
+  title,
+  message,
+  entityType,
+  entityId,
+  dedupEntityId = entityId,
+  thresholdHours,
+  emailTemplate,
+}) {
   await dispatch([{ id: Number(userId), name, email }], {
     type,
     title,
@@ -321,7 +342,7 @@ async function sendExpiryReminder({ userId, name, email, type, title, message, e
   await execute(
     `INSERT IGNORE INTO notification_deliveries (user_id, type, entity_type, entity_id, threshold_hours)
      VALUES (?, ?, ?, ?, ?)`,
-    [userId, type, entityType, entityId, thresholdHours],
+    [userId, type, entityType, dedupEntityId, thresholdHours],
   );
 }
 
@@ -348,7 +369,8 @@ async function notifyExpiringOffersAtThreshold(hoursBefore) {
 async function notifyExpiringServiceOffersAtThreshold(hoursBefore) {
   const rows = await findExpiringServiceOffers(hoursBefore);
   for (const row of rows) {
-    const offer = { id: Number(row.service_offer_id), title: row.service_name, shop_name: row.shop_name };
+    // What the customer sees a link to - the service, not the offer row.
+    const service = { id: Number(row.service_id), title: row.service_name, shop_name: row.shop_name };
     await sendExpiryReminder({
       userId: row.user_id,
       name: row.name,
@@ -357,10 +379,11 @@ async function notifyExpiringServiceOffersAtThreshold(hoursBefore) {
       title: "Don't miss this service deal",
       message: `${row.shop_name}: ${row.service_name}`,
       entityType: 'service_offer',
-      entityId: offer.id,
+      entityId: service.id,
+      dedupEntityId: Number(row.service_offer_id),
       thresholdHours: hoursBefore,
       emailTemplate: (recipient) =>
-        mailer.templates.serviceOfferExpiring(recipient.name, offer, serviceUrl(offer.id)),
+        mailer.templates.serviceOfferExpiring(recipient.name, service, serviceUrl(service.id)),
     });
   }
   return rows.length;

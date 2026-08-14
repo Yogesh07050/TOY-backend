@@ -14,6 +14,8 @@ const money = z.coerce.number().min(0).max(99999999).optional().nullable();
 const listServiceOffersSchema = z.object({
   ...paginationSchema,
   status: z.enum([...STATUSES, 'all']).optional(),
+  /** Management view: returns non-active offers, scoped by the caller's permission check. */
+  manage: z.coerce.boolean().optional(),
 });
 
 const serviceOfferBody = z
