@@ -57,6 +57,8 @@ function mapRow(row) {
     imageUrl: row.image_url ?? null,
     distanceKm: row.distance_km === null || row.distance_km === undefined ? null : Number(Number(row.distance_km).toFixed(2)),
     isSaved: Boolean(row.is_saved),
+    latitude: row.latitude === null || row.latitude === undefined ? null : Number(row.latitude),
+    longitude: row.longitude === null || row.longitude === undefined ? null : Number(row.longitude),
     shop: {
       id: Number(row.shop_id),
       name: row.shop_name,
@@ -86,6 +88,34 @@ async function listAllOffers(params, user) {
     ? `(SELECT MIN(${geo.distanceKmSql('b.latitude', 'b.longitude')}) FROM shop_branches b
          WHERE b.status = 'active' AND b.latitude IS NOT NULL AND b.longitude IS NOT NULL
            AND ${branchPredicateService('b')})`
+    : 'NULL';
+  // Nearest matching branch's own coordinates, for plotting the listing on a
+  // map (mobile Near Me tab) - mirrors productDistance/serviceDistance's
+  // predicate and NULL-when-no-position behaviour exactly, just selecting the
+  // branch's lat/lng instead of the computed distance.
+  const productLat = hasPosition
+    ? `(SELECT b.latitude FROM shop_branches b
+         WHERE b.status = 'active' AND b.latitude IS NOT NULL AND b.longitude IS NOT NULL
+           AND ${branchPredicateProduct('b')}
+         ORDER BY ${geo.distanceKmSql('b.latitude', 'b.longitude')} ASC LIMIT 1)`
+    : 'NULL';
+  const productLng = hasPosition
+    ? `(SELECT b.longitude FROM shop_branches b
+         WHERE b.status = 'active' AND b.latitude IS NOT NULL AND b.longitude IS NOT NULL
+           AND ${branchPredicateProduct('b')}
+         ORDER BY ${geo.distanceKmSql('b.latitude', 'b.longitude')} ASC LIMIT 1)`
+    : 'NULL';
+  const serviceLat = hasPosition
+    ? `(SELECT b.latitude FROM shop_branches b
+         WHERE b.status = 'active' AND b.latitude IS NOT NULL AND b.longitude IS NOT NULL
+           AND ${branchPredicateService('b')}
+         ORDER BY ${geo.distanceKmSql('b.latitude', 'b.longitude')} ASC LIMIT 1)`
+    : 'NULL';
+  const serviceLng = hasPosition
+    ? `(SELECT b.longitude FROM shop_branches b
+         WHERE b.status = 'active' AND b.latitude IS NOT NULL AND b.longitude IS NOT NULL
+           AND ${branchPredicateService('b')}
+         ORDER BY ${geo.distanceKmSql('b.latitude', 'b.longitude')} ASC LIMIT 1)`
     : 'NULL';
   const distanceParams = hasPosition ? geo.distanceKmParams(params.latitude, params.longitude) : [];
 
@@ -147,6 +177,8 @@ async function listAllOffers(params, user) {
            (SELECT oi.image_url FROM offer_images oi WHERE oi.offer_id = o.id ORDER BY oi.display_order, oi.id LIMIT 1) AS image_url,
            (o.favorite_count * 3 + o.click_count * 2 + o.view_count) AS engagement_count,
            ${PLAN_RANK_SQL} AS plan_rank,
+           ${productLat} AS latitude,
+           ${productLng} AS longitude,
            ${productDistance} AS distance_km,
            ${productSaved}
       FROM offers o
@@ -166,6 +198,8 @@ async function listAllOffers(params, user) {
            (SELECT si.image_url FROM service_images si WHERE si.service_id = sv.id ORDER BY si.display_order, si.id LIMIT 1) AS image_url,
            (so.claim_count * 3 + so.view_count) AS engagement_count,
            ${PLAN_RANK_SQL} AS plan_rank,
+           ${serviceLat} AS latitude,
+           ${serviceLng} AS longitude,
            ${serviceDistance} AS distance_km,
            ${serviceSaved}
       FROM service_offers so
@@ -179,11 +213,13 @@ async function listAllOffers(params, user) {
   const unionParams = [];
   if (type !== 'service') {
     parts.push(productSql);
-    unionParams.push(...distanceParams, ...savedParams, ...productParams);
+    // One set of distanceParams per distanceKmSql() occurrence in productSql's
+    // SELECT list, in text order: latitude, longitude, distance_km.
+    unionParams.push(...distanceParams, ...distanceParams, ...distanceParams, ...savedParams, ...productParams);
   }
   if (type !== 'product') {
     parts.push(serviceSql);
-    unionParams.push(...distanceParams, ...savedParams, ...serviceParams);
+    unionParams.push(...distanceParams, ...distanceParams, ...distanceParams, ...savedParams, ...serviceParams);
   }
   const unionSql = parts.join('\nUNION ALL\n');
 
