@@ -27,6 +27,8 @@ const PREFERENCE_COLUMN = {
   OFFER_DEACTIVATED: 'offer_updates',
   ADMIN_ANNOUNCEMENT: 'admin_announcements',
   OFFER_PUBLISHED: 'admin_announcements',
+  SUBSCRIPTION_BILLING: 'admin_announcements',
+  FEATURE_ACCESS: 'admin_announcements',
 };
 
 async function loadOffer(offerId) {
@@ -214,6 +216,20 @@ async function notifyShopStaff(offer) {
     entityType: 'offer',
     entityId: offer.id,
   });
+}
+
+/**
+ * Notice to a shop's own team, for things that happen to the shop rather than
+ * to an offer - a failed renewal (§10), a granted feature (§11G).
+ */
+async function notifyShopTeam(shopId, { type, title, message, entityType = 'shop', entityId = shopId }) {
+  const staff = await query(
+    `SELECT u.id, u.name, u.email FROM shop_members sm
+       JOIN users u ON u.id = sm.user_id AND u.status = 'active'
+      WHERE sm.shop_id = ? AND sm.status = 'active'`,
+    [shopId],
+  );
+  return dispatch(staff, { type, title, message, entityType, entityId });
 }
 
 /** Customers who saved the offer are told when it changes. */
@@ -440,6 +456,7 @@ async function pruneOld() {
 
 module.exports = {
   notifyNewOffer,
+  notifyShopTeam,
   notifyOfferUpdated,
   notifyOfferDeactivated,
   notifyExpiringOffers,

@@ -12,6 +12,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const mysql = require('mysql2/promise');
 const env = require('../config/env');
+const featureCatalogue = require('../config/featureCatalogue');
 
 const FRESH = process.argv.includes('--fresh');
 
@@ -87,6 +88,56 @@ const COLUMN_PATCHES = [
     column: 'saved_service_offer_expiring',
     sql: "ALTER TABLE notification_preferences ADD COLUMN saved_service_offer_expiring TINYINT(1) NOT NULL DEFAULT 1 AFTER favorite_expiring",
   },
+
+  // ---- V3 Razorpay payments -----------------------------------------------
+  // Gateway bookkeeping on the existing one-row-per-shop subscription.
+  {
+    table: 'shop_subscriptions',
+    column: 'gateway_customer_id',
+    sql: 'ALTER TABLE shop_subscriptions ADD COLUMN gateway VARCHAR(40) DEFAULT NULL AFTER provider_ref',
+    after: [
+      'ALTER TABLE shop_subscriptions ADD COLUMN gateway_customer_id VARCHAR(120) DEFAULT NULL AFTER gateway',
+      'ALTER TABLE shop_subscriptions ADD COLUMN gateway_subscription_id VARCHAR(120) DEFAULT NULL AFTER gateway_customer_id',
+      'ALTER TABLE shop_subscriptions ADD COLUMN gateway_plan_id VARCHAR(120) DEFAULT NULL AFTER gateway_subscription_id',
+      'ALTER TABLE shop_subscriptions ADD COLUMN current_period_start DATETIME DEFAULT NULL AFTER gateway_plan_id',
+      'ALTER TABLE shop_subscriptions ADD COLUMN current_period_end DATETIME DEFAULT NULL AFTER current_period_start',
+      'ALTER TABLE shop_subscriptions ADD COLUMN cancel_at_period_end TINYINT(1) NOT NULL DEFAULT 0 AFTER current_period_end',
+      "ALTER TABLE shop_subscriptions ADD COLUMN pending_plan ENUM('FREE','BUSINESS','PREMIUM') DEFAULT NULL AFTER cancel_at_period_end",
+      'ALTER TABLE shop_subscriptions ADD COLUMN grace_until DATETIME DEFAULT NULL AFTER cancel_at_period_end',
+      'ALTER TABLE shop_subscriptions ADD COLUMN autopay_enabled TINYINT(1) NOT NULL DEFAULT 0 AFTER grace_until',
+      'ALTER TABLE shop_subscriptions ADD COLUMN payment_method VARCHAR(40) DEFAULT NULL AFTER autopay_enabled',
+      'ALTER TABLE shop_subscriptions ADD COLUMN last_payment_at DATETIME DEFAULT NULL AFTER payment_method',
+      'ALTER TABLE shop_subscriptions ADD COLUMN last_failure_reason VARCHAR(255) DEFAULT NULL AFTER last_payment_at',
+      'ALTER TABLE shop_subscriptions ADD KEY idx_subscription_gateway (gateway_subscription_id)',
+    ],
+  },
+
+  {
+    table: 'shop_subscriptions',
+    column: 'checkout_plan',
+    sql: "ALTER TABLE shop_subscriptions ADD COLUMN checkout_plan ENUM('FREE','BUSINESS','PREMIUM') DEFAULT NULL AFTER pending_plan",
+  },
+
+  // ---- Persistent login: refresh_tokens becomes the device-session table ----
+  {
+    table: 'refresh_tokens',
+    column: 'family_id',
+    sql: 'ALTER TABLE refresh_tokens ADD COLUMN family_id CHAR(32) DEFAULT NULL AFTER token_hash',
+    after: [
+      `ALTER TABLE refresh_tokens ADD COLUMN revoked_reason
+         ENUM('rotated','logout','logout_others','reuse_detected','password_changed','revoked','account_disabled')
+         DEFAULT NULL AFTER revoked_at`,
+      `ALTER TABLE refresh_tokens ADD COLUMN device_type
+         ENUM('mobile','tablet','desktop','web','unknown') NOT NULL DEFAULT 'unknown' AFTER revoked_reason`,
+      'ALTER TABLE refresh_tokens ADD COLUMN device_name VARCHAR(120) DEFAULT NULL AFTER device_type',
+      'ALTER TABLE refresh_tokens ADD COLUMN platform VARCHAR(40) DEFAULT NULL AFTER device_name',
+      'ALTER TABLE refresh_tokens ADD COLUMN last_used_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP AFTER ip_address',
+      'ALTER TABLE refresh_tokens ADD KEY idx_refresh_family (family_id)',
+      // Pre-existing tokens have no family; give each its own so rotation
+      // and "log out this device" behave for sessions that predate this.
+      'UPDATE refresh_tokens SET family_id = REPLACE(UUID(), \'-\', \'\') WHERE family_id IS NULL',
+    ],
+  },
 ];
 
 /**
@@ -142,6 +193,58 @@ const STATEMENT_PATCHES = [
            WHERE NOT EXISTS (SELECT 1 FROM shop_subscriptions sub WHERE sub.shop_id = s.id)`,
   },
   {
+    name: "shop_subscriptions.status += 'created','paused'",
+    // Razorpay distinguishes a subscription that exists but has never been
+    // paid ('created') from one halted mid-life ('paused') (§9).
+    check: async (connection, dbName) => {
+      const [rows] = await connection.query(
+        `SELECT COLUMN_TYPE AS t FROM information_schema.COLUMNS
+          WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'shop_subscriptions' AND COLUMN_NAME = 'status'`,
+        [dbName],
+      );
+      return rows.length > 0 && !rows[0].t.includes('paused');
+    },
+    sql: `ALTER TABLE shop_subscriptions
+            MODIFY COLUMN status ENUM('created','active','past_due','paused','cancelled','expired')
+            NOT NULL DEFAULT 'active'`,
+  },
+  {
+    name: 'subscription_events.action += payment lifecycle',
+    check: async (connection, dbName) => {
+      const [rows] = await connection.query(
+        `SELECT COLUMN_TYPE AS t FROM information_schema.COLUMNS
+          WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'subscription_events' AND COLUMN_NAME = 'action'`,
+        [dbName],
+      );
+      return rows.length > 0 && !rows[0].t.includes('payment_failed');
+    },
+    sql: `ALTER TABLE subscription_events
+            MODIFY COLUMN action ENUM('created','upgraded','downgraded','renewed','cancelled',
+                                      'reactivated','payment_failed','past_due','expired','grace_started')
+            NOT NULL`,
+  },
+  {
+    name: 'feature_catalogue is in sync with config/featureCatalogue.js',
+    // The catalogue is declared in code (§11J) and mirrored into the table so
+    // override rows can be validated with a join. Re-running only ever
+    // upserts, so a key removed from code stays in the table for history.
+    check: async (connection) => {
+      const [rows] = await connection.query('SELECT COUNT(*) AS n FROM feature_catalogue');
+      return Number(rows[0].n) !== featureCatalogue.CATALOGUE.length;
+    },
+    run: async (connection) => {
+      for (const entry of featureCatalogue.CATALOGUE) {
+        await connection.query(
+          `INSERT INTO feature_catalogue (feature_key, name, description, category, is_active)
+           VALUES (?, ?, ?, ?, 1)
+           ON DUPLICATE KEY UPDATE name = VALUES(name), description = VALUES(description),
+                                   category = VALUES(category), is_active = 1`,
+          [entry.featureKey, entry.name, entry.description, entry.category],
+        );
+      }
+    },
+  },
+  {
     name: 'analytics_events.service_id -> services FK',
     // `services` is created later in schema.sql than `analytics_events`, so on
     // a fresh install the constraint has to be attached after both exist.
@@ -177,7 +280,10 @@ async function applyPatches(connection, dbName) {
 
   for (const patch of STATEMENT_PATCHES) {
     if (!(await patch.check(connection, dbName))) continue;
-    await connection.query(patch.sql);
+    // A patch is either one statement or a function, for the few that need
+    // to loop over data declared in code.
+    if (patch.run) await patch.run(connection);
+    else await connection.query(patch.sql);
     applied.push(patch.name);
   }
 

@@ -8,6 +8,8 @@ const bannerService = require('../modules/banners/banner.service');
 const notifications = require('../services/notifications');
 const analyticsSnapshots = require('../services/analyticsSnapshots');
 const authService = require('../modules/auth/auth.service');
+const subscriptionService = require('../modules/subscriptions/subscription.service');
+const featureOverrides = require('../modules/featureOverrides/featureOverride.service');
 
 /**
  * Background maintenance. Everything here is idempotent, so running a job twice
@@ -78,6 +80,28 @@ const jobs = [
     run: async () => {
       const { day, rows } = await analyticsSnapshots.rebuildDay();
       console.log('[jobs] analytics snapshot for %s: %d rows', day, rows);
+    },
+  },
+  {
+    name: 'billing-lifecycle',
+    // 02:00 daily. Closes grace windows on failed payments and applies
+    // downgrades whose paid period has ended (§10, §11, §12). Merchant data is
+    // never deleted - only the plan changes.
+    schedule: '0 2 * * *',
+    run: async () => {
+      const downgraded = await subscriptionService.sweepLapsed();
+      if (downgraded) console.log('[jobs] billing lifecycle: %d shops downgraded', downgraded);
+    },
+  },
+  {
+    name: 'override-expiry',
+    // 02:10 daily (§11H). Bookkeeping rather than enforcement: an expired
+    // override stops granting its feature the moment its date passes, because
+    // the resolver filters on the date. This writes the EXPIRED audit event.
+    schedule: '10 2 * * *',
+    run: async () => {
+      const expired = await featureOverrides.expireLapsed();
+      if (expired) console.log('[jobs] feature overrides expired: %d', expired);
     },
   },
   {

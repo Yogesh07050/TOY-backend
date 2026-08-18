@@ -27,6 +27,8 @@ router.use('/claims', require('./modules/claims/claim.routes'));
 
 // ---- V3 ----
 router.use('/subscriptions', require('./modules/subscriptions/subscription.routes'));
+router.use('/payments', require('./modules/payments/payment.routes'));
+router.use('/feature-overrides', require('./modules/featureOverrides/featureOverride.routes'));
 router.use('/campaigns', require('./modules/campaigns/campaign.routes'));
 
 // ---- V4: Services ----

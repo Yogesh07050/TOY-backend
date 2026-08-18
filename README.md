@@ -282,6 +282,7 @@ All routes are under `/api`. Responses are enveloped:
 | Area | Routes |
 |---|---|
 | Auth | `POST /auth/register\|login\|logout\|refresh-token\|forgot-password\|reset-password\|verify-email\|resend-verification\|change-password`, `GET /auth/me` |
+| Sessions | `GET /auth/sessions`, `DELETE /auth/sessions/:id`, `POST /auth/sessions/revoke-others` |
 | Users | `GET /users`, `GET /users/:id`, `PUT /users/:id`, `PATCH /users/:id/status`, `PUT /users/me` |
 | Shop access | `POST /users/:id/memberships`, `PUT\|DELETE /users/:id/memberships/:membershipId` |
 | Roles | `GET|POST /roles`, `GET|PUT|DELETE /roles/:id` |
@@ -302,7 +303,9 @@ All routes are under `/api`. Responses are enveloped:
 | Discovery (V2) | `GET /discovery/featured\|ending-soon\|nearby\|recommended`, `POST /discovery/featured/:id/track` |
 | Claims (V2) | `GET /claims`, `POST /claims/:offerId`, `GET /claims/lookup/:code`, `POST /claims/lookup/:code/redeem` |
 | Analytics (V2) | `GET /analytics/funnel`, `GET /analytics/growth` |
-| Subscriptions (V3) | `GET /subscriptions/plans\|me`, `GET /subscriptions/shops/:shopId\|/usage\|/history\|/invoices`, `PUT /subscriptions/shops/:shopId`, `POST /subscriptions/shops/:shopId/confirm-payment\|cancel` |
+| Subscriptions (V3) | `GET /subscriptions/plans\|me\|current`, `GET /subscriptions/shops/:shopId\|/usage\|/history\|/billing-history\|/invoices`, `PUT /subscriptions/shops/:shopId` (Free only), `POST /subscriptions/shops/:shopId/checkout\|checkout/verify\|upgrade\|downgrade\|cancel\|confirm-payment` |
+| Payments (Razorpay) | `POST /payments/razorpay/webhook`, `GET /payments/config`, `GET /payments/transactions` (Super Admin) |
+| Feature overrides (Super Admin) | `GET /feature-overrides\|/catalogue\|/summary\|/history`, `GET /feature-overrides/shops/:shopId`, `POST /feature-overrides/shops/:shopId`, `DELETE /feature-overrides/shops/:shopId/:featureKey` |
 | Campaigns (V3) | `GET\|POST /campaigns`, `GET\|PUT\|DELETE /campaigns/:id` |
 | Premium analytics (V3) | `GET /analytics/premium/overview\|offer-performance\|funnel\|locations\|branches\|customers\|acquisition\|retention\|campaigns\|offer-comparison\|discount-effectiveness\|best-time\|ending-soon\|offer-health\|recommendations\|category-insights\|roi\|offer-intelligence` |
 | Reports (V3) | `GET /analytics/premium/reports`, `GET /analytics/premium/reports/export?type=&format=csv\|xlsx` |
@@ -342,7 +345,23 @@ restricted to shops the caller may administer.
 - bcrypt password hashing; strength rules enforced server-side.
 - Short-lived JWT access tokens; refresh tokens are **rotated** on use, stored
   only as SHA-256 digests, and revoked on password reset or deactivation.
-- The refresh token is also set as an `httpOnly` cookie for the browser client.
+- Rotation carries a **session family** (`refresh_tokens.family_id`): one family
+  per device. Presenting a token that was already rotated away means a copy
+  leaked, so the whole family is revoked — the thief and the owner cannot take
+  turns refreshing.
+- The refresh token is also set as an `httpOnly` cookie for the browser client,
+  which is what lets the web app stay signed in without a long-lived credential
+  in `localStorage`. `REFRESH_COOKIE_SAMESITE` tunes it per deployment.
+- A password change signs out every *other* device; the one that made the
+  change keeps its session, having just proved it knows the old password.
+- **Subscriptions are never activated by the frontend.** A paid plan is created
+  `pending` and only a signature-verified Razorpay webhook may set it active.
+  Merchant Admins cannot set a paid plan, confirm a payment, or grant
+  themselves a feature — all three are refused at the route.
+- Razorpay webhooks are verified by HMAC over the **raw** request body and
+  deduplicated on a unique `(gateway, event_id)` key, so redelivery is a no-op.
+- No card number, CVV, PIN, UPI PIN or banking credential is ever received or
+  stored — only gateway identifiers and the descriptors Razorpay echoes back.
 - Login answers identically for an unknown email and a wrong password, and
   spends comparable time, so it cannot be used to enumerate accounts.
 - Every input is parsed by a Zod schema that *replaces* the request part, so
@@ -365,6 +384,12 @@ See `.env.example`. Notable values:
 | `SMTP_HOST` | Leave empty to log emails to the console instead of sending |
 | `STORAGE_DRIVER` | `local` (implemented) or `s3` (stub) |
 | `MAX_UPLOAD_MB` | Per-image upload cap |
+| `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` | Leave empty and checkout answers `503 PAYMENTS_NOT_CONFIGURED` instead of failing mid-call |
+| `RAZORPAY_WEBHOOK_SECRET` | Required for `POST /payments/razorpay/webhook`; without it the endpoint refuses rather than trusting unverified events |
+| `RAZORPAY_PLAN_BUSINESS` / `RAZORPAY_PLAN_PREMIUM` | Razorpay Plan ids. Recurring billing and UPI AutoPay are created against these |
+| `BILLING_GRACE_DAYS` | Days a failed renewal keeps its features before dropping to Free (data is never deleted) |
+| `BILLING_TAX_PERCENT` | Tax already included in the plan price; invoices back-compute the split |
+| `REFRESH_COOKIE_SAMESITE` | `lax` when API and SPA share a site, `none` (+ Secure) when they do not |
 
 ## Background jobs
 
@@ -373,4 +398,6 @@ See `.env.example`. Notable values:
 | `offer-lifecycle` | every 5 min | scheduled → active → expired |
 | `expiring-favourites` | daily 09:00 | emails customers about saved offers ending within 48h |
 | `analytics-snapshots` | daily 00:20 | folds yesterday's events into `analytics_daily_snapshots` (V3) |
+| `billing-lifecycle` | daily 02:00 | closes grace windows and applies downgrades whose paid period ended — plan only, never data |
+| `override-expiry` | daily 02:10 | writes the `EXPIRED` audit event for lapsed Super Admin grants (they stop granting the moment their date passes, independently of this job) |
 | `prune` | daily 03:30 | deletes spent tokens and read notifications older than 60 days |

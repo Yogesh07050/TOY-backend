@@ -44,7 +44,17 @@ app.use(
 );
 
 app.use(compression());
-app.use(express.json({ limit: '1mb' }));
+app.use(
+  express.json({
+    limit: '1mb',
+    // The Razorpay webhook signature is an HMAC over the exact bytes sent
+    // (§8.1). Re-serialising the parsed object would reorder keys and change
+    // whitespace, so the raw buffer is kept for that one verification.
+    verify: (req, _res, buffer) => {
+      if (buffer?.length) req.rawBody = buffer;
+    },
+  }),
+);
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 app.use(cookieParser());
 

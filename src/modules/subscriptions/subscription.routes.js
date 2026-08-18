@@ -3,12 +3,14 @@
 const express = require('express');
 const { z } = require('zod');
 const service = require('./subscription.service');
+const payments = require('../payments/payment.service');
+const razorpay = require('../../services/razorpay');
 const plans = require('../../config/plans');
 const audit = require('../../utils/audit');
 const validate = require('../../middleware/validate');
 const asyncHandler = require('../../utils/asyncHandler');
 const { authenticate, optionalAuth } = require('../../middleware/auth');
-const { requireShopScope } = require('../../middleware/authorize');
+const { requireShopScope, requireSuperAdmin } = require('../../middleware/authorize');
 const accessControl = require('../../services/accessControl');
 const ApiError = require('../../utils/ApiError');
 const { ok } = require('../../utils/respond');
@@ -49,6 +51,14 @@ router.get(
       }),
       featureLabels: plans.FEATURE_LABELS,
       comparison: plans.COMPARISON_MATRIX,
+      /** So the pricing page can say whether checkout is available at all. */
+      payment: {
+        gateway: 'razorpay',
+        enabled: razorpay.isConfigured,
+        keyId: razorpay.isConfigured ? razorpay.keyId : null,
+        supportsAutopay: true,
+        methods: ['card', 'upi', 'netbanking', 'wallet'],
+      },
     });
   }),
 );
@@ -62,6 +72,25 @@ router.get(
     const shopIds = req.user.shops.map((shop) => shop.shopId);
     const entitlements = await Promise.all(shopIds.map((shopId) => service.entitlements(shopId)));
     ok(res, entitlements);
+  }),
+);
+
+/**
+ * §18 `GET /subscriptions/current`: the entitlement in force for the caller.
+ * Resolves to the shop they administer, or the highest-ranked when they manage
+ * several - the client narrows with `/shops/:shopId` when it knows the shop.
+ */
+router.get(
+  '/current',
+  asyncHandler(async (req, res) => {
+    const shopIds = req.user.shops.map((shop) => shop.shopId);
+    if (!shopIds.length) return ok(res, null);
+
+    const all = await Promise.all(shopIds.map((shopId) => service.entitlements(shopId)));
+    const best = all.sort(
+      (a, b) => plans.planFor(b.plan).rank - plans.planFor(a.plan).rank,
+    )[0];
+    ok(res, best);
   }),
 );
 
@@ -102,27 +131,175 @@ router.get(
   }),
 );
 
+/** Payment ledger for the Billing screen (§15). */
+router.get(
+  '/shops/:shopId/billing-history',
+  validate({ params: shopIdParam }),
+  requireShopScope('MANAGE_SUBSCRIPTION'),
+  asyncHandler(async (req, res) => {
+    ok(res, await payments.billingHistory(Number(req.params.shopId)));
+  }),
+);
+
 router.get(
   '/shops/:shopId/invoices',
   validate({ params: shopIdParam }),
   requireShopScope('MANAGE_SUBSCRIPTION'),
   asyncHandler(async (req, res) => {
-    ok(res, await service.invoices(Number(req.params.shopId)));
+    ok(res, await payments.invoices(Number(req.params.shopId)));
   }),
 );
 
-/** Upgrade or downgrade. Payment capture itself belongs to the provider (§38). */
+router.get(
+  '/shops/:shopId/invoices/:invoiceId',
+  validate({ params: shopIdParam.extend({ invoiceId: z.coerce.number().int().positive() }) }),
+  requireShopScope('MANAGE_SUBSCRIPTION'),
+  asyncHandler(async (req, res) => {
+    ok(res, await payments.invoice(Number(req.params.shopId), Number(req.params.invoiceId)));
+  }),
+);
+
+/**
+ * Starts a paid-plan purchase (§3, §18).
+ *
+ * Returns what Checkout needs; it does **not** change the shop's entitlements.
+ * The plan is left pending until the Razorpay webhook confirms payment (§7),
+ * so a client that fakes a success response gains nothing.
+ */
+router.post(
+  '/shops/:shopId/checkout',
+  validate({
+    params: shopIdParam,
+    body: z.object({
+      plan: z.enum(['BUSINESS', 'PREMIUM']),
+      billingCycle: z.enum(['monthly', 'yearly']).default('monthly'),
+      note: z.string().trim().max(255).optional(),
+    }),
+  }),
+  requireShopScope('MANAGE_SUBSCRIPTION'),
+  asyncHandler(async (req, res) => {
+    const shopId = Number(req.params.shopId);
+    const checkout = await payments.startCheckout(shopId, req.body.plan, req.user, {
+      billingCycle: req.body.billingCycle,
+      note: req.body.note,
+    });
+
+    await audit.record(req, {
+      action: 'SUBSCRIPTION_CHECKOUT_STARTED',
+      entityType: 'shop',
+      entityId: shopId,
+      newValue: { plan: req.body.plan, gatewaySubscriptionId: checkout.subscriptionId },
+    });
+
+    ok(res, checkout);
+  }),
+);
+
+/**
+ * The handshake the client makes when Checkout closes successfully (§7).
+ *
+ * Its signature is verified, but the answer is deliberately "payment received,
+ * activation pending" - only the webhook activates a plan.
+ */
+router.post(
+  '/shops/:shopId/checkout/verify',
+  validate({
+    params: shopIdParam,
+    body: z.object({
+      paymentId: z.string().trim().min(4).max(120),
+      subscriptionId: z.string().trim().max(120).optional(),
+      orderId: z.string().trim().max(120).optional(),
+      signature: z.string().trim().min(16).max(200),
+    }),
+  }),
+  requireShopScope('MANAGE_SUBSCRIPTION'),
+  asyncHandler(async (req, res) => {
+    ok(res, await payments.acknowledgeCheckout(Number(req.params.shopId), req.body));
+  }),
+);
+
+/**
+ * Upgrade (§12). Paid targets go through checkout, so this only points there -
+ * the frontend must never be able to set a plan directly.
+ */
+router.post(
+  '/shops/:shopId/upgrade',
+  validate({
+    params: shopIdParam,
+    body: z.object({
+      plan: z.enum(['BUSINESS', 'PREMIUM']),
+      billingCycle: z.enum(['monthly', 'yearly']).default('monthly'),
+    }),
+  }),
+  requireShopScope('MANAGE_SUBSCRIPTION'),
+  asyncHandler(async (req, res) => {
+    const shopId = Number(req.params.shopId);
+    const checkout = await payments.startCheckout(shopId, req.body.plan, req.user, {
+      billingCycle: req.body.billingCycle,
+    });
+    await audit.record(req, {
+      action: 'SUBSCRIPTION_CHECKOUT_STARTED',
+      entityType: 'shop',
+      entityId: shopId,
+      newValue: { plan: req.body.plan, via: 'upgrade' },
+    });
+    ok(res, checkout);
+  }),
+);
+
+/**
+ * Downgrade (§12). Takes effect at the end of the period already paid for, so
+ * the merchant keeps the benefits they bought.
+ */
+router.post(
+  '/shops/:shopId/downgrade',
+  validate({
+    params: shopIdParam,
+    body: z.object({
+      plan: z.enum(['FREE', 'BUSINESS']),
+      note: z.string().trim().max(255).optional(),
+    }),
+  }),
+  requireShopScope('MANAGE_SUBSCRIPTION'),
+  asyncHandler(async (req, res) => {
+    const shopId = Number(req.params.shopId);
+    const before = await service.getForShop(shopId);
+    const entitlements = await service.scheduleDowngrade(shopId, req.body.plan, req.user, req.body.note);
+
+    await audit.record(req, {
+      action: 'SUBSCRIPTION_DOWNGRADED',
+      entityType: 'shop',
+      entityId: shopId,
+      oldValue: { plan: before.plan },
+      newValue: { plan: req.body.plan, effectiveAt: entitlements.currentPeriodEnd ?? 'immediately' },
+    });
+
+    ok(res, entitlements);
+  }),
+);
+
+/**
+ * Plan switch (§31). Only Free is settable this way: moving onto a paid plan
+ * has to go through checkout so that money changes hands before features do
+ * (§7, §31 "Admin cannot manually modify subscription status").
+ */
 router.put(
   '/shops/:shopId',
   validate({ params: shopIdParam, body: planBody }),
   requireShopScope('MANAGE_SUBSCRIPTION'),
   asyncHandler(async (req, res) => {
     const shopId = Number(req.params.shopId);
+    if (req.body.plan !== 'FREE') {
+      throw new ApiError(
+        400,
+        'Paid plans must be purchased through checkout.',
+        undefined,
+        'CHECKOUT_REQUIRED',
+      );
+    }
+
     const before = await service.getForShop(shopId);
-    const entitlements = await service.changePlan(shopId, req.body.plan, req.user, {
-      billingCycle: req.body.billingCycle,
-      note: req.body.note,
-    });
+    const entitlements = await service.scheduleDowngrade(shopId, 'FREE', req.user, req.body.note);
 
     await audit.record(req, {
       action: 'SUBSCRIPTION_CHANGED',
@@ -137,9 +314,12 @@ router.put(
 );
 
 /**
- * Confirms payment for the current period. Left as an authenticated admin
- * action rather than an open webhook until a provider is chosen - the provider
- * integration should call `service.markPaid` from its own verified handler.
+ * Manual payment confirmation, **Super Admin only**.
+ *
+ * Kept as a support tool for reconciling a payment the webhook never delivered,
+ * and for exercising paid plans on an environment with no Razorpay credentials.
+ * A merchant Admin cannot reach it: §31 requires that they not be able to move
+ * their own subscription into a paid state from the frontend.
  */
 router.post(
   '/shops/:shopId/confirm-payment',
@@ -147,35 +327,39 @@ router.post(
     params: shopIdParam,
     body: z.object({ provider: z.string().max(40).optional(), reference: z.string().max(120).optional() }),
   }),
-  requireShopScope('MANAGE_SUBSCRIPTION'),
+  requireSuperAdmin,
   asyncHandler(async (req, res) => {
     const shopId = Number(req.params.shopId);
     const subscription = await service.markPaid(shopId, {
-      provider: req.body.provider ?? null,
+      provider: req.body.provider ?? 'manual',
       providerRef: req.body.reference ?? null,
     });
     await audit.record(req, {
       action: 'SUBSCRIPTION_PAYMENT_CONFIRMED',
       entityType: 'shop',
       entityId: shopId,
-      newValue: { plan: subscription.plan, amount: subscription.price },
+      newValue: { plan: subscription.plan, amount: subscription.price, manual: true },
     });
     ok(res, subscription);
   }),
 );
 
+/**
+ * Cancels future billing (§13). The mandate is cancelled at Razorpay, the plan
+ * stays live until the paid period ends, and no payment record is deleted.
+ */
 router.post(
   '/shops/:shopId/cancel',
   validate({ params: shopIdParam, body: z.object({ note: z.string().max(255).optional() }) }),
   requireShopScope('MANAGE_SUBSCRIPTION'),
   asyncHandler(async (req, res) => {
     const shopId = Number(req.params.shopId);
-    const entitlements = await service.cancel(shopId, req.user, req.body.note);
+    const entitlements = await payments.cancelSubscription(shopId, req.user, req.body.note);
     await audit.record(req, {
       action: 'SUBSCRIPTION_CANCELLED',
       entityType: 'shop',
       entityId: shopId,
-      newValue: { note: req.body.note ?? null },
+      newValue: { note: req.body.note ?? null, activeUntil: entitlements.activeUntil ?? null },
     });
     ok(res, entitlements);
   }),

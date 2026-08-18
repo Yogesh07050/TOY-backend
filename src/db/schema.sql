@@ -83,18 +83,36 @@ CREATE TABLE IF NOT EXISTS user_roles (
 -- ---------------------------------------------------------------------
 -- Auth tokens
 -- ---------------------------------------------------------------------
+-- One row per issued refresh token. This is the `user_sessions` table of
+-- the persistent-login spec (§27): a "session" is a family of refresh
+-- tokens sharing `family_id`, rotated on every use (§29), so the newest
+-- live row in a family *is* that device's session.
+--
+-- Raw tokens are never stored, only their SHA-256 digest (§27).
 CREATE TABLE IF NOT EXISTS refresh_tokens (
-  id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  user_id     BIGINT UNSIGNED NOT NULL,
-  token_hash  CHAR(64)        NOT NULL,
-  expires_at  DATETIME        NOT NULL,
-  revoked_at  DATETIME                DEFAULT NULL,
-  user_agent  VARCHAR(255)            DEFAULT NULL,
-  ip_address  VARCHAR(64)             DEFAULT NULL,
-  created_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  user_id        BIGINT UNSIGNED NOT NULL,
+  token_hash     CHAR(64)        NOT NULL,
+  -- Shared by every rotation of one device's session. Presenting a token
+  -- that was already rotated away is a reuse signal, and the whole family
+  -- is revoked in response (§29).
+  family_id      CHAR(32)                DEFAULT NULL,
+  expires_at     DATETIME        NOT NULL,
+  revoked_at     DATETIME                DEFAULT NULL,
+  revoked_reason ENUM('rotated','logout','logout_others','reuse_detected',
+                      'password_changed','revoked','account_disabled')
+                 DEFAULT NULL,
+  device_type    ENUM('mobile','tablet','desktop','web','unknown') NOT NULL DEFAULT 'unknown',
+  device_name    VARCHAR(120)            DEFAULT NULL,
+  platform       VARCHAR(40)             DEFAULT NULL,
+  user_agent     VARCHAR(255)            DEFAULT NULL,
+  ip_address     VARCHAR(64)             DEFAULT NULL,
+  last_used_at   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  created_at     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   UNIQUE KEY uq_refresh_hash (token_hash),
   KEY idx_refresh_user (user_id),
+  KEY idx_refresh_family (family_id),
   CONSTRAINT fk_refresh_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -571,7 +589,10 @@ CREATE TABLE IF NOT EXISTS shop_subscriptions (
   id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   shop_id        BIGINT UNSIGNED NOT NULL,
   plan           ENUM('FREE','BUSINESS','PREMIUM') NOT NULL DEFAULT 'FREE',
-  status         ENUM('active','past_due','cancelled','expired') NOT NULL DEFAULT 'active',
+  -- 'created' is a paid plan chosen but not yet paid for; 'paused' is a
+  -- Razorpay-side halt. Entitlements only follow 'active' (§9).
+  status         ENUM('created','active','past_due','paused','cancelled','expired')
+                 NOT NULL DEFAULT 'active',
   billing_cycle  ENUM('monthly','yearly') NOT NULL DEFAULT 'monthly',
   price_amount   DECIMAL(10,2)   NOT NULL DEFAULT 0.00,
   currency       CHAR(3)         NOT NULL DEFAULT 'INR',
@@ -581,12 +602,36 @@ CREATE TABLE IF NOT EXISTS shop_subscriptions (
   cancelled_at   DATETIME                DEFAULT NULL,
   provider       VARCHAR(40)             DEFAULT NULL,
   provider_ref   VARCHAR(120)            DEFAULT NULL,
+  -- ---- Gateway bookkeeping (Razorpay §6, §17) ----
+  -- Identifiers only. No card, UPI or banking credential is ever stored.
+  gateway               VARCHAR(40)      DEFAULT NULL,
+  gateway_customer_id   VARCHAR(120)     DEFAULT NULL,
+  gateway_subscription_id VARCHAR(120)   DEFAULT NULL,
+  gateway_plan_id       VARCHAR(120)     DEFAULT NULL,
+  current_period_start  DATETIME         DEFAULT NULL,
+  current_period_end    DATETIME         DEFAULT NULL,
+  -- Set when the merchant cancels or downgrades: benefits run to the end of
+  -- the paid period before `pending_plan` takes effect (§12, §13).
+  cancel_at_period_end  TINYINT(1)       NOT NULL DEFAULT 0,
+  pending_plan          ENUM('FREE','BUSINESS','PREMIUM') DEFAULT NULL,
+  -- The plan a checkout is in flight for. Parked here rather than written
+  -- to `plan`, so starting a purchase never disturbs the plan the merchant
+  -- has already paid for (§7, §12). Applied by `activate()` on payment.
+  checkout_plan         ENUM('FREE','BUSINESS','PREMIUM') DEFAULT NULL,
+  -- How long a failed renewal keeps its features before downgrade (§10).
+  grace_until           DATETIME         DEFAULT NULL,
+  -- True once a UPI AutoPay / card mandate is authorised (§5).
+  autopay_enabled       TINYINT(1)       NOT NULL DEFAULT 0,
+  payment_method        VARCHAR(40)      DEFAULT NULL,
+  last_payment_at       DATETIME         DEFAULT NULL,
+  last_failure_reason   VARCHAR(255)     DEFAULT NULL,
   created_at     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   -- A shop has exactly one subscription; upgrades mutate this row.
   UNIQUE KEY uq_subscription_shop (shop_id),
   KEY idx_subscription_plan (plan, status),
+  KEY idx_subscription_gateway (gateway_subscription_id),
   CONSTRAINT fk_subscription_shop FOREIGN KEY (shop_id) REFERENCES shops (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -597,7 +642,8 @@ CREATE TABLE IF NOT EXISTS subscription_events (
   shop_id    BIGINT UNSIGNED NOT NULL,
   from_plan  ENUM('FREE','BUSINESS','PREMIUM')         DEFAULT NULL,
   to_plan    ENUM('FREE','BUSINESS','PREMIUM') NOT NULL,
-  action     ENUM('created','upgraded','downgraded','renewed','cancelled','reactivated') NOT NULL,
+  action     ENUM('created','upgraded','downgraded','renewed','cancelled','reactivated',
+                  'payment_failed','past_due','expired','grace_started') NOT NULL,
   amount     DECIMAL(10,2)   NOT NULL DEFAULT 0.00,
   actor_id   BIGINT UNSIGNED         DEFAULT NULL,
   note       VARCHAR(255)            DEFAULT NULL,
@@ -949,4 +995,174 @@ CREATE TABLE IF NOT EXISTS notification_deliveries (
   UNIQUE KEY uq_notif_delivery (user_id, type, entity_type, entity_id, threshold_hours),
   KEY idx_nd_entity (entity_type, entity_id),
   CONSTRAINT fk_nd_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- =====================================================================
+--  V3 Payments (Razorpay) - "Razorpay Payments & Persistent Login" §17
+-- =====================================================================
+
+-- ---------------------------------------------------------------------
+-- Every payment attempt the gateway told us about (§17). One row per
+-- Razorpay payment; `gateway_payment_id` is unique so a webhook replay
+-- updates the existing row rather than inserting a duplicate.
+--
+-- Nothing here can identify a card: only gateway references, the last
+-- four digits Razorpay itself echoes back, and the method name (§6).
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS payment_transactions (
+  id                 BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  shop_id            BIGINT UNSIGNED NOT NULL,
+  subscription_id    BIGINT UNSIGNED         DEFAULT NULL,
+  gateway            VARCHAR(40)     NOT NULL DEFAULT 'razorpay',
+  gateway_order_id   VARCHAR(120)            DEFAULT NULL,
+  gateway_payment_id VARCHAR(120)            DEFAULT NULL,
+  gateway_invoice_id VARCHAR(120)            DEFAULT NULL,
+  plan               ENUM('FREE','BUSINESS','PREMIUM') NOT NULL DEFAULT 'FREE',
+  amount             DECIMAL(10,2)   NOT NULL DEFAULT 0.00,
+  amount_refunded    DECIMAL(10,2)   NOT NULL DEFAULT 0.00,
+  currency           CHAR(3)         NOT NULL DEFAULT 'INR',
+  -- 'upi', 'card', 'netbanking', 'wallet' ... whatever Razorpay reports.
+  payment_method     VARCHAR(40)             DEFAULT NULL,
+  -- Safe-to-store descriptors Razorpay echoes back; never the full number.
+  method_detail      VARCHAR(120)            DEFAULT NULL,
+  status             ENUM('CREATED','PENDING','AUTHORIZED','CAPTURED','FAILED',
+                          'REFUNDED','PARTIALLY_REFUNDED','CANCELLED')
+                     NOT NULL DEFAULT 'CREATED',
+  failure_reason     VARCHAR(255)            DEFAULT NULL,
+  paid_at            DATETIME                DEFAULT NULL,
+  created_at         DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at         DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_payment_gateway_payment (gateway_payment_id),
+  KEY idx_payment_shop (shop_id, created_at),
+  KEY idx_payment_order (gateway_order_id),
+  KEY idx_payment_status (status),
+  CONSTRAINT fk_payment_shop FOREIGN KEY (shop_id) REFERENCES shops (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------
+-- Raw webhook ledger (§8, §17). The unique key on (gateway, event_id) is
+-- what makes processing idempotent: a redelivered event collides on
+-- insert, so the handler can tell "seen before" from "new" atomically
+-- rather than by reading first and racing itself.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS payment_webhooks (
+  id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  gateway      VARCHAR(40)     NOT NULL DEFAULT 'razorpay',
+  event_id     VARCHAR(160)    NOT NULL,
+  event_type   VARCHAR(80)     NOT NULL,
+  payload      JSON            NOT NULL,
+  processed    TINYINT(1)      NOT NULL DEFAULT 0,
+  processed_at DATETIME                DEFAULT NULL,
+  error        VARCHAR(500)            DEFAULT NULL,
+  created_at   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_webhook_event (gateway, event_id),
+  KEY idx_webhook_type (event_type, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------
+-- Issued invoices (§16). Generated from a captured payment, so an
+-- invoice only ever exists for money that actually arrived.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS subscription_invoices (
+  id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  shop_id        BIGINT UNSIGNED NOT NULL,
+  transaction_id BIGINT UNSIGNED         DEFAULT NULL,
+  number         VARCHAR(40)     NOT NULL,
+  plan           ENUM('FREE','BUSINESS','PREMIUM') NOT NULL,
+  period_start   DATETIME                DEFAULT NULL,
+  period_end     DATETIME                DEFAULT NULL,
+  -- Amount excluding tax, the tax charged, and what the merchant paid.
+  subtotal       DECIMAL(10,2)   NOT NULL DEFAULT 0.00,
+  tax_amount     DECIMAL(10,2)   NOT NULL DEFAULT 0.00,
+  total          DECIMAL(10,2)   NOT NULL DEFAULT 0.00,
+  currency       CHAR(3)         NOT NULL DEFAULT 'INR',
+  status         ENUM('issued','paid','void','refunded') NOT NULL DEFAULT 'paid',
+  billing_name   VARCHAR(190)            DEFAULT NULL,
+  billing_address VARCHAR(500)           DEFAULT NULL,
+  issued_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  created_at     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_invoice_number (number),
+  KEY idx_invoice_shop (shop_id, issued_at),
+  CONSTRAINT fk_invoice_shop FOREIGN KEY (shop_id) REFERENCES shops (id) ON DELETE CASCADE,
+  CONSTRAINT fk_invoice_txn  FOREIGN KEY (transaction_id)
+    REFERENCES payment_transactions (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- =====================================================================
+--  Super Admin feature overrides (§11A-§11L)
+-- =====================================================================
+
+-- Controlled catalogue (§11J). An override may only name a key that
+-- exists and is active here, which is what stops a typo or an invented
+-- feature name from being inserted and then silently never matching.
+CREATE TABLE IF NOT EXISTS feature_catalogue (
+  id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  feature_key VARCHAR(60)     NOT NULL,
+  name        VARCHAR(120)    NOT NULL,
+  description VARCHAR(255)            DEFAULT NULL,
+  category    VARCHAR(60)     NOT NULL DEFAULT 'General',
+  is_active   TINYINT(1)      NOT NULL DEFAULT 1,
+  created_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_feature_key (feature_key),
+  KEY idx_feature_active (is_active)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- One row per (shop, feature) grant (§11J). Scoped to the shop rather
+-- than the admin user: entitlements are consumed per shop everywhere
+-- else, and a shop's staff must all see the same feature set.
+-- `admin_user_id` records which merchant account the grant was made for.
+CREATE TABLE IF NOT EXISTS feature_overrides (
+  id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  shop_id       BIGINT UNSIGNED NOT NULL,
+  admin_user_id BIGINT UNSIGNED         DEFAULT NULL,
+  feature_key   VARCHAR(60)     NOT NULL,
+  status        ENUM('active','revoked','expired') NOT NULL DEFAULT 'active',
+  starts_at     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  expires_at    DATETIME                DEFAULT NULL,
+  is_permanent  TINYINT(1)      NOT NULL DEFAULT 0,
+  reason        VARCHAR(500)            DEFAULT NULL,
+  granted_by    BIGINT UNSIGNED         DEFAULT NULL,
+  revoked_by    BIGINT UNSIGNED         DEFAULT NULL,
+  revoked_at    DATETIME                DEFAULT NULL,
+  created_at    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  -- A shop has at most one override row per feature; re-granting a
+  -- revoked feature reactivates this row so its history stays in one place.
+  UNIQUE KEY uq_override_shop_feature (shop_id, feature_key),
+  KEY idx_override_status (status, expires_at),
+  KEY idx_override_feature (feature_key, status),
+  CONSTRAINT fk_override_shop    FOREIGN KEY (shop_id)       REFERENCES shops (id) ON DELETE CASCADE,
+  CONSTRAINT fk_override_admin   FOREIGN KEY (admin_user_id) REFERENCES users (id) ON DELETE SET NULL,
+  CONSTRAINT fk_override_granter FOREIGN KEY (granted_by)    REFERENCES users (id) ON DELETE SET NULL,
+  CONSTRAINT fk_override_revoker FOREIGN KEY (revoked_by)    REFERENCES users (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Append-only history of every override action (§11I). Separate from
+-- audit_logs so "who gave ABC Stores Advanced Analytics, and when did it
+-- lapse" is one query rather than a search through the generic trail.
+CREATE TABLE IF NOT EXISTS feature_override_events (
+  id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  override_id    BIGINT UNSIGNED         DEFAULT NULL,
+  shop_id        BIGINT UNSIGNED NOT NULL,
+  admin_user_id  BIGINT UNSIGNED         DEFAULT NULL,
+  feature_key    VARCHAR(60)     NOT NULL,
+  action         ENUM('GRANTED','REVOKED','EXTENDED','EXPIRED','MODIFIED') NOT NULL,
+  previous_state JSON                    DEFAULT NULL,
+  new_state      JSON                    DEFAULT NULL,
+  starts_at      DATETIME                DEFAULT NULL,
+  expires_at     DATETIME                DEFAULT NULL,
+  reason         VARCHAR(500)            DEFAULT NULL,
+  actor_id       BIGINT UNSIGNED         DEFAULT NULL,
+  created_at     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_override_event_shop (shop_id, created_at),
+  KEY idx_override_event_override (override_id, created_at),
+  CONSTRAINT fk_override_event_shop  FOREIGN KEY (shop_id)  REFERENCES shops (id) ON DELETE CASCADE,
+  CONSTRAINT fk_override_event_actor FOREIGN KEY (actor_id) REFERENCES users (id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

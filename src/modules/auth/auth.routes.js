@@ -59,4 +59,19 @@ router.post(
 
 router.get('/me', authenticate, asyncHandler(controller.me));
 
+// ---- Device sessions (§28) -------------------------------------------------
+// A user manages only their own sessions, so authentication is the whole
+// authorization check here - there is no permission that lets one user see
+// another's devices.
+router.get('/sessions', authenticate, asyncHandler(controller.sessions));
+
+router.post('/sessions/revoke-others', authenticate, asyncHandler(controller.revokeOtherSessions));
+
+router.delete(
+  '/sessions/:id',
+  authenticate,
+  validate({ params: schema.sessionIdParam }),
+  asyncHandler(controller.revokeSession),
+);
+
 module.exports = router;

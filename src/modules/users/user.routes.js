@@ -7,6 +7,7 @@ const ApiError = require('../../utils/ApiError');
 const validate = require('../../middleware/validate');
 const asyncHandler = require('../../utils/asyncHandler');
 const audit = require('../../utils/audit');
+const authService = require('../auth/auth.service');
 const { authenticate } = require('../../middleware/auth');
 const { requireGlobalPermission } = require('../../middleware/authorize');
 const { limitOffset, paginationSchema } = require('../../utils/pagination');
@@ -374,11 +375,8 @@ router.patch(
 
     await execute('UPDATE users SET status = ? WHERE id = ?', [req.body.status, req.params.id]);
     if (req.body.status === 'inactive') {
-      // Deactivation must end existing sessions, not just block new logins.
-      await execute(
-        'UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = ? AND revoked_at IS NULL',
-        [req.params.id],
-      );
+      // Deactivation must end existing sessions, not just block new logins (§26).
+      await authService.revokeAllSessions(Number(req.params.id), 'account_disabled');
     }
 
     await audit.record(req, {

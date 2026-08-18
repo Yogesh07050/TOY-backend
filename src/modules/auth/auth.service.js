@@ -1,6 +1,6 @@
 'use strict';
 
-const { queryOne, execute, transaction } = require('../../db/pool');
+const { query, queryOne, execute, transaction } = require('../../db/pool');
 const ApiError = require('../../utils/ApiError');
 const env = require('../../config/env');
 const password = require('../../utils/password');
@@ -8,6 +8,7 @@ const tokens = require('../../utils/tokens');
 const mailer = require('../../utils/mailer');
 const access = require('../../services/accessControl');
 const analyticsEvents = require('../../services/analyticsEvents');
+const deviceInfo = require('../../utils/device');
 
 const VERIFY_TTL_MS = 24 * 60 * 60 * 1000;
 const RESET_TTL_MS = 60 * 60 * 1000;
@@ -54,30 +55,72 @@ function publicUser(user, context) {
   };
 }
 
-/** Issues an access + refresh pair and persists the refresh token's digest. */
-async function issueSession(user, req) {
+/**
+ * Issues an access + refresh pair and persists the refresh token's digest.
+ *
+ * `familyId` ties every rotation of one device's session together (§29): a
+ * login starts a new family, a refresh continues the existing one. That is
+ * what makes "log this iPhone out" and reuse detection possible without
+ * storing the tokens themselves.
+ */
+async function issueSession(user, req, { familyId = tokens.randomToken(16) } = {}) {
   const jti = tokens.randomToken(16);
   const accessToken = tokens.signAccessToken(user);
   const refreshToken = tokens.signRefreshToken(user, jti);
   const expiresAt = new Date(Date.now() + tokens.durationToMs(env.jwt.refreshExpiresIn));
+  const device = deviceInfo.describe(req);
 
   await execute(
-    `INSERT INTO refresh_tokens (user_id, token_hash, expires_at, user_agent, ip_address)
-     VALUES (?, ?, ?, ?, ?)`,
+    `INSERT INTO refresh_tokens
+       (user_id, token_hash, family_id, expires_at, device_type, device_name,
+        platform, user_agent, ip_address, last_used_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
     [
       user.id,
       tokens.hashToken(refreshToken),
+      familyId,
       expiresAt,
-      (req?.headers?.['user-agent'] || '').slice(0, 255) || null,
-      req?.ip || null,
+      device.deviceType,
+      device.deviceName,
+      device.platform,
+      device.userAgent,
+      device.ipAddress,
     ],
   );
 
   return {
     accessToken,
     refreshToken,
+    familyId,
     expiresIn: Math.floor(tokens.durationToMs(env.jwt.accessExpiresIn) / 1000),
+    refreshExpiresIn: Math.floor(tokens.durationToMs(env.jwt.refreshExpiresIn) / 1000),
   };
+}
+
+/** Revokes every live token in one session family. */
+async function revokeFamily(familyId, reason) {
+  if (!familyId) return 0;
+  const result = await execute(
+    'UPDATE refresh_tokens SET revoked_at = NOW(), revoked_reason = ? WHERE family_id = ? AND revoked_at IS NULL',
+    [reason, familyId],
+  );
+  return result.affectedRows;
+}
+
+/** Revokes every live session for a user, optionally sparing one family. */
+async function revokeAllSessions(userId, reason, { exceptFamilyId = null } = {}) {
+  const result = exceptFamilyId
+    ? await execute(
+        `UPDATE refresh_tokens SET revoked_at = NOW(), revoked_reason = ?
+          WHERE user_id = ? AND revoked_at IS NULL AND (family_id IS NULL OR family_id <> ?)`,
+        [reason, userId, exceptFamilyId],
+      )
+    : await execute(
+        `UPDATE refresh_tokens SET revoked_at = NOW(), revoked_reason = ?
+          WHERE user_id = ? AND revoked_at IS NULL`,
+        [reason, userId],
+      );
+  return result.affectedRows;
 }
 
 async function createAuthToken(userId, purpose, ttlMs) {
@@ -159,7 +202,15 @@ async function login({ email, password: plain }, req) {
   return { user: publicUser(user, context), ...session };
 }
 
-/** Rotates the refresh token: the presented one is revoked as the new one is issued. */
+/**
+ * Rotates the refresh token (§29): the presented one is revoked as the new one
+ * is issued, and both belong to the same session family.
+ *
+ * Presenting a token that was already rotated away means a copy leaked - the
+ * legitimate client would be holding the newest one. The whole family is
+ * revoked in that case, which logs that device out and forces a real login,
+ * rather than letting the thief and the owner take turns refreshing (§29).
+ */
 async function refresh(refreshToken, req) {
   if (!refreshToken) throw ApiError.unauthorized('Refresh token is required');
 
@@ -174,7 +225,19 @@ async function refresh(refreshToken, req) {
     'SELECT * FROM refresh_tokens WHERE token_hash = ? LIMIT 1',
     [tokens.hashToken(refreshToken)],
   );
-  if (!stored || stored.revoked_at || new Date(stored.expires_at) < new Date()) {
+  if (!stored) throw ApiError.unauthorized('Refresh token is no longer valid');
+
+  if (stored.revoked_at) {
+    // Reuse of a spent token. `rotated` is the only reason that implies the
+    // token was valid when it was retired, so it is the only one that points
+    // at a leak rather than an ordinary logout.
+    if (stored.revoked_reason === 'rotated') {
+      await revokeFamily(stored.family_id, 'reuse_detected');
+    }
+    throw ApiError.unauthorized('Refresh token is no longer valid');
+  }
+
+  if (new Date(stored.expires_at) < new Date()) {
     throw ApiError.unauthorized('Refresh token is no longer valid');
   }
 
@@ -182,25 +245,111 @@ async function refresh(refreshToken, req) {
   if (!user) throw ApiError.unauthorized('Account no longer exists');
   if (user.status !== 'active') throw ApiError.forbidden('This account has been deactivated');
 
-  await execute('UPDATE refresh_tokens SET revoked_at = NOW() WHERE id = ?', [stored.id]);
+  await execute(
+    "UPDATE refresh_tokens SET revoked_at = NOW(), revoked_reason = 'rotated' WHERE id = ?",
+    [stored.id],
+  );
 
   const context = await access.loadAccessContext(user.id);
-  const session = await issueSession(user, req);
+  const session = await issueSession(user, req, { familyId: stored.family_id });
   return { user: publicUser(user, context), ...session };
 }
 
+/**
+ * Ends the session the caller is holding (§25). The whole family goes, not
+ * just the presented token, so a logout cannot be undone with a refresh token
+ * the client had already rotated away but still has in memory.
+ *
+ * With no refresh token to identify the device - a client that only sent its
+ * access token - every session for the user is ended instead. Signing out of
+ * more than was asked is the safe direction to err in.
+ */
 async function logout(refreshToken, userId) {
   if (refreshToken) {
-    await execute(
-      'UPDATE refresh_tokens SET revoked_at = NOW() WHERE token_hash = ? AND revoked_at IS NULL',
-      [tokens.hashToken(refreshToken)],
-    );
-  } else if (userId) {
-    await execute(
-      'UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = ? AND revoked_at IS NULL',
-      [userId],
-    );
+    const stored = await queryOne('SELECT id, family_id FROM refresh_tokens WHERE token_hash = ? LIMIT 1', [
+      tokens.hashToken(refreshToken),
+    ]);
+    if (stored?.family_id) return void (await revokeFamily(stored.family_id, 'logout'));
+    if (stored) {
+      await execute(
+        "UPDATE refresh_tokens SET revoked_at = NOW(), revoked_reason = 'logout' WHERE id = ? AND revoked_at IS NULL",
+        [stored.id],
+      );
+      return;
+    }
   }
+  if (userId) await revokeAllSessions(userId, 'logout');
+}
+
+// ---------------------------------------------------------------------------
+// Active device sessions (§27, §28)
+
+/**
+ * One row per live session family, carrying the descriptors of its newest
+ * token. The aggregate picks the family's bounds, then joins back to the row
+ * holding `MAX(id)` for the device fields - reading them off the newest row
+ * directly, rather than concatenating and splitting, so a device name that
+ * itself contains a comma survives intact.
+ */
+const SESSION_SELECT = `
+  SELECT f.family_id, f.created_at, f.last_used_at, f.expires_at,
+         t.device_type, t.device_name, t.platform, t.ip_address
+    FROM (
+      SELECT family_id, MAX(id) AS newest_id, MIN(created_at) AS created_at,
+             MAX(last_used_at) AS last_used_at, MAX(expires_at) AS expires_at
+        FROM refresh_tokens
+       WHERE user_id = ? AND revoked_at IS NULL AND expires_at > NOW()
+       GROUP BY family_id
+    ) f
+    JOIN refresh_tokens t ON t.id = f.newest_id`;
+
+/**
+ * The user's live sessions, one row per device (§28).
+ * `currentFamilyId` marks the session making the request, which the UI needs
+ * so it can label it "this device" and not offer to revoke it by accident.
+ */
+async function listSessions(userId, currentFamilyId = null) {
+  const rows = await query(`${SESSION_SELECT} ORDER BY f.last_used_at DESC`, [userId]);
+  return rows.map((row) => ({
+    id: row.family_id,
+    deviceType: row.device_type || 'unknown',
+    deviceName: row.device_name || null,
+    platform: row.platform || null,
+    ipAddress: row.ip_address || null,
+    createdAt: row.created_at,
+    lastUsedAt: row.last_used_at,
+    expiresAt: row.expires_at,
+    current: Boolean(currentFamilyId) && row.family_id === currentFamilyId,
+  }));
+}
+
+/** Ends one device's session. Only the session's own owner may do this. */
+async function revokeSession(userId, familyId) {
+  const owned = await queryOne(
+    'SELECT 1 AS ok FROM refresh_tokens WHERE user_id = ? AND family_id = ? LIMIT 1',
+    [userId, familyId],
+  );
+  if (!owned) throw ApiError.notFound('Session not found');
+  const revoked = await revokeFamily(familyId, 'revoked');
+  return { revoked };
+}
+
+/** "Log out other devices" (§28) - everything except the caller's own session. */
+async function revokeOtherSessions(userId, currentFamilyId) {
+  const revoked = await revokeAllSessions(userId, 'logout_others', {
+    exceptFamilyId: currentFamilyId,
+  });
+  return { revoked };
+}
+
+/** The family a presented refresh token belongs to, or null. */
+async function familyForToken(refreshToken) {
+  if (!refreshToken) return null;
+  const row = await queryOne(
+    'SELECT family_id FROM refresh_tokens WHERE token_hash = ? LIMIT 1',
+    [tokens.hashToken(refreshToken)],
+  );
+  return row?.family_id ?? null;
 }
 
 async function forgotPassword(email) {
@@ -232,11 +381,8 @@ async function resetPassword({ token, password: plain }) {
   const passwordHash = await password.hash(plain);
 
   await execute('UPDATE users SET password_hash = ? WHERE id = ?', [passwordHash, row.user_id]);
-  // A password reset invalidates every existing session.
-  await execute(
-    'UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = ? AND revoked_at IS NULL',
-    [row.user_id],
-  );
+  // A password reset invalidates every existing session (§26).
+  await revokeAllSessions(row.user_id, 'password_changed');
 }
 
 async function verifyEmail(token) {
@@ -252,7 +398,7 @@ async function resendVerification(email) {
   return sendVerificationEmail(user);
 }
 
-async function changePassword(userId, { currentPassword, password: plain }) {
+async function changePassword(userId, { currentPassword, password: plain }, currentFamilyId = null) {
   const user = await queryOne('SELECT * FROM users WHERE id = ?', [userId]);
   if (!user) throw ApiError.notFound('User not found');
 
@@ -261,6 +407,11 @@ async function changePassword(userId, { currentPassword, password: plain }) {
 
   const passwordHash = await password.hash(plain);
   await execute('UPDATE users SET password_hash = ? WHERE id = ?', [passwordHash, userId]);
+
+  // §26: a password change is a security event, so every *other* device has to
+  // sign in again. The device that made the change keeps its session - it just
+  // proved it knows the old password.
+  await revokeAllSessions(userId, 'password_changed', { exceptFamilyId: currentFamilyId });
 }
 
 /** Current user + freshly resolved permissions, used by the SPA on boot. */
@@ -287,6 +438,11 @@ async function pruneExpiredTokens() {
 module.exports = {
   publicUser,
   register,
+  listSessions,
+  revokeSession,
+  revokeOtherSessions,
+  revokeAllSessions,
+  familyForToken,
   login,
   refresh,
   logout,

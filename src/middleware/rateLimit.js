@@ -20,6 +20,10 @@ const apiLimiter = rateLimit({
   ...base,
   windowMs: 15 * 60 * 1000,
   limit: 1000,
+  // The payment webhook is exempt: its caller is Razorpay, whose retries and
+  // catch-up bursts are not abuse, and dropping one means missing a payment.
+  // Its HMAC signature is what gates it (§8.1).
+  skip: (req) => base.skip() || req.path === '/payments/razorpay/webhook',
   message: message('Too many requests. Please slow down and try again shortly.'),
 });
 

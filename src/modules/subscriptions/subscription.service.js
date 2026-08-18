@@ -3,6 +3,7 @@
 const { query, queryOne, execute, rawQuery } = require('../../db/pool');
 const ApiError = require('../../utils/ApiError');
 const plans = require('../../config/plans');
+const env = require('../../config/env');
 
 /**
  * Merchant subscriptions (V3 §2, §38).
@@ -17,12 +18,25 @@ function currentPeriod(date = new Date()) {
   return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
 }
 
-/** One month from `from`, which is what "monthly" renewal means here. */
-function nextRenewal(from, cycle = 'monthly') {
-  const next = new Date(from);
-  if (cycle === 'yearly') next.setFullYear(next.getFullYear() + 1);
-  else next.setMonth(next.getMonth() + 1);
-  return next;
+/**
+ * Whether the row's *billing* state still entitles the shop to its paid plan.
+ *
+ * Three states keep the features on (§10, §13):
+ *   active               - paid and current
+ *   past_due, in grace   - a renewal failed but the grace window is open
+ *   cancelled, period    - cancelled, but the period already paid for runs on
+ *                          remaining
+ */
+function isEntitled(row) {
+  if (!row) return false;
+  const now = new Date();
+  if (row.status === 'active') return true;
+  if (row.status === 'past_due') return Boolean(row.grace_until) && new Date(row.grace_until) > now;
+  if (row.status === 'cancelled') {
+    const until = row.current_period_end ?? row.renews_at;
+    return Boolean(until) && new Date(until) > now;
+  }
+  return false;
 }
 
 function mapSubscription(row) {
@@ -44,6 +58,25 @@ function mapSubscription(row) {
     features: plan.features,
     profile: plan.profile,
     visibility: plan.visibility,
+    // ---- Gateway / billing state (§14) ----
+    gateway: row.gateway ?? null,
+    gatewaySubscriptionId: row.gateway_subscription_id ?? null,
+    gatewayCustomerId: row.gateway_customer_id ?? null,
+    currentPeriodStart: row.current_period_start ?? null,
+    currentPeriodEnd: row.current_period_end ?? null,
+    nextBillingDate: row.renews_at ?? null,
+    cancelAtPeriodEnd: Boolean(row.cancel_at_period_end),
+    /** Plan that takes effect when the current paid period ends (§12). */
+    pendingPlan: row.pending_plan ?? null,
+    /** Plan a checkout is in flight for; applied only once payment lands (§7). */
+    checkoutPlan: row.checkout_plan ?? null,
+    graceUntil: row.grace_until ?? null,
+    autopayEnabled: Boolean(row.autopay_enabled),
+    paymentMethod: row.payment_method ?? null,
+    lastPaymentAt: row.last_payment_at ?? null,
+    lastFailureReason: row.last_failure_reason ?? null,
+    /** True when the paid features are currently in force. */
+    entitled: isEntitled(row),
   };
 }
 
@@ -67,10 +100,16 @@ async function getForShop(shopId) {
 
 /** Plan key only - the hot path for feature checks, so it stays a single row read. */
 async function planKeyForShop(shopId) {
-  const row = await queryOne('SELECT plan, status FROM shop_subscriptions WHERE shop_id = ?', [shopId]);
+  const row = await queryOne(
+    `SELECT plan, status, grace_until, current_period_end, renews_at
+       FROM shop_subscriptions WHERE shop_id = ?`,
+    [shopId],
+  );
   if (!row) return 'FREE';
-  // A lapsed subscription falls back to Free rather than keeping paid features.
-  return row.status === 'active' ? row.plan : 'FREE';
+  // A lapsed subscription falls back to Free rather than keeping paid features;
+  // a failed payment inside its grace window, or a cancellation with paid time
+  // left on it, does not (§10, §13).
+  return isEntitled(row) ? row.plan : 'FREE';
 }
 
 /**
@@ -138,17 +177,41 @@ async function recordUsage(shopId, column, amount = 1) {
 }
 
 /**
- * Everything a client needs to render plan-aware UI in one call: the plan, its
- * feature list, the limits and how much of each has been used.
+ * Everything a client needs to render plan-aware UI in one call: the plan, the
+ * *effective* feature list and limits (plan + Super Admin overrides), and how
+ * much of each allowance has been used.
+ *
+ * `features` is the merged set the server enforces (§11K); `planFeatures` and
+ * `specialAccess` are reported alongside it so the merchant UI can explain why
+ * a feature is available and when a grant expires (§11G, §11N).
+ *
+ * The resolver is required lazily: it reads subscriptions, so requiring it at
+ * module load would close a cycle back into this file.
  */
 async function entitlements(shopId) {
-  const [subscription, usage] = await Promise.all([getForShop(shopId), usageForShop(shopId)]);
-  const limits = subscription.limits;
+  // eslint-disable-next-line global-require
+  const resolver = require('../../services/entitlements');
+  const overrides = require('../featureOverrides/featureOverride.service');
 
+  const [subscription, usage, resolved, specialAccess] = await Promise.all([
+    getForShop(shopId),
+    usageForShop(shopId),
+    resolver.resolve(shopId),
+    overrides.activeForShop(shopId),
+  ]);
+
+  const limits = resolved.limits;
   const remaining = (limit, used) => (limit === null ? null : Math.max(limit - used, 0));
 
   return {
     ...subscription,
+    // Effective, not plan-only: an override widens both of these.
+    features: resolved.features,
+    limits,
+    planFeatures: resolved.planFeatures,
+    overrideFeatures: resolved.overrideFeatures,
+    /** Active Super Admin grants, with their expiry, for the §11N panel. */
+    specialAccess,
     usage,
     remaining: {
       offersThisMonth: remaining(limits.offersPerMonth, usage.offersThisMonth),
@@ -161,9 +224,12 @@ async function entitlements(shopId) {
 }
 
 /**
- * Moves a shop onto a different plan (§31). Billing itself is delegated to the
- * payment provider; this records the intent, the amount and the history so the
- * provider integration only has to flip `payment_status`.
+ * Moves a shop onto a different plan (§31, §12).
+ *
+ * This records the *intent*. A paid plan lands in `created`/`pending` and
+ * unlocks nothing: only a verified gateway event may set it `active` (§7).
+ * `activate()` below is the sole path to that, and it is reachable only from
+ * the webhook handler.
  */
 async function changePlan(shopId, planKey, user, { billingCycle = 'monthly', note } = {}) {
   if (!plans.PLAN_KEYS.includes(planKey)) throw ApiError.badRequest('Unknown subscription plan');
@@ -172,7 +238,6 @@ async function changePlan(shopId, planKey, user, { billingCycle = 'monthly', not
   if (current.plan === planKey && current.status === 'active') return entitlements(shopId);
 
   const target = plans.planFor(planKey);
-  const now = new Date();
   const action =
     current.plan === planKey
       ? 'reactivated'
@@ -180,20 +245,25 @@ async function changePlan(shopId, planKey, user, { billingCycle = 'monthly', not
         ? 'upgraded'
         : 'downgraded';
 
+  const paid = target.price > 0;
+
+  const interval = billingCycle === 'yearly' ? 'INTERVAL 1 YEAR' : 'INTERVAL 1 MONTH';
+
   await execute(
     `UPDATE shop_subscriptions
-        SET plan = ?, status = 'active', billing_cycle = ?, price_amount = ?,
-            payment_status = ?, started_at = ?, renews_at = ?, cancelled_at = NULL
+        SET plan = ?, status = ?, billing_cycle = ?, price_amount = ?,
+            payment_status = ?, started_at = NOW(),
+            renews_at = ${paid ? `DATE_ADD(NOW(), ${interval})` : 'NULL'},
+            cancelled_at = NULL, pending_plan = NULL, checkout_plan = NULL,
+            cancel_at_period_end = 0, grace_until = NULL, last_failure_reason = NULL
       WHERE shop_id = ?`,
     [
       planKey,
+      // §7: a paid plan is not active until the gateway says it is paid.
+      paid ? 'created' : 'active',
       billingCycle,
       target.price,
-      // A paid plan starts as pending until the provider confirms; Free needs
-      // no payment at all.
-      target.price > 0 ? 'pending' : 'not_required',
-      now,
-      target.price > 0 ? nextRenewal(now, billingCycle) : null,
+      paid ? 'pending' : 'not_required',
       shopId,
     ],
   );
@@ -207,30 +277,237 @@ async function changePlan(shopId, planKey, user, { billingCycle = 'monthly', not
   return entitlements(shopId);
 }
 
+/**
+ * Schedules a downgrade for the end of the paid period (§12).
+ *
+ * The merchant keeps what they paid for until the period ends; a nightly job
+ * applies the pending plan once `current_period_end` passes. Dropping to Free
+ * immediately would take away time already bought.
+ */
+async function scheduleDowngrade(shopId, planKey, user, note) {
+  if (!plans.PLAN_KEYS.includes(planKey)) throw ApiError.badRequest('Unknown subscription plan');
+
+  const current = await getForShop(shopId);
+  if (plans.planFor(planKey).rank >= plans.planFor(current.plan).rank) {
+    throw ApiError.badRequest('That is not a downgrade. Use checkout to move to a higher plan.');
+  }
+
+  const periodEnd = current.currentPeriodEnd ?? current.renewsAt;
+  const hasPaidTimeLeft = current.entitled && periodEnd && new Date(periodEnd) > new Date();
+
+  if (!hasPaidTimeLeft) return changePlan(shopId, planKey, user, { note });
+
+  await execute(
+    `UPDATE shop_subscriptions SET cancel_at_period_end = 1, pending_plan = ? WHERE shop_id = ?`,
+    [planKey, shopId],
+  );
+  await execute(
+    `INSERT INTO subscription_events (shop_id, from_plan, to_plan, action, amount, actor_id, note)
+     VALUES (?, ?, ?, 'downgraded', 0, ?, ?)`,
+    [shopId, current.plan, planKey, user?.id ?? null, note ?? `Scheduled for ${periodEnd}`],
+  );
+
+  return entitlements(shopId);
+}
+
+/**
+ * Records that a purchase is in flight, without touching entitlements (§12).
+ *
+ * The target plan is parked in `checkout_plan`; `activate()` applies it when
+ * the gateway confirms payment (§7). Writing it straight to `plan` would drop
+ * the merchant onto an unpaid `created` row and revoke the plan they are
+ * currently paying for the moment they opened checkout.
+ *
+ * A shop with no live paid plan has nothing to lose, so it is additionally
+ * moved to `created`/`pending` - that is what lets the UI show the purchase as
+ * in flight. Either way no feature is unlocked before payment.
+ */
+async function recordCheckoutIntent(shopId, planKey, { billingCycle = 'monthly' } = {}) {
+  if (!plans.PLAN_KEYS.includes(planKey)) throw ApiError.badRequest('Unknown subscription plan');
+
+  const current = await getForShop(shopId);
+  const keepCurrent = current.entitled && current.price > 0;
+
+  await execute(
+    `UPDATE shop_subscriptions
+        SET checkout_plan = ?, billing_cycle = ?
+            ${keepCurrent ? '' : ", status = 'created', payment_status = 'pending'"}
+      WHERE shop_id = ?`,
+    [planKey, billingCycle, shopId],
+  );
+
+  return getForShop(shopId);
+}
+
+/** Records the gateway identifiers a checkout produced, before any money moves. */
+async function attachGateway(shopId, { gateway = 'razorpay', customerId, subscriptionId, planId }) {
+  await execute(
+    `UPDATE shop_subscriptions
+        SET gateway = ?, gateway_customer_id = COALESCE(?, gateway_customer_id),
+            gateway_subscription_id = COALESCE(?, gateway_subscription_id),
+            gateway_plan_id = COALESCE(?, gateway_plan_id)
+      WHERE shop_id = ?`,
+    [gateway, customerId ?? null, subscriptionId ?? null, planId ?? null, shopId],
+  );
+}
+
+/** The shop a gateway subscription belongs to, for webhook routing. */
+async function findByGatewaySubscriptionId(subscriptionId) {
+  const row = await queryOne('SELECT * FROM shop_subscriptions WHERE gateway_subscription_id = ?', [
+    subscriptionId,
+  ]);
+  return row ? mapSubscription(row) : null;
+}
+
+/**
+ * Activates (or renews) a subscription. **Only the verified webhook handler
+ * may call this** - it is the single write that turns paid features on (§7).
+ */
+async function activate(shopId, { periodStart, periodEnd, paymentMethod, autopay, amount } = {}) {
+  const subscription = await getForShop(shopId);
+  // The plan a checkout was started for is applied *here*, on confirmed
+  // payment, and nowhere else (§7). Without one in flight this is a renewal of
+  // the plan already held.
+  const targetPlan = subscription.checkoutPlan ?? subscription.plan;
+  const target = plans.planFor(targetPlan);
+  const isUpgrade = targetPlan !== subscription.plan;
+
+  // Razorpay tells us the period when it knows it. When it does not, the
+  // database stamps it: every "is this still current" check compares against
+  // NOW(), so the two dates have to come from the same clock.
+  const interval = subscription.billingCycle === 'yearly' ? 'INTERVAL 1 YEAR' : 'INTERVAL 1 MONTH';
+
+  await execute(
+    `UPDATE shop_subscriptions
+        SET plan = ?, price_amount = ?, checkout_plan = NULL,
+            status = 'active', payment_status = 'paid',
+            current_period_start = COALESCE(?, NOW()),
+            current_period_end = COALESCE(?, DATE_ADD(NOW(), ${interval})),
+            renews_at = COALESCE(?, DATE_ADD(NOW(), ${interval})),
+            grace_until = NULL, last_failure_reason = NULL, last_payment_at = NOW(),
+            cancelled_at = NULL, cancel_at_period_end = 0, pending_plan = NULL,
+            payment_method = COALESCE(?, payment_method),
+            autopay_enabled = COALESCE(?, autopay_enabled)
+      WHERE shop_id = ?`,
+    [
+      targetPlan,
+      target.price,
+      periodStart ?? null,
+      periodEnd ?? null,
+      periodEnd ?? null,
+      paymentMethod ?? null,
+      autopay === undefined ? null : autopay ? 1 : 0,
+      shopId,
+    ],
+  );
+
+  await execute(
+    `INSERT INTO subscription_events (shop_id, from_plan, to_plan, action, amount)
+     VALUES (?, ?, ?, ?, ?)`,
+    [
+      shopId,
+      subscription.plan,
+      targetPlan,
+      isUpgrade ? 'upgraded' : 'renewed',
+      amount ?? target.price,
+    ],
+  );
+
+  return getForShop(shopId);
+}
+
+/**
+ * A renewal failed (§10). The plan is not taken away: the shop goes PAST_DUE
+ * with a configurable grace window, and only stays there until the retry
+ * succeeds or the window closes.
+ */
+async function markPastDue(shopId, { reason = null, graceDays = env.billing.graceDays } = {}) {
+  const subscription = await getForShop(shopId);
+  const days = Number.isFinite(Number(graceDays)) ? Math.max(0, Math.trunc(graceDays)) : 5;
+
+  await execute(
+    `UPDATE shop_subscriptions
+        SET status = 'past_due', payment_status = 'failed',
+            grace_until = COALESCE(grace_until, DATE_ADD(NOW(), INTERVAL ${days} DAY)),
+            last_failure_reason = ?
+      WHERE shop_id = ?`,
+    [reason ? String(reason).slice(0, 255) : null, shopId],
+  );
+  await execute(
+    `INSERT INTO subscription_events (shop_id, from_plan, to_plan, action, amount, note)
+     VALUES (?, ?, ?, 'payment_failed', 0, ?)`,
+    [shopId, subscription.plan, subscription.plan, reason ? String(reason).slice(0, 255) : null],
+  );
+
+  return getForShop(shopId);
+}
+
+/** Razorpay paused or resumed the mandate. */
+async function setStatus(shopId, status) {
+  await execute('UPDATE shop_subscriptions SET status = ? WHERE shop_id = ?', [status, shopId]);
+  return getForShop(shopId);
+}
+
+/**
+ * Drops a shop to Free, keeping every row of its data (§10, §11).
+ * Called when a grace window closes or a cancelled period finally ends.
+ */
+async function downgradeToFree(shopId, note) {
+  const subscription = await getForShop(shopId);
+  const target = subscription.pendingPlan ?? 'FREE';
+  if (subscription.plan === target) return getForShop(shopId);
+
+  const plan = plans.planFor(target);
+  const paid = plan.price > 0;
+
+  // A paid target still has to be paid for: the old mandate is gone, so it
+  // lands in `created`/`pending` and unlocks nothing until a new checkout
+  // completes. Only Free is entitled the moment it is applied.
+  await execute(
+    `UPDATE shop_subscriptions
+        SET plan = ?, status = ?, price_amount = ?,
+            payment_status = ?, renews_at = NULL, grace_until = NULL,
+            cancel_at_period_end = 0, pending_plan = NULL, checkout_plan = NULL,
+            current_period_start = NULL, current_period_end = NULL,
+            gateway_subscription_id = NULL, autopay_enabled = 0
+      WHERE shop_id = ?`,
+    [target, paid ? 'created' : 'active', plan.price, paid ? 'pending' : 'not_required', shopId],
+  );
+  await execute(
+    `INSERT INTO subscription_events (shop_id, from_plan, to_plan, action, amount, note)
+     VALUES (?, ?, ?, 'downgraded', 0, ?)`,
+    [shopId, subscription.plan, target, note ?? null],
+  );
+
+  return getForShop(shopId);
+}
+
 /** Marks the current billing period as paid - the hook a provider webhook calls. */
 async function markPaid(shopId, { provider = null, providerRef = null } = {}) {
   const subscription = await getForShop(shopId);
   await execute(
-    `UPDATE shop_subscriptions
-        SET payment_status = 'paid', status = 'active', renews_at = ?, provider = ?, provider_ref = ?
-      WHERE shop_id = ?`,
-    [nextRenewal(new Date(), subscription.billingCycle), provider, providerRef, shopId],
+    `UPDATE shop_subscriptions SET provider = ?, provider_ref = ? WHERE shop_id = ?`,
+    [provider, providerRef, shopId],
   );
-  await execute(
-    `INSERT INTO subscription_events (shop_id, from_plan, to_plan, action, amount)
-     VALUES (?, ?, ?, 'renewed', ?)`,
-    [shopId, subscription.plan, subscription.plan, subscription.price],
-  );
-  return getForShop(shopId);
+  return activate(shopId, { amount: subscription.price, paymentMethod: provider });
 }
 
-/** Cancels at the end of the paid period; entitlements drop to Free on expiry. */
+/**
+ * Cancels at the end of the paid period (§13). Future billing stops; the
+ * merchant keeps their benefits until the period they paid for runs out, and
+ * no historical payment record is touched.
+ */
 async function cancel(shopId, user, note) {
   const subscription = await getForShop(shopId);
   if (subscription.plan === 'FREE') throw ApiError.badRequest('The Free plan cannot be cancelled');
 
+  const periodEnd = subscription.currentPeriodEnd ?? subscription.renewsAt;
+
   await execute(
-    `UPDATE shop_subscriptions SET status = 'cancelled', cancelled_at = NOW() WHERE shop_id = ?`,
+    `UPDATE shop_subscriptions
+        SET status = 'cancelled', cancelled_at = NOW(), cancel_at_period_end = 1,
+            autopay_enabled = 0, checkout_plan = NULL
+      WHERE shop_id = ?`,
     [shopId],
   );
   await execute(
@@ -238,7 +515,33 @@ async function cancel(shopId, user, note) {
      VALUES (?, ?, 'FREE', 'cancelled', 0, ?, ?)`,
     [shopId, subscription.plan, user?.id ?? null, note ?? null],
   );
-  return entitlements(shopId);
+
+  return { ...(await entitlements(shopId)), activeUntil: periodEnd };
+}
+
+/**
+ * Nightly sweep (§10, §11, §12): closes grace windows and applies downgrades
+ * whose paid period has ended. Idempotent - a shop already on its target plan
+ * is skipped.
+ */
+async function sweepLapsed() {
+  const lapsed = await query(
+    `SELECT shop_id, plan, status FROM shop_subscriptions
+      WHERE plan <> 'FREE'
+        AND ((status = 'past_due' AND grace_until IS NOT NULL AND grace_until <= NOW())
+          OR (status = 'cancelled' AND COALESCE(current_period_end, renews_at) IS NOT NULL
+              AND COALESCE(current_period_end, renews_at) <= NOW())
+          OR (cancel_at_period_end = 1 AND COALESCE(current_period_end, renews_at) IS NOT NULL
+              AND COALESCE(current_period_end, renews_at) <= NOW()))`,
+  );
+
+  for (const row of lapsed) {
+    await downgradeToFree(
+      Number(row.shop_id),
+      row.status === 'past_due' ? 'Grace period ended without payment' : 'Billing period ended',
+    );
+  }
+  return lapsed.length;
 }
 
 async function history(shopId, limit = 50) {
@@ -289,13 +592,12 @@ async function invoices(shopId, limit = 24) {
 async function planKeysForShops(shopIds) {
   if (!shopIds.length) return new Map();
   const rows = await query(
-    `SELECT shop_id, plan, status FROM shop_subscriptions
+    `SELECT shop_id, plan, status, grace_until, current_period_end, renews_at
+       FROM shop_subscriptions
       WHERE shop_id IN (${shopIds.map(() => '?').join(',')})`,
     shopIds,
   );
-  return new Map(
-    rows.map((row) => [Number(row.shop_id), row.status === 'active' ? row.plan : 'FREE']),
-  );
+  return new Map(rows.map((row) => [Number(row.shop_id), isEntitled(row) ? row.plan : 'FREE']));
 }
 
 module.exports = {
@@ -306,7 +608,17 @@ module.exports = {
   usageForShop,
   recordUsage,
   entitlements,
+  isEntitled,
   changePlan,
+  scheduleDowngrade,
+  recordCheckoutIntent,
+  attachGateway,
+  findByGatewaySubscriptionId,
+  activate,
+  markPastDue,
+  setStatus,
+  downgradeToFree,
+  sweepLapsed,
   markPaid,
   cancel,
   history,

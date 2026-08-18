@@ -18,9 +18,11 @@ const int = (value, fallback) => {
 const list = (value, fallback = []) =>
   value ? String(value).split(',').map((v) => v.trim()).filter(Boolean) : fallback;
 
+const isProduction = (process.env.NODE_ENV || 'development') === 'production';
+
 const env = {
   nodeEnv: process.env.NODE_ENV || 'development',
-  isProduction: (process.env.NODE_ENV || 'development') === 'production',
+  isProduction,
   port: int(process.env.PORT, 3000),
   apiPrefix: process.env.API_PREFIX || '/api',
   corsOrigins: list(process.env.CORS_ORIGINS, ['http://localhost:4200']),
@@ -44,6 +46,19 @@ const env = {
   },
   bcryptRounds: int(process.env.BCRYPT_ROUNDS, 12),
 
+  /**
+   * The httpOnly refresh cookie the web app uses (§22).
+   *
+   * SameSite depends on where the API sits relative to the SPA: same site can
+   * use 'lax', a separate API domain needs 'none' - which browsers only accept
+   * on a Secure cookie, so the two default together.
+   */
+  refreshCookie: {
+    sameSite: (process.env.REFRESH_COOKIE_SAMESITE || (isProduction ? 'none' : 'lax')).toLowerCase(),
+    secure: bool(process.env.REFRESH_COOKIE_SECURE, isProduction),
+    domain: process.env.REFRESH_COOKIE_DOMAIN || '',
+  },
+
   mail: {
     host: process.env.SMTP_HOST || '',
     port: int(process.env.SMTP_PORT, 587),
@@ -64,6 +79,35 @@ const env = {
     defaultRadiusKm: int(process.env.DISCOVERY_DEFAULT_RADIUS_KM, 10),
     endingSoonHours: int(process.env.DISCOVERY_ENDING_SOON_HOURS, 72),
     urgentHours: int(process.env.DISCOVERY_URGENT_HOURS, 6),
+  },
+
+  /**
+   * Razorpay (V3 payments §2). Left empty in development: the checkout and
+   * webhook endpoints then answer with a clear "payments are not configured"
+   * rather than failing deep inside an HTTP call to the gateway.
+   *
+   * `planIds` map this app's plan keys onto Razorpay Plan ids, which is what a
+   * recurring subscription (and therefore UPI AutoPay) is created against.
+   */
+  razorpay: {
+    keyId: process.env.RAZORPAY_KEY_ID || '',
+    keySecret: process.env.RAZORPAY_KEY_SECRET || '',
+    webhookSecret: process.env.RAZORPAY_WEBHOOK_SECRET || '',
+    apiBase: process.env.RAZORPAY_API_BASE || 'https://api.razorpay.com/v1',
+    planIds: {
+      BUSINESS: process.env.RAZORPAY_PLAN_BUSINESS || '',
+      PREMIUM: process.env.RAZORPAY_PLAN_PREMIUM || '',
+    },
+    /** Billing cycles a mandate is authorised for before it must be renewed. */
+    totalCount: int(process.env.RAZORPAY_TOTAL_COUNT, 120),
+  },
+
+  billing: {
+    /** Days a failed renewal keeps its features before downgrade (§10). */
+    graceDays: int(process.env.BILLING_GRACE_DAYS, 5),
+    /** Percentage added to the plan price on invoices (§16). */
+    taxPercent: Number(process.env.BILLING_TAX_PERCENT ?? 18),
+    invoicePrefix: process.env.BILLING_INVOICE_PREFIX || 'INV',
   },
 
   seed: {

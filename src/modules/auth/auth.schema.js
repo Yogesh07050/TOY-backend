@@ -66,6 +66,9 @@ const verifyEmailSchema = z.object({ token: z.string().min(10, 'Verification tok
 
 const resendVerificationSchema = z.object({ email });
 
+/** A session id is its refresh-token family id: 32 hex characters. */
+const sessionIdParam = z.object({ id: z.string().regex(/^[a-f0-9-]{16,64}$/i, 'Invalid session id') });
+
 const changePasswordSchema = z
   .object({
     currentPassword: z.string().min(1, 'Current password is required'),
@@ -86,4 +89,5 @@ module.exports = {
   verifyEmailSchema,
   resendVerificationSchema,
   changePasswordSchema,
+  sessionIdParam,
 };
