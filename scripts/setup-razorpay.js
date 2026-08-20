@@ -40,7 +40,7 @@ async function createPlan(key) {
     period: 'monthly',
     interval: 1,
     item: {
-      name: `Offers App - ${plan.name}`,
+      name: `OffersOffer - ${plan.name}`,
       description: plan.description,
       // Razorpay works in paise; the app's rupee price is the single source.
       amount: razorpay.toPaise(plan.price),

@@ -1,5 +1,5 @@
 -- =====================================================================
---  Offers App - MySQL schema
+--  OffersOffer - MySQL schema
 --  Requirements reference: section 30 (Database Structure)
 --  Engine: InnoDB / utf8mb4. Target: MySQL 8.0+
 -- =====================================================================

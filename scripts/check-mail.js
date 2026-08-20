@@ -78,7 +78,7 @@ async function main() {
   if (!fromAddress.includes('@')) {
     console.log('\nFAIL: MAIL_FROM has no email address in it.');
     console.log('  A display name alone is not a valid sender. Use:');
-    console.log('    MAIL_FROM="Offers App <%s>"', env.mail.user || 'you@gmail.com');
+    console.log('    MAIL_FROM="OffersOffer <%s>"', env.mail.user || 'you@gmail.com');
     process.exitCode = 1;
     return;
   }
@@ -125,9 +125,9 @@ async function main() {
     const info = await transporter.sendMail({
       from: env.mail.from,
       to: recipient,
-      subject: 'Offers App - SMTP test',
-      text: 'If you are reading this, the Offers App backend can send email.',
-      html: '<p>If you are reading this, the Offers App backend can send email.</p>',
+      subject: 'OffersOffer - SMTP test',
+      text: 'If you are reading this, the OffersOffer backend can send email.',
+      html: '<p>If you are reading this, the OffersOffer backend can send email.</p>',
     });
     console.log('Sent to %s (id %s)', recipient, info.messageId);
   } catch (error) {

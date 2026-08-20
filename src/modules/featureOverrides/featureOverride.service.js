@@ -313,7 +313,7 @@ async function notifyShop(shopId, featureKey, override, action) {
       type: 'FEATURE_ACCESS',
       title: 'Special access granted',
       message: override.isPermanent
-        ? `${label} has been enabled for your shop by the Offers App team.`
+        ? `${label} has been enabled for your shop by the OffersOffer team.`
         : `${label} has been enabled for your shop until ${new Date(
             override.expiresAt,
           ).toDateString()}.`,

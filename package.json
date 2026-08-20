@@ -2,7 +2,7 @@
   "name": "toy-backend",
   "version": "1.0.0",
   "private": true,
-  "description": "Offers App backend - Node.js / Express / MySQL",
+  "description": "OffersOffer backend - Node.js / Express / MySQL",
   "main": "src/server.js",
   "engines": {
     "node": ">=20.11.0"

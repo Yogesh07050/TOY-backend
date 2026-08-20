@@ -15,7 +15,7 @@ async function main() {
   if (!connected) process.exit(1);
 
   const server = app.listen(env.port, () => {
-    console.log('Offers App API listening on http://localhost:%d%s', env.port, env.apiPrefix);
+    console.log('OffersOffer API listening on http://localhost:%d%s', env.port, env.apiPrefix);
     console.log('Environment: %s | Database: %s', env.nodeEnv, env.db.database);
   });
 

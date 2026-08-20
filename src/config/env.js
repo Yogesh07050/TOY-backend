@@ -65,7 +65,7 @@ const env = {
     secure: bool(process.env.SMTP_SECURE, false),
     user: process.env.SMTP_USER || '',
     password: process.env.SMTP_PASSWORD || '',
-    from: process.env.MAIL_FROM || 'Offers App <no-reply@offers.app>',
+    from: process.env.MAIL_FROM || 'OffersOffer <no-reply@offers.app>',
   },
 
   storage: {

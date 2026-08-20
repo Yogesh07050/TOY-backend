@@ -1,6 +1,6 @@
-# Offers App — Backend
+# OffersOffer — Backend
 
-Node.js / Express / MySQL API for the Offers App: shops publish discounts, customers
+Node.js / Express / MySQL API for the OffersOffer: shops publish discounts, customers
 discover them by search, category, shop and location.
 
 Implements the requirements document in full — RBAC, shop & branch management,

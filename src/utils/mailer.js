@@ -82,7 +82,14 @@ async function send({ to, subject, text, html }) {
   }
 
   try {
-    await getTransporter().sendMail({ from: env.mail.from, to, subject, text, html });
+    await getTransporter().sendMail({
+      from: env.mail.from,
+      to,
+      subject,
+      text,
+      html,
+      attachments: logoAttachment(),
+    });
     return { delivered: true, transport: 'smtp' };
   } catch (error) {
     console.error('[mail] failed to send "%s" to %s: %s', subject, to, error.message);
@@ -120,36 +127,177 @@ async function verifyTransport() {
   }
 }
 
-const layout = (title, body) => `
-<div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:560px;margin:0 auto;padding:24px;color:#1f2937">
-  <h2 style="color:#b45309;margin:0 0 16px">${title}</h2>
-  ${body}
-  <p style="margin-top:32px;font-size:12px;color:#6b7280">Offers App &middot; This is an automated message.</p>
-</div>`;
+// ---------------------------------------------------------------------------
+// Templates
+//
+// Email HTML is not web HTML: Gmail and Outlook strip <style> blocks, ignore
+// flexbox and grid, and Outlook renders through Word. So everything below is
+// table-based with inline styles, which is the only combination that survives
+// every major client.
+//
+// The logo travels as a CID attachment rather than a hosted <img src>. A URL
+// would need the API to be publicly reachable, and most clients block remote
+// images by default - the mark would be a broken box on first open.
 
-const button = (url, label) =>
-  `<a href="${url}" style="background:#f59e0b;color:#3b2600;font-weight:600;padding:10px 18px;border-radius:8px;text-decoration:none">${label}</a>`;
+const BRAND = {
+  name: 'OffersOffer',
+  ink: '#1B1B1E',
+  gold: '#F5A623',
+  goldDark: '#D97706',
+  cream: '#FDF6E3',
+  paper: '#FFFFFF',
+  body: '#3F3F46',
+  muted: '#71717A',
+  line: '#EFE6CC',
+};
+
+const LOGO_CID = 'offersoffer-logo';
+const LOGO_PATH = path.resolve(__dirname, '../../assets/logo-email.png');
+
+/** Attached to every message so <img src="cid:..."> resolves. */
+const logoAttachment = () =>
+  fs.existsSync(LOGO_PATH)
+    ? [{ filename: 'offersoffer.png', path: LOGO_PATH, cid: LOGO_CID }]
+    : [];
+
+/** Escapes text interpolated into the HTML - names and titles are user data. */
+const esc = (value) =>
+  String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+
+/**
+ * The masthead: the mark, then the wordmark as live text.
+ *
+ * The wordmark is text rather than part of the image so it stays sharp at any
+ * zoom and still reads when images are blocked - the brand name survives even
+ * when the mark does not.
+ */
+const masthead = () => `
+  <tr>
+    <td align="center" style="padding:36px 24px 8px">
+      <img src="cid:${LOGO_CID}" width="132" height="87" alt="${BRAND.name}"
+           style="display:block;border:0;outline:none;text-decoration:none;width:132px;height:auto"/>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" style="padding:0 24px 28px">
+      <span style="font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:26px;font-weight:700;letter-spacing:-0.4px;color:${BRAND.ink}">Offers</span><span style="font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:26px;font-weight:700;letter-spacing:-0.4px;color:${BRAND.gold}">Offer</span>
+    </td>
+  </tr>`;
+
+/**
+ * @param {string} title    headline inside the card
+ * @param {string} body     inner HTML
+ * @param {string} [preview] the snippet inboxes show beside the subject
+ */
+const layout = (title, body, preview = '') => `<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta name="color-scheme" content="light"/>
+<title>${esc(title)}</title>
+</head>
+<body style="margin:0;padding:0;background:${BRAND.cream};-webkit-text-size-adjust:100%">
+<!-- Inbox preview text, hidden in the message body itself. -->
+<div style="display:none;font-size:1px;color:${BRAND.cream};line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden">${esc(preview)}</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.cream}">
+  <tr>
+    <td align="center" style="padding:0 12px 40px">
+      <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:600px">
+        ${masthead()}
+        <tr>
+          <td style="background:${BRAND.paper};border:1px solid ${BRAND.line};border-radius:14px;padding:0">
+            <!-- Gold rule across the top of the card. -->
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+              <tr><td style="height:4px;background:${BRAND.gold};border-radius:14px 14px 0 0;font-size:0;line-height:0">&nbsp;</td></tr>
+              <tr>
+                <td style="padding:32px 36px 36px;font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:15px;line-height:1.6;color:${BRAND.body}">
+                  <h1 style="margin:0 0 18px;font-size:21px;line-height:1.3;font-weight:700;color:${BRAND.ink}">${esc(title)}</h1>
+                  ${body}
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+        <tr>
+          <td align="center" style="padding:24px 24px 0;font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:12px;line-height:1.7;color:${BRAND.muted}">
+            You are receiving this because you have an ${BRAND.name} account.<br/>
+            This is an automated message &mdash; please do not reply.
+            <div style="margin-top:10px;color:#A1A1AA">&copy; ${new Date().getFullYear()} ${BRAND.name}</div>
+          </td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+</table>
+</body>
+</html>`;
+
+/**
+ * A bulletproof button: Outlook ignores padding on <a>, so the shape comes from
+ * a table cell and the anchor only carries the colour and the click target.
+ */
+const button = (url, label) => `
+  <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:26px 0">
+    <tr>
+      <td align="center" bgcolor="${BRAND.gold}" style="border-radius:10px">
+        <a href="${url}" target="_blank"
+           style="display:inline-block;padding:14px 30px;font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:15px;font-weight:700;color:#3B2600;text-decoration:none;border-radius:10px">${esc(label)}</a>
+      </td>
+    </tr>
+  </table>`;
+
+/** The same destination as plain text, for when the button cannot be clicked. */
+const fallbackLink = (url) => `
+  <p style="margin:0;font-size:12px;line-height:1.6;color:${BRAND.muted}">
+    If the button does not work, copy this link into your browser:<br/>
+    <a href="${url}" style="color:${BRAND.goldDark};word-break:break-all">${url}</a>
+  </p>`;
+
+/** Highlighted panel for the thing the email is actually about. */
+const highlight = (heading, sub) => `
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:20px 0">
+    <tr>
+      <td style="background:${BRAND.cream};border-left:4px solid ${BRAND.gold};border-radius:0 10px 10px 0;padding:16px 20px">
+        <div style="font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:17px;font-weight:700;color:${BRAND.ink}">${esc(heading)}</div>
+        ${sub ? `<div style="margin-top:4px;font-size:13px;color:${BRAND.muted}">${esc(sub)}</div>` : ''}
+      </td>
+    </tr>
+  </table>`;
+
+const note = (text) =>
+  `<p style="margin:0 0 18px;font-size:13px;color:${BRAND.muted}">${esc(text)}</p>`;
 
 const templates = {
   verifyEmail: (name, url) => ({
-    subject: 'Verify your email address',
-    text: `Hi ${name},\n\nConfirm your email address: ${url}\n\nThe link expires in 24 hours.`,
+    subject: `Confirm your email &middot; ${BRAND.name}`.replace('&middot;', '·'),
+    text: `Hi ${name},\n\nWelcome to ${BRAND.name}. Confirm your email address to activate your account:\n${url}\n\nThe link expires in 24 hours.`,
     html: layout(
-      'Confirm your email',
-      `<p>Hi ${name},</p><p>Please confirm your email address to activate your Offers App account.</p>
-       <p>${button(url, 'Verify email')}</p>
-       <p style="font-size:13px;color:#6b7280">The link expires in 24 hours.</p>`,
+      'Confirm your email address',
+      `<p style="margin:0 0 14px">Hi ${esc(name)},</p>
+       <p style="margin:0 0 4px">Welcome to ${BRAND.name}. Confirm your email address and your account is ready to use.</p>
+       ${button(url, 'Verify my email')}
+       ${note('This link expires in 24 hours. If you did not create an account, you can ignore this email.')}
+       ${fallbackLink(url)}`,
+      `Confirm your email to activate your ${BRAND.name} account.`,
     ),
   }),
 
   resetPassword: (name, url) => ({
-    subject: 'Reset your password',
-    text: `Hi ${name},\n\nReset your password: ${url}\n\nThe link expires in 1 hour. Ignore this email if you did not request it.`,
+    subject: `Reset your password · ${BRAND.name}`,
+    text: `Hi ${name},\n\nReset your ${BRAND.name} password:\n${url}\n\nThe link expires in 1 hour. Ignore this email if you did not request it.`,
     html: layout(
       'Reset your password',
-      `<p>Hi ${name},</p><p>We received a request to reset your password.</p>
-       <p>${button(url, 'Choose a new password')}</p>
-       <p style="font-size:13px;color:#6b7280">The link expires in 1 hour. If you did not request this, no action is needed.</p>`,
+      `<p style="margin:0 0 14px">Hi ${esc(name)},</p>
+       <p style="margin:0 0 4px">We received a request to reset the password on your ${BRAND.name} account.</p>
+       ${button(url, 'Choose a new password')}
+       ${note('This link expires in 1 hour. If you did not request a reset, no action is needed — your password stays as it is.')}
+       ${fallbackLink(url)}`,
+      'Reset your password. The link expires in 1 hour.',
     ),
   }),
 
@@ -157,10 +305,13 @@ const templates = {
     subject: `${offer.shop_name}: ${offer.title}`,
     text: `Hi ${name},\n\n${reason}\n\n${offer.title}\n${offer.offer_text || ''}\n\nView it here: ${url}`,
     html: layout(
-      offer.title,
-      `<p>Hi ${name},</p><p>${reason}</p>
-       <p style="font-size:18px;font-weight:600">${offer.offer_text || offer.title}</p>
-       <p>${button(url, 'View offer')}</p>`,
+      'A new offer for you',
+      `<p style="margin:0 0 14px">Hi ${esc(name)},</p>
+       <p style="margin:0">${esc(reason)}</p>
+       ${highlight(offer.offer_text || offer.title, offer.shop_name)}
+       ${button(url, 'View this offer')}
+       ${fallbackLink(url)}`,
+      `${offer.shop_name}: ${offer.title}`,
     ),
   }),
 
@@ -169,8 +320,12 @@ const templates = {
     text: `Hi ${name},\n\nA saved offer is about to expire: ${offer.title}\n\n${url}`,
     html: layout(
       'A saved offer is ending soon',
-      `<p>Hi ${name},</p><p><strong>${offer.title}</strong> from ${offer.shop_name} expires soon.</p>
-       <p>${button(url, 'View offer')}</p>`,
+      `<p style="margin:0 0 14px">Hi ${esc(name)},</p>
+       <p style="margin:0">One of your saved offers expires shortly — here it is before it goes.</p>
+       ${highlight(offer.title, offer.shop_name)}
+       ${button(url, 'View this offer')}
+       ${fallbackLink(url)}`,
+      `${offer.title} at ${offer.shop_name} expires soon.`,
     ),
   }),
 
@@ -178,11 +333,15 @@ const templates = {
     subject: `Ending soon: ${offer.title}`,
     text: `Hi ${name},\n\nA saved service deal is about to expire: ${offer.title}\n\n${url}`,
     html: layout(
-      "Don't miss this service deal",
-      `<p>Hi ${name},</p><p><strong>${offer.title}</strong> at ${offer.shop_name} expires soon.</p>
-       <p>${button(url, 'View service')}</p>`,
+      'A saved service deal is ending soon',
+      `<p style="margin:0 0 14px">Hi ${esc(name)},</p>
+       <p style="margin:0">One of your saved service deals expires shortly.</p>
+       ${highlight(offer.title, offer.shop_name)}
+       ${button(url, 'View this service')}
+       ${fallbackLink(url)}`,
+      `${offer.title} at ${offer.shop_name} expires soon.`,
     ),
   }),
 };
 
-module.exports = { send, templates, verifyTransport, isConfigured, OUTBOX_DIR };
+module.exports = { send, templates, verifyTransport, isConfigured, OUTBOX_DIR, BRAND };

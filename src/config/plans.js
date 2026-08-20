@@ -88,7 +88,7 @@ const PLANS = {
   FREE: {
     key: 'FREE',
     name: 'Free',
-    tagline: 'Try Offers App',
+    tagline: 'Try OffersOffer',
     price: 0,
     currency: 'INR',
     rank: 0,
