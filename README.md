@@ -391,6 +391,58 @@ See `.env.example`. Notable values:
 | `BILLING_TAX_PERCENT` | Tax already included in the plan price; invoices back-compute the split |
 | `REFRESH_COOKIE_SAMESITE` | `lax` when API and SPA share a site, `none` (+ Secure) when they do not |
 
+## Email and payment setup
+
+Two helpers verify the parts that depend on outside accounts, so a
+misconfiguration surfaces here rather than as a failed signup or checkout.
+
+### Email (Gmail)
+
+```bash
+npm run check:mail                  # verify connection + credentials
+npm run check:mail -- you@gmail.com # ...and send a real test message
+```
+
+`SMTP_PASSWORD` must be a 16-character **App Password**, not the account
+password — Gmail refuses the latter with `534-5.7.9 Application-specific
+password required`. App passwords only appear once 2-Step Verification is on
+for the account (Google Account → Security → 2-Step Verification → App
+passwords).
+
+`SMTP_USER` must be the same mailbox as the address in `MAIL_FROM`. Gmail
+silently rewrites the sender when they differ, so mail appears to come from the
+wrong account; the checker warns about this before you hit it in production.
+
+### Razorpay
+
+```bash
+npm run setup:razorpay              # verify keys, compare plans against .env
+npm run setup:razorpay -- --create  # create any missing Plan
+```
+
+`--create` provisions one Razorpay Plan per paid tier, priced from
+`config/plans.js` so the gateway and the app cannot disagree about what a plan
+costs. Plans are matched on `notes.plan_key`, so re-running reuses them rather
+than duplicating. It prints the `RAZORPAY_PLAN_*` values to paste into `.env`.
+
+Razorpay cannot delete a Plan once created, only deactivate it, so the script
+confirms before writing to a live account.
+
+**Webhooks need a public URL.** Razorpay cannot reach `localhost`, and until the
+webhook arrives no subscription activates (§7) — a local checkout will complete
+at the gateway and the plan will stay pending. For local testing, expose the
+backend and point the webhook at the tunnel:
+
+```bash
+npx localtunnel --port 3000
+```
+
+Then set the webhook URL to `https://<tunnel-host>/api/payments/razorpay/webhook`,
+put the same secret in `RAZORPAY_WEBHOOK_SECRET`, and subscribe the events listed
+in `.env.example`. Delivery attempts and their responses are visible under
+Dashboard → Settings → Webhooks, and every received event is stored in the
+`payment_webhooks` table whether or not it processed cleanly.
+
 ## Background jobs
 
 | Job | Schedule | Does |
