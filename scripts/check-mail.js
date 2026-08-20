@@ -59,10 +59,30 @@ async function main() {
   console.log('Username   : %s', env.mail.user || '(none)');
   console.log('From       : %s', env.mail.from);
 
+  // SMTP_HOST is a server name. An email address here still counts as
+  // "configured", so the app stops falling back to the outbox and instead
+  // fails every send with ENOTFOUND - worth catching before that happens.
+  if (env.mail.host.includes('@')) {
+    console.log('\nFAIL: SMTP_HOST is an email address, not a mail server.');
+    console.log('  Gmail:    SMTP_HOST=smtp.gmail.com');
+    console.log('  Mailtrap: SMTP_HOST=sandbox.smtp.mailtrap.io');
+    process.exitCode = 1;
+    return;
+  }
+
   // The From address has to be the authenticated mailbox, or a "Send mail as"
   // alias verified on it. Mismatches are a common silent surprise: Gmail
   // quietly rewrites the sender rather than refusing.
   const fromAddress = /<([^>]+)>/.exec(env.mail.from)?.[1] ?? env.mail.from;
+
+  if (!fromAddress.includes('@')) {
+    console.log('\nFAIL: MAIL_FROM has no email address in it.');
+    console.log('  A display name alone is not a valid sender. Use:');
+    console.log('    MAIL_FROM="Offers App <%s>"', env.mail.user || 'you@gmail.com');
+    process.exitCode = 1;
+    return;
+  }
+
   if (env.mail.user && fromAddress.toLowerCase() !== env.mail.user.toLowerCase()) {
     console.log(
       '\n! MAIL_FROM (%s) is not SMTP_USER (%s).\n  Gmail will rewrite the sender unless it is a verified alias.',
