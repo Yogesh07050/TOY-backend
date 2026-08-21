@@ -8,8 +8,10 @@ service, loaded outermost first so the closest file wins:
 Walking up rather than hardcoding a depth means the service keeps working
 wherever it is nested. Two things fall out of it for free:
 
-  * ``GEMINI_API_KEY`` is read from the repository-root ``.env``, where the
-    project already keeps it, so the key is configured in exactly one place.
+  * ``GEMINI_API_KEY`` is read from this service's own ``.env``. Provider keys
+    live here and nowhere else, because this is the only process that calls a
+    provider. An enclosing ``.env`` may still supply it, but nothing outside
+    this directory is expected to hold it.
   * ``AI_SERVICE_TOKEN`` set in ``TOY-backend/.env`` is picked up here too, so
     the shared secret cannot drift between the API and this service.
 """
