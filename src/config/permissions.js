@@ -38,6 +38,16 @@ const PERMISSIONS = {
 
   VIEW_ANALYTICS: { category: 'Insights', description: 'View analytics dashboards' },
   VIEW_AUDIT_LOGS: { category: 'Insights', description: 'View audit logs' },
+
+  // AI (TOY.md). Holding the permission only makes the feature *reachable* -
+  // whether it actually runs is decided by the shop's subscription plan, which
+  // is checked separately on every call.
+  USE_AI_ASSISTANT: { category: 'AI', description: 'Use the AI Offer Assistant' },
+  USE_AI_CONTENT: { category: 'AI', description: 'Use the AI content generator' },
+  MANAGE_SUBSCRIPTIONS: {
+    category: 'AI',
+    description: 'Manage subscription plans and AI usage limits',
+  },
 };
 
 const PERMISSION_NAMES = Object.keys(PERMISSIONS);
@@ -74,6 +84,10 @@ const SYSTEM_ROLES = {
       'MANAGE_LOCATIONS',
       'VIEW_ANALYTICS',
       'REDEEM_CLAIM',
+      // The subscription plan is the real gate on these two, so granting them
+      // to every Admin costs nothing and keeps the upgrade prompt reachable.
+      'USE_AI_ASSISTANT',
+      'USE_AI_CONTENT',
       // Deliberately no *_BANNER permissions here: §6 requires a Super Admin to
       // grant those explicitly, per Admin.
     ],
@@ -112,6 +126,9 @@ const MANAGEMENT_PERMISSIONS = [
   'MANAGE_PERMISSIONS',
   'MODERATE_REVIEWS',
   'VIEW_AUDIT_LOGS',
+  'USE_AI_ASSISTANT',
+  'USE_AI_CONTENT',
+  'MANAGE_SUBSCRIPTIONS',
 ];
 
 const SUPER_ADMIN_ROLE = 'SUPER_ADMIN';

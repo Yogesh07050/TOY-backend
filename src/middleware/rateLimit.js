@@ -49,4 +49,19 @@ const uploadLimiter = rateLimit({
   message: message('Too many uploads. Try again shortly.'),
 });
 
-module.exports = { apiLimiter, authLimiter, emailLimiter, uploadLimiter };
+/**
+ * Limiter for AI generation (§40). Each call costs a provider request, so this
+ * sits well below the general API limit. The subscription quota is the real
+ * budget; this only stops a stuck client from burning a month's allowance in a
+ * few seconds.
+ */
+const aiLimiter = rateLimit({
+  ...base,
+  windowMs: 60 * 1000,
+  limit: 12,
+  // Per user rather than per IP: a shop's staff often share an office address.
+  keyGenerator: (req) => (req.user?.id ? `user:${req.user.id}` : req.ip),
+  message: message('You are generating a lot at once. Please wait a moment and try again.'),
+});
+
+module.exports = { apiLimiter, authLimiter, emailLimiter, uploadLimiter, aiLimiter };

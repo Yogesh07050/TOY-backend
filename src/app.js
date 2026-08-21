@@ -10,6 +10,7 @@ const cookieParser = require('cookie-parser');
 
 const env = require('./config/env');
 const routes = require('./routes');
+const ApiError = require('./utils/ApiError');
 const { healthCheck } = require('./db/pool');
 const mailer = require('./utils/mailer');
 const { apiLimiter } = require('./middleware/rateLimit');
@@ -31,13 +32,26 @@ app.use(
   }),
 );
 
+/**
+ * Any localhost origin is acceptable while developing. The dev server does not
+ * always get the port it asks for - if 4200 is taken it moves to 4201 - and a
+ * fixed allow list turns that into an unexplained login failure. Production is
+ * unaffected: there, only CORS_ORIGINS is honoured.
+ */
+const isLocalDevOrigin = (origin) =>
+  !env.isProduction && /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/.test(origin);
+
 app.use(
   cors({
     origin(origin, callback) {
       // Requests without an Origin header (curl, server-to-server) are allowed;
-      // browsers always send one, and those must be on the allow list.
-      if (!origin || env.corsOrigins.includes(origin)) return callback(null, true);
-      callback(new Error(`Origin ${origin} is not allowed by CORS`));
+      // browsers always send one on POST, and those must be on the allow list.
+      if (!origin || env.corsOrigins.includes(origin) || isLocalDevOrigin(origin)) {
+        return callback(null, true);
+      }
+      // A disallowed origin is the caller's problem, not a server fault, so it
+      // must not surface as a 500 "something went wrong on our side".
+      callback(ApiError.forbidden(`Origin ${origin} is not allowed by CORS`));
     },
     credentials: true,
   }),

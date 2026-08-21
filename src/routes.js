@@ -24,4 +24,8 @@ router.use('/banners', require('./modules/banners/banner.routes'));
 router.use('/discovery', require('./modules/discovery/discovery.routes'));
 router.use('/claims', require('./modules/claims/claim.routes'));
 
+// ---- V3: subscriptions and AI ----
+router.use('/subscriptions', require('./modules/subscriptions/subscription.routes'));
+router.use('/ai', require('./modules/ai/ai.routes'));
+
 module.exports = router;

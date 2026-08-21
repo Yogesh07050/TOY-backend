@@ -511,3 +511,120 @@ CREATE TABLE IF NOT EXISTS search_history (
   KEY idx_search_user (user_id, created_at),
   CONSTRAINT fk_search_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- =====================================================================
+--  V3 additions - subscriptions and the AI features (TOY.md)
+-- =====================================================================
+
+-- ---------------------------------------------------------------------
+-- Subscription plans (§3). The AI entitlements are columns rather than a
+-- hardcoded lookup because TOY.md requires the Super Admin to be able to
+-- change the limits without a deploy.
+--
+-- Limit columns: NULL means unlimited, 0 means the feature is off for the
+-- plan even if the matching *_enabled flag is somehow set.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS subscription_plans (
+  id                         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  code                       VARCHAR(40)     NOT NULL,
+  name                       VARCHAR(120)    NOT NULL,
+  description                VARCHAR(500)            DEFAULT NULL,
+  price_monthly              DECIMAL(10,2)   NOT NULL DEFAULT 0,
+  currency                   CHAR(3)         NOT NULL DEFAULT 'INR',
+
+  ai_assistant_enabled       TINYINT(1)      NOT NULL DEFAULT 0,
+  ai_content_enabled         TINYINT(1)      NOT NULL DEFAULT 0,
+  ai_optimizer_enabled       TINYINT(1)      NOT NULL DEFAULT 0,
+
+  -- Premium-only context the assistant may reason from (§11, §12, §13).
+  historical_insights        TINYINT(1)      NOT NULL DEFAULT 0,
+  location_insights          TINYINT(1)      NOT NULL DEFAULT 0,
+  timing_insights            TINYINT(1)      NOT NULL DEFAULT 0,
+  social_caption_enabled     TINYINT(1)      NOT NULL DEFAULT 0,
+
+  ai_assistant_monthly_limit INT UNSIGNED            DEFAULT 0,
+  ai_content_monthly_limit   INT UNSIGNED            DEFAULT 0,
+  ai_optimizer_monthly_limit INT UNSIGNED            DEFAULT 0,
+
+  display_order              INT             NOT NULL DEFAULT 0,
+  is_system                  TINYINT(1)      NOT NULL DEFAULT 0,
+  status                     ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  created_at                 DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at                 DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_plan_code (code),
+  KEY idx_plan_status (status, display_order)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- One live plan per shop. A shop with no row is on the free plan.
+CREATE TABLE IF NOT EXISTS shop_subscriptions (
+  id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  shop_id     BIGINT UNSIGNED NOT NULL,
+  plan_id     BIGINT UNSIGNED NOT NULL,
+  status      ENUM('active','cancelled','expired') NOT NULL DEFAULT 'active',
+  started_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  expires_at  DATETIME                DEFAULT NULL,
+  notes       VARCHAR(500)            DEFAULT NULL,
+  updated_by  BIGINT UNSIGNED         DEFAULT NULL,
+  created_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_shop_subscription (shop_id),
+  KEY idx_subscription_plan (plan_id),
+  CONSTRAINT fk_subscription_shop       FOREIGN KEY (shop_id)    REFERENCES shops (id)              ON DELETE CASCADE,
+  CONSTRAINT fk_subscription_plan       FOREIGN KEY (plan_id)    REFERENCES subscription_plans (id) ON DELETE RESTRICT,
+  CONSTRAINT fk_subscription_updated_by FOREIGN KEY (updated_by) REFERENCES users (id)              ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------
+-- AI usage metering (§32). Every attempt is recorded, successful or not,
+-- because the failures are what explain a provider outage later. Only
+-- successes count against a plan limit.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS ai_usage (
+  id                BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  shop_id           BIGINT UNSIGNED NOT NULL,
+  user_id           BIGINT UNSIGNED         DEFAULT NULL,
+  feature           VARCHAR(40)     NOT NULL,
+  plan_code         VARCHAR(40)             DEFAULT NULL,
+  provider          VARCHAR(40)             DEFAULT NULL,
+  model             VARCHAR(80)             DEFAULT NULL,
+  prompt_tokens     INT UNSIGNED    NOT NULL DEFAULT 0,
+  completion_tokens INT UNSIGNED    NOT NULL DEFAULT 0,
+  total_tokens      INT UNSIGNED    NOT NULL DEFAULT 0,
+  status            ENUM('success','failure') NOT NULL DEFAULT 'success',
+  error_code        VARCHAR(60)             DEFAULT NULL,
+  duration_ms       INT UNSIGNED    NOT NULL DEFAULT 0,
+  created_at        DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  -- The monthly quota check reads exactly this key.
+  KEY idx_ai_usage_quota (shop_id, feature, status, created_at),
+  KEY idx_ai_usage_user (user_id, created_at),
+  CONSTRAINT fk_ai_usage_shop FOREIGN KEY (shop_id) REFERENCES shops (id) ON DELETE CASCADE,
+  CONSTRAINT fk_ai_usage_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------
+-- AI generation history (§33). `outcome` is how "Accepted / Rejected" is
+-- answered: it flips to accepted when the admin actually uses the result.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS ai_generations (
+  id               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  shop_id          BIGINT UNSIGNED NOT NULL,
+  user_id          BIGINT UNSIGNED         DEFAULT NULL,
+  feature          VARCHAR(40)     NOT NULL,
+  offer_id         BIGINT UNSIGNED         DEFAULT NULL,
+  request_summary  VARCHAR(500)            DEFAULT NULL,
+  result_summary   VARCHAR(500)            DEFAULT NULL,
+  request_payload  JSON                    DEFAULT NULL,
+  result_payload   JSON                    DEFAULT NULL,
+  outcome          ENUM('pending','accepted','rejected') NOT NULL DEFAULT 'pending',
+  created_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_ai_gen_shop (shop_id, created_at),
+  KEY idx_ai_gen_offer (offer_id),
+  CONSTRAINT fk_ai_gen_shop  FOREIGN KEY (shop_id)  REFERENCES shops (id)  ON DELETE CASCADE,
+  CONSTRAINT fk_ai_gen_user  FOREIGN KEY (user_id)  REFERENCES users (id)  ON DELETE SET NULL,
+  CONSTRAINT fk_ai_gen_offer FOREIGN KEY (offer_id) REFERENCES offers (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

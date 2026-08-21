@@ -13,6 +13,7 @@ const { pool, query, queryOne, execute } = require('./pool');
 const env = require('../config/env');
 const password = require('../utils/password');
 const { PERMISSIONS, SYSTEM_ROLES } = require('../config/permissions');
+const { DEFAULT_PLANS } = require('../config/aiFeatures');
 const { slugify } = require('../utils/slug');
 
 const CATEGORIES = [
@@ -71,6 +72,48 @@ async function seedCategories() {
     );
   }
   console.log('  categories: %d', CATEGORIES.length);
+}
+
+/**
+ * Subscription plans (§3). Re-running the seeder refreshes the descriptive
+ * columns but deliberately leaves the AI limits alone: those are the Super
+ * Admin's to tune, and a re-seed must not quietly reset them.
+ */
+async function seedPlans() {
+  for (const plan of DEFAULT_PLANS) {
+    await execute(
+      `INSERT INTO subscription_plans
+         (code, name, description, price_monthly,
+          ai_assistant_enabled, ai_content_enabled, ai_optimizer_enabled,
+          historical_insights, location_insights, timing_insights, social_caption_enabled,
+          ai_assistant_monthly_limit, ai_content_monthly_limit, ai_optimizer_monthly_limit,
+          display_order, is_system, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'active')
+       ON DUPLICATE KEY UPDATE
+         name = VALUES(name),
+         description = VALUES(description),
+         display_order = VALUES(display_order),
+         is_system = 1`,
+      [
+        plan.code,
+        plan.name,
+        plan.description,
+        plan.priceMonthly,
+        plan.aiAssistantEnabled ? 1 : 0,
+        plan.aiContentEnabled ? 1 : 0,
+        plan.aiOptimizerEnabled ? 1 : 0,
+        plan.historicalInsights ? 1 : 0,
+        plan.locationInsights ? 1 : 0,
+        plan.timingInsights ? 1 : 0,
+        plan.socialCaptionEnabled ? 1 : 0,
+        plan.aiAssistantMonthlyLimit,
+        plan.aiContentMonthlyLimit,
+        plan.aiOptimizerMonthlyLimit,
+        plan.displayOrder,
+      ],
+    );
+  }
+  console.log('  subscription plans: %s', DEFAULT_PLANS.map((plan) => plan.code).join(', '));
 }
 
 async function ensureUser({ name, email, plainPassword, roles = [], verified = true }) {
@@ -412,7 +455,24 @@ async function seedDemoData(superAdmin) {
     [priya.id],
   );
 
+  // Put the demo shops on different plans so the AI gating is visible without
+  // any setup: Zara gets the full suite, the rest fall back to Free.
+  const demoPlans = [
+    [zara.id, 'PREMIUM'],
+    [shops.TechNova?.id, 'BUSINESS'],
+  ];
+  for (const [shopId, planCode] of demoPlans) {
+    if (!shopId) continue;
+    await execute(
+      `INSERT INTO shop_subscriptions (shop_id, plan_id, status)
+       SELECT ?, id, 'active' FROM subscription_plans WHERE code = ?
+       ON DUPLICATE KEY UPDATE plan_id = VALUES(plan_id), status = 'active'`,
+      [shopId, planCode],
+    );
+  }
+
   console.log('  demo shops: %s', Object.keys(shops).join(', '));
+  console.log('  demo plans: Zara = PREMIUM, TechNova = BUSINESS, FreshMart = FREE');
   console.log('  demo users: john@zara.com / ShopAdmin@123, priya@example.com / Customer@123');
 }
 
@@ -421,6 +481,7 @@ async function main() {
   await seedPermissions();
   await seedRoles();
   await seedCategories();
+  await seedPlans();
   const superAdmin = await seedSuperAdmin();
 
   if (env.seed.demoData) {

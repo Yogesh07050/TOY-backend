@@ -1,0 +1,9 @@
+# Offers App - AI service (Python / FastAPI)
+# Deliberately small: the provider SDKs are not used, both Gemini and OpenAI
+# are called over their plain REST APIs with httpx so there is one HTTP stack
+# and no SDK version drift.
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+httpx>=0.27,<1.0
+pydantic>=2.7,<3.0
+python-dotenv>=1.0,<2.0

@@ -227,6 +227,8 @@ All routes are under `/api`. Responses are enveloped:
 | Discovery (V2) | `GET /discovery/featured\|ending-soon\|nearby\|recommended`, `POST /discovery/featured/:id/track` |
 | Claims (V2) | `GET /claims`, `POST /claims/:offerId`, `GET /claims/lookup/:code`, `POST /claims/lookup/:code/redeem` |
 | Analytics (V2) | `GET /analytics/funnel`, `GET /analytics/growth` |
+| Subscriptions (V3) | `GET /subscriptions/plans`, `PUT /subscriptions/plans/:id`, `GET\|PUT /subscriptions/shops/:shopId` |
+| AI (V3) | `POST /ai/offer-assistant/recommend\|regenerate`, `POST /ai/content/generate\|regenerate`, `POST /ai/offer/improve`, `GET /ai/shops\|usage\|history\|status`, `GET /ai/capabilities/:shopId`, `GET\|PATCH /ai/history/:id` |
 
 ### Offer listing parameters
 
@@ -263,6 +265,56 @@ restricted to shops the caller may administer.
 - Uploads are type-checked, size-capped and re-encoded before touching disk.
 - Error responses never include stack traces in production.
 
+### V3: subscriptions and the AI features
+
+Three tiers, seeded into `subscription_plans` and editable by a Super Admin
+through `PUT /subscriptions/plans/:id` — TOY.md requires the allowances to be
+configurable rather than hardcoded.
+
+| | Free | Business (₹999) | Premium (₹2,500) |
+|---|---|---|---|
+| AI Offer Assistant | — | — | ✅ unlimited |
+| AI Content Generator | — | ✅ 10 / month | ✅ unlimited |
+| AI Offer Optimisation | — | — | ✅ |
+| History / location / timing insights | — | — | ✅ |
+| Social captions | — | — | ✅ |
+
+A shop with no `shop_subscriptions` row, a cancelled one, or one whose
+`expires_at` has passed is on Free. Expiry is resolved on read, so a lapsed
+subscription stops working immediately rather than at the next nightly job.
+
+**The AI itself lives in `TOY-ai-backend/`** (Python / FastAPI, nested inside
+this project), which is the only process holding a Gemini or OpenAI key. This API is what makes it safe to call:
+
+```
+authorise the shop → check the plan → gather only that shop's data →
+call the AI service → validate the response → re-check it against the offer →
+record usage and history → return
+```
+
+Notable pieces:
+
+- `services/subscriptions.js` — plan resolution and the monthly quota. Only
+  *successful* generations count, so a provider outage never costs a merchant
+  their allowance.
+- `modules/ai/ai.context.js` — builds the merchant context. Scoped to one shop
+  id throughout; the location and timing sections are aggregate counts, and
+  premium-only sections are not even queried when the plan excludes them.
+- `modules/ai/ai.guard.js` — an independent re-check of generated copy against
+  the offer's real numbers. §40 says never trust AI discount values without
+  validation, and trusting another service to have validated them does not
+  satisfy that. Copy that fails is dropped, not shown.
+- `ai_usage` / `ai_generations` — metering (§32) and the accepted/rejected
+  history (§33).
+
+No AI endpoint writes to `offers`. §10 and §35 require the admin to review,
+edit and publish, so the assistant returns a pre-fill and the admin's own
+`POST /offers` creates the offer.
+
+If the AI service is unreachable or the provider fails, the endpoints return a
+plain "try again later" message — the provider's own error is logged, never
+returned (§36, §37) — and the normal offer workflow is unaffected.
+
 ## Configuration
 
 See `.env.example`. Notable values:
@@ -274,6 +326,10 @@ See `.env.example`. Notable values:
 | `SMTP_HOST` | Leave empty to log emails to the console instead of sending |
 | `STORAGE_DRIVER` | `local` (implemented) or `s3` (stub) |
 | `MAX_UPLOAD_MB` | Per-image upload cap |
+| `AI_SERVICE_URL` | Where `TOY-ai-backend` is listening |
+| `AI_SERVICE_TOKEN` | Shared secret; must match the AI service's own value |
+| `AI_SERVICE_ENABLED` | `false` makes the AI endpoints answer "unavailable" cleanly |
+| `AI_HISTORY_WINDOW_DAYS` / `AI_MIN_HISTORY_OFFERS` | How much history the assistant may use, and how little counts as "not enough" (§38) |
 
 ## Background jobs
 
