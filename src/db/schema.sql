@@ -1166,3 +1166,96 @@ CREATE TABLE IF NOT EXISTS feature_override_events (
   CONSTRAINT fk_override_event_shop  FOREIGN KEY (shop_id)  REFERENCES shops (id) ON DELETE CASCADE,
   CONSTRAINT fk_override_event_actor FOREIGN KEY (actor_id) REFERENCES users (id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- =====================================================================
+--  Premium AI (TOY.md): what each plan unlocks, and what has been used
+-- =====================================================================
+--
+-- `subscription_plans` is deliberately *not* the record of which plan a shop
+-- is on - `shop_subscriptions` above is, and it carries the billing state
+-- Razorpay drives. This table says what a plan *code* unlocks in the AI layer.
+-- The two are joined on `code` rather than by foreign key, so a Super Admin can
+-- retune AI limits without touching a subscription row or a payment, and a plan
+-- change made through billing needs nothing synced over here.
+--
+-- Limit columns: NULL means unlimited, 0 means the feature is off for the plan
+-- even if the matching *_enabled flag is somehow set.
+-- ---------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS subscription_plans (
+  id                         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  code                       VARCHAR(40)     NOT NULL,
+  name                       VARCHAR(120)    NOT NULL,
+  description                VARCHAR(500)            DEFAULT NULL,
+  price_monthly              DECIMAL(10,2)   NOT NULL DEFAULT 0,
+  currency                   CHAR(3)         NOT NULL DEFAULT 'INR',
+
+  ai_assistant_enabled       TINYINT(1)      NOT NULL DEFAULT 0,
+  ai_content_enabled         TINYINT(1)      NOT NULL DEFAULT 0,
+  ai_optimizer_enabled       TINYINT(1)      NOT NULL DEFAULT 0,
+
+  -- Premium-only context the assistant may reason from (§11, §12, §13).
+  historical_insights        TINYINT(1)      NOT NULL DEFAULT 0,
+  location_insights          TINYINT(1)      NOT NULL DEFAULT 0,
+  timing_insights            TINYINT(1)      NOT NULL DEFAULT 0,
+  social_caption_enabled     TINYINT(1)      NOT NULL DEFAULT 0,
+
+  ai_assistant_monthly_limit INT UNSIGNED            DEFAULT 0,
+  ai_content_monthly_limit   INT UNSIGNED            DEFAULT 0,
+  ai_optimizer_monthly_limit INT UNSIGNED            DEFAULT 0,
+
+  display_order              INT             NOT NULL DEFAULT 0,
+  is_system                  TINYINT(1)      NOT NULL DEFAULT 0,
+  status                     ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  created_at                 DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at                 DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_plan_code (code),
+  KEY idx_plan_status (status, display_order)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- One row per successful AI generation, which is what the monthly quota counts.
+CREATE TABLE IF NOT EXISTS ai_usage (
+  id                BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  shop_id           BIGINT UNSIGNED NOT NULL,
+  user_id           BIGINT UNSIGNED         DEFAULT NULL,
+  feature           VARCHAR(40)     NOT NULL,
+  plan_code         VARCHAR(40)             DEFAULT NULL,
+  provider          VARCHAR(40)             DEFAULT NULL,
+  model             VARCHAR(80)             DEFAULT NULL,
+  prompt_tokens     INT UNSIGNED    NOT NULL DEFAULT 0,
+  completion_tokens INT UNSIGNED    NOT NULL DEFAULT 0,
+  total_tokens      INT UNSIGNED    NOT NULL DEFAULT 0,
+  status            ENUM('success','failure') NOT NULL DEFAULT 'success',
+  error_code        VARCHAR(60)             DEFAULT NULL,
+  duration_ms       INT UNSIGNED    NOT NULL DEFAULT 0,
+  created_at        DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  -- The monthly quota check reads exactly this key.
+  KEY idx_ai_usage_quota (shop_id, feature, status, created_at),
+  KEY idx_ai_usage_user (user_id, created_at),
+  CONSTRAINT fk_ai_usage_shop FOREIGN KEY (shop_id) REFERENCES shops (id) ON DELETE CASCADE,
+  CONSTRAINT fk_ai_usage_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- The generated artefacts themselves, kept so a merchant can revisit them.
+CREATE TABLE IF NOT EXISTS ai_generations (
+  id               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  shop_id          BIGINT UNSIGNED NOT NULL,
+  user_id          BIGINT UNSIGNED         DEFAULT NULL,
+  feature          VARCHAR(40)     NOT NULL,
+  offer_id         BIGINT UNSIGNED         DEFAULT NULL,
+  request_summary  VARCHAR(500)            DEFAULT NULL,
+  result_summary   VARCHAR(500)            DEFAULT NULL,
+  request_payload  JSON                    DEFAULT NULL,
+  result_payload   JSON                    DEFAULT NULL,
+  outcome          ENUM('pending','accepted','rejected') NOT NULL DEFAULT 'pending',
+  created_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_ai_gen_shop (shop_id, created_at),
+  KEY idx_ai_gen_offer (offer_id),
+  CONSTRAINT fk_ai_gen_shop  FOREIGN KEY (shop_id)  REFERENCES shops (id)  ON DELETE CASCADE,
+  CONSTRAINT fk_ai_gen_user  FOREIGN KEY (user_id)  REFERENCES users (id)  ON DELETE SET NULL,
+  CONSTRAINT fk_ai_gen_offer FOREIGN KEY (offer_id) REFERENCES offers (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

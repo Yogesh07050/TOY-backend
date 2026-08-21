@@ -92,6 +92,23 @@ const env = {
   },
 
   /**
+   * The Python AI service (TOY-ai-backend). Provider keys live there, never
+   * here and never in Angular (§40). `enabled` false makes every AI endpoint
+   * answer "unavailable" cleanly rather than time out against a dead port.
+   */
+  ai: {
+    enabled: bool(process.env.AI_SERVICE_ENABLED, true),
+    baseUrl: (process.env.AI_SERVICE_URL || 'http://127.0.0.1:8000').replace(/\/$/, ''),
+    token: process.env.AI_SERVICE_TOKEN || '',
+    timeoutMs: int(process.env.AI_SERVICE_TIMEOUT_MS, 60000),
+    /** How much history the assistant may be given (§11). */
+    historyOfferLimit: int(process.env.AI_HISTORY_OFFER_LIMIT, 12),
+    historyWindowDays: int(process.env.AI_HISTORY_WINDOW_DAYS, 180),
+    /** Below this many measured offers, history is treated as insufficient (§38). */
+    minHistoryOffers: int(process.env.AI_MIN_HISTORY_OFFERS, 2),
+  },
+
+  /**
    * Razorpay (V3 payments §2). Left empty in development: the checkout and
    * webhook endpoints then answer with a clear "payments are not configured"
    * rather than failing deep inside an HTTP call to the gateway.

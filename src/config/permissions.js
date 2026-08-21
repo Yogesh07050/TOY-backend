@@ -66,6 +66,16 @@ const PERMISSIONS = {
   MANAGE_SERVICE_BOOKING: { category: 'Services', description: 'Manage customer service bookings' },
   VIEW_SERVICE_ANALYTICS: { category: 'Insights', description: 'View service analytics dashboards' },
   EXPORT_SERVICE_ANALYTICS: { category: 'Insights', description: 'Export service analytics reports' },
+
+  // AI (TOY.md). Holding the permission only makes the feature *reachable* -
+  // whether it actually runs is decided by the shop's subscription plan, which
+  // is checked separately on every call.
+  USE_AI_ASSISTANT: { category: 'AI', description: 'Use the AI Offer Assistant' },
+  USE_AI_CONTENT: { category: 'AI', description: 'Use the AI content generator' },
+  MANAGE_SUBSCRIPTIONS: {
+    category: 'AI',
+    description: 'Manage subscription plans and AI usage limits',
+  },
 };
 
 const PERMISSION_NAMES = Object.keys(PERMISSIONS);
@@ -108,6 +118,10 @@ const SYSTEM_ROLES = {
       'VIEW_SUBSCRIPTION',
       'MANAGE_SUBSCRIPTION',
       'MANAGE_CAMPAIGNS',
+      // The subscription plan is the real gate on these two, so granting them
+      // to every Admin costs nothing and keeps the upgrade prompt reachable.
+      'USE_AI_ASSISTANT',
+      'USE_AI_CONTENT',
       // Deliberately no *_BANNER permissions here: §6 requires a Super Admin to
       // grant those explicitly, per Admin.
       'CREATE_SERVICE',
@@ -164,6 +178,9 @@ const MANAGEMENT_PERMISSIONS = [
   'EDIT_SERVICE',
   'DELETE_SERVICE',
   'VIEW_SERVICE_ANALYTICS',
+  'USE_AI_ASSISTANT',
+  'USE_AI_CONTENT',
+  'MANAGE_SUBSCRIPTIONS',
 ];
 
 const SUPER_ADMIN_ROLE = 'SUPER_ADMIN';

@@ -32,6 +32,15 @@ router.use('/payments', require('./modules/payments/payment.routes'));
 router.use('/feature-overrides', require('./modules/featureOverrides/featureOverride.routes'));
 router.use('/campaigns', require('./modules/campaigns/campaign.routes'));
 
+// ---- V3: premium AI ----
+// The AI plan catalogue is a separate prefix from `/subscriptions` on purpose.
+// `/subscriptions` owns billing - what a shop is paying and when it renews.
+// `/subscription-plans` owns what each plan *unlocks* in the AI layer, which is
+// Super Admin configuration rather than commerce. Keeping them apart is what
+// stopped the two branches' `GET /plans` from colliding on one path.
+router.use('/subscription-plans', require('./modules/subscriptions/plan.routes'));
+router.use('/ai', require('./modules/ai/ai.routes'));
+
 // ---- V4: Services ----
 router.use('/services', require('./modules/services/service.routes'));
 router.use('/service-offer-claims', require('./modules/services/serviceOfferClaim.routes'));
