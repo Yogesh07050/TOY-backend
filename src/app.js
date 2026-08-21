@@ -13,6 +13,7 @@ const routes = require('./routes');
 const { healthCheck } = require('./db/pool');
 const mailer = require('./utils/mailer');
 const { apiLimiter } = require('./middleware/rateLimit');
+const cachePolicy = require('./middleware/cachePolicy');
 const { notFoundHandler, errorHandler } = require('./middleware/errorHandler');
 
 const app = express();
@@ -82,7 +83,9 @@ app.get('/health', async (_req, res) => {
   });
 });
 
-app.use(env.apiPrefix, apiLimiter, routes);
+// Guest/authenticated cache separation (§26). Sits ahead of the router so it
+// applies to every API response, including error responses.
+app.use(env.apiPrefix, apiLimiter, cachePolicy, routes);
 
 app.use(notFoundHandler);
 app.use(errorHandler);

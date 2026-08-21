@@ -298,6 +298,7 @@ All routes are under `/api`. Responses are enveloped:
 | Notifications | `GET /notifications`, `PATCH /notifications/:id/read`, `PATCH /notifications/read-all`, `GET|PUT /notifications/preferences`, `POST /notifications/announce` |
 | Analytics | `GET /analytics/overview\|offers\|shops\|categories\|locations`, `GET /analytics/shops/:shopId` |
 | Audit | `GET /audit-logs`, `GET /audit-logs/filters` |
+| Search | `GET /search` — public, grouped across offers, services, shops and categories |
 | Uploads | `POST /uploads/:type` (`offers\|shops\|categories\|avatars`), `POST /uploads/offers/batch` |
 | Banners (V2) | `GET\|POST /banners`, `GET\|PUT\|DELETE /banners/:id`, `PATCH /banners/:id/status`, `GET /banners/selectable-offers`, `GET /banners/analytics` |
 | Discovery (V2) | `GET /discovery/featured\|ending-soon\|nearby\|recommended`, `POST /discovery/featured/:id/track` |
@@ -340,6 +341,52 @@ restricted to shops the caller may administer.
 
 ---
 
+### Guest browsing — what is public and what is not
+
+The customer experience is **public-first**: browsing the marketplace never
+requires an account. Authentication is demanded only when the caller reaches for
+something that belongs to an account.
+
+| | Anonymous | Authenticated |
+|---|---|---|
+| `GET /offers`, `/offers/:id`, `/offers/:id/reviews` | ✅ | ✅ personalised (`isFavorite`) |
+| `GET /services`, `/services/:id` | ✅ | ✅ personalised (`isSaved`) |
+| `GET /shops`, `/shops/:id`, `/shops/:id/branches` | ✅ | ✅ personalised (`isFollowing`) |
+| `GET /categories`, `/categories/:id` | ✅ | ✅ personalised (`isFollowing`) |
+| `GET /discovery/featured\|ending-soon\|nearby\|offers\|recommended` | ✅ | ✅ personalised ranking |
+| `GET /search` | ✅ | ✅ + the term is recorded as a recommendation signal |
+| `POST /analytics/events`, `POST /offers/:id/track` | ✅ | ✅ attributed to the user |
+| `/favorites`, `/following`, `/claims`, `/notifications`, `/preferences`, `/saved-services` | ❌ 401 | ✅ |
+| `?favorites=true` / `?following=true` on a public listing | ❌ 401 | ✅ |
+| Everything under admin, analytics, subscriptions and payments | ❌ | role + permission + plan |
+
+Two middlewares carry this:
+
+- `optionalAuth` attaches `req.user` when a token is present and lets anonymous
+  requests through. It is what makes one endpoint serve both audiences.
+- `authenticate` rejects without one. Hiding a button in a client is never the
+  boundary — every protected route re-checks independently.
+
+Recommendations degrade rather than fail for a guest: with no account history to
+score against, `recommendations.recommend()` falls back to location, popularity
+and freshness, which is why the clients label that rail "Popular near you"
+rather than "Recommended for you" when nobody is signed in.
+
+### Guest/authenticated cache separation
+
+`middleware/cachePolicy.js` sets two headers on every API response:
+
+- `Vary: Authorization` — always. A public payload still carries per-user flags
+  (`isFavorite`, `isFollowing`, `isSaved`) derived from the bearer token, so a
+  cache keyed on the URL alone would serve one customer another's flags.
+- `Cache-Control` — `public, max-age=…, s-maxage=…` only when the request is a
+  GET, arrived **without** a token, and names a public-discovery path.
+  Everything else is `private, no-store`.
+
+The token is read from the raw header rather than `req.user`, because this runs
+ahead of each route's own `optionalAuth`. Tune the windows with
+`CACHE_PUBLIC_MAX_AGE` and `CACHE_SHARED_MAX_AGE`.
+
 ## Security
 
 - bcrypt password hashing; strength rules enforced server-side.
@@ -372,6 +419,10 @@ restricted to shops the caller may administer.
   attempts / 15 min; email: 5 / hour).
 - Uploads are type-checked, size-capped and re-encoded before touching disk.
 - Error responses never include stack traces in production.
+- Public browsing does not mean a public backend. Guest access is granted per
+  route by `optionalAuth`; every account-scoped route still demands a token, and
+  user-specific responses are marked `private, no-store` so they cannot be
+  replayed to another customer from a shared cache.
 
 ## Configuration
 
@@ -390,6 +441,8 @@ See `.env.example`. Notable values:
 | `BILLING_GRACE_DAYS` | Days a failed renewal keeps its features before dropping to Free (data is never deleted) |
 | `BILLING_TAX_PERCENT` | Tax already included in the plan price; invoices back-compute the split |
 | `REFRESH_COOKIE_SAMESITE` | `lax` when API and SPA share a site, `none` (+ Secure) when they do not |
+| `CACHE_PUBLIC_MAX_AGE` | Browser cache window for anonymous public-discovery responses (seconds) |
+| `CACHE_SHARED_MAX_AGE` | CDN/proxy window for the same responses. Longer than the browser one — a shared cache can be purged |
 
 ## Email and payment setup
 

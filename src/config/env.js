@@ -82,6 +82,16 @@ const env = {
   },
 
   /**
+   * How long an anonymous public-discovery response may be cached (§26).
+   * `shared` is the CDN/proxy window and is deliberately the longer of the
+   * two - a shared cache can be purged, a browser cache cannot.
+   */
+  cache: {
+    publicMaxAgeSeconds: int(process.env.CACHE_PUBLIC_MAX_AGE, 60),
+    sharedMaxAgeSeconds: int(process.env.CACHE_SHARED_MAX_AGE, 300),
+  },
+
+  /**
    * Razorpay (V3 payments §2). Left empty in development: the checkout and
    * webhook endpoints then answer with a clear "payments are not configured"
    * rather than failing deep inside an HTTP call to the gateway.
