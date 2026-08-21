@@ -363,7 +363,23 @@ async function findByGatewaySubscriptionId(subscriptionId) {
  * Activates (or renews) a subscription. **Only the verified webhook handler
  * may call this** - it is the single write that turns paid features on (§7).
  */
-async function activate(shopId, { periodStart, periodEnd, paymentMethod, autopay, amount } = {}) {
+async function activate(
+  shopId,
+  {
+    periodStart,
+    periodEnd,
+    paymentMethod,
+    autopay,
+    amount,
+    // A Super Admin grant reaches this through `grantPlan` rather than a
+    // webhook, and the history should say so: who did it, why, and that no
+    // payment was taken. Webhook callers pass none of these and behave exactly
+    // as before.
+    actorId = null,
+    note = null,
+    paymentStatus = 'paid',
+  } = {},
+) {
   const subscription = await getForShop(shopId);
   // The plan a checkout was started for is applied *here*, on confirmed
   // payment, and nowhere else (§7). Without one in flight this is a renewal of
@@ -380,7 +396,7 @@ async function activate(shopId, { periodStart, periodEnd, paymentMethod, autopay
   await execute(
     `UPDATE shop_subscriptions
         SET plan = ?, price_amount = ?, checkout_plan = NULL,
-            status = 'active', payment_status = 'paid',
+            status = 'active', payment_status = ?,
             current_period_start = COALESCE(?, NOW()),
             current_period_end = COALESCE(?, DATE_ADD(NOW(), ${interval})),
             renews_at = COALESCE(?, DATE_ADD(NOW(), ${interval})),
@@ -392,6 +408,7 @@ async function activate(shopId, { periodStart, periodEnd, paymentMethod, autopay
     [
       targetPlan,
       target.price,
+      paymentStatus,
       periodStart ?? null,
       periodEnd ?? null,
       periodEnd ?? null,
@@ -402,18 +419,63 @@ async function activate(shopId, { periodStart, periodEnd, paymentMethod, autopay
   );
 
   await execute(
-    `INSERT INTO subscription_events (shop_id, from_plan, to_plan, action, amount)
-     VALUES (?, ?, ?, ?, ?)`,
+    `INSERT INTO subscription_events (shop_id, from_plan, to_plan, action, amount, actor_id, note)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
     [
       shopId,
       subscription.plan,
       targetPlan,
       isUpgrade ? 'upgraded' : 'renewed',
       amount ?? target.price,
+      actorId,
+      note,
     ],
   );
 
   return getForShop(shopId);
+}
+
+/**
+ * Puts a shop on a paid plan without a payment. **Super Admin only** - the
+ * route enforces that.
+ *
+ * This exists because every other way onto a paid plan runs through Razorpay:
+ * `startCheckout` refuses when no credentials are configured, and `activate`
+ * only ever applies a plan a checkout already put in flight. On a staging box,
+ * a fresh clone, or any deployment without live keys, that left no way at all
+ * to provision Business or Premium - including for the AI entitlements, which
+ * read the plan code and nothing else.
+ *
+ * It deliberately reuses the normal activation path rather than writing the
+ * plan directly, so a granted subscription is shaped exactly like a purchased
+ * one: same period dates, same status, same history row. The only differences
+ * are the ones that would be a lie otherwise - the amount is zero, the payment
+ * status is `not_required` rather than `paid`, and the event carries the
+ * Super Admin who did it and their reason.
+ *
+ * Downgrades to Free are not handled here; they belong to `scheduleDowngrade`,
+ * which honours the period the merchant already paid for (§12).
+ */
+async function grantPlan(shopId, planKey, user, { billingCycle = 'monthly', note } = {}) {
+  if (!plans.PLAN_KEYS.includes(planKey)) throw ApiError.badRequest('Unknown subscription plan');
+
+  const plan = plans.planFor(planKey);
+  if (plan.price <= 0) {
+    throw ApiError.badRequest('Use the plan change endpoint to move a shop to Free.');
+  }
+
+  // Park the target on the row the way a checkout would, so `activate` applies
+  // it through its normal "the plan a checkout was started for" path.
+  await recordCheckoutIntent(shopId, planKey, { billingCycle });
+
+  return activate(shopId, {
+    amount: 0,
+    paymentMethod: 'manual-grant',
+    autopay: false,
+    paymentStatus: 'not_required',
+    actorId: user?.id ?? null,
+    note: note ?? `Granted by ${user?.name ?? 'a Super Admin'} without a charge`,
+  });
 }
 
 /**
@@ -612,6 +674,7 @@ module.exports = {
   changePlan,
   scheduleDowngrade,
   recordCheckoutIntent,
+  grantPlan,
   attachGateway,
   findByGatewaySubscriptionId,
   activate,

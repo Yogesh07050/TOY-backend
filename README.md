@@ -304,7 +304,7 @@ All routes are under `/api`. Responses are enveloped:
 | Discovery (V2) | `GET /discovery/featured\|ending-soon\|nearby\|recommended`, `POST /discovery/featured/:id/track` |
 | Claims (V2) | `GET /claims`, `POST /claims/:offerId`, `GET /claims/lookup/:code`, `POST /claims/lookup/:code/redeem` |
 | Analytics (V2) | `GET /analytics/funnel`, `GET /analytics/growth` |
-| Subscriptions (V3) | `GET /subscriptions/plans\|me\|current`, `GET /subscriptions/shops/:shopId\|/usage\|/history\|/billing-history\|/invoices`, `PUT /subscriptions/shops/:shopId` (Free only), `POST /subscriptions/shops/:shopId/checkout\|checkout/verify\|upgrade\|downgrade\|cancel\|confirm-payment` |
+| Subscriptions (V3) | `GET /subscriptions/plans\|me\|current`, `GET /subscriptions/shops/:shopId\|/usage\|/history\|/billing-history\|/invoices`, `PUT /subscriptions/shops/:shopId` (Free only), `POST /subscriptions/shops/:shopId/checkout\|checkout/verify\|upgrade\|downgrade\|cancel\|confirm-payment\|grant` (grant is Super Admin only) |
 | Payments (Razorpay) | `POST /payments/razorpay/webhook`, `GET /payments/config`, `GET /payments/transactions` (Super Admin) |
 | Feature overrides (Super Admin) | `GET /feature-overrides\|/catalogue\|/summary\|/history`, `GET /feature-overrides/shops/:shopId`, `POST /feature-overrides/shops/:shopId`, `DELETE /feature-overrides/shops/:shopId/:featureKey` |
 | Campaigns (V3) | `GET\|POST /campaigns`, `GET\|PUT\|DELETE /campaigns/:id` |
@@ -322,7 +322,7 @@ All routes are under `/api`. Responses are enveloped:
 &offerType=percentage  &discountType=flat   &status=active
 &sort=views|claims|redemptions|conversion|saves|newest   &limit=50
 ```
-| Subscriptions (V3) | `GET /subscriptions/plans`, `PUT /subscriptions/plans/:id`, `GET\|PUT /subscriptions/shops/:shopId` |
+| AI plan entitlements (V3) | `GET /subscription-plans/plans`, `PUT /subscription-plans/plans/:id` (Super Admin), `GET /subscription-plans/shops/:shopId` |
 | AI (V3) | `POST /ai/offer-assistant/recommend\|regenerate`, `POST /ai/content/generate\|regenerate`, `POST /ai/offer/improve`, `GET /ai/shops\|usage\|history\|status`, `GET /ai/capabilities/:shopId`, `GET\|PATCH /ai/history/:id` |
 
 ### Offer listing parameters
@@ -403,10 +403,14 @@ ahead of each route's own `optionalAuth`. Tune the windows with
   in `localStorage`. `REFRESH_COOKIE_SAMESITE` tunes it per deployment.
 - A password change signs out every *other* device; the one that made the
   change keeps its session, having just proved it knows the old password.
-- **Subscriptions are never activated by the frontend.** A paid plan is created
-  `pending` and only a signature-verified Razorpay webhook may set it active.
-  Merchant Admins cannot set a paid plan, confirm a payment, or grant
-  themselves a feature — all three are refused at the route.
+- **Subscriptions are never activated by the merchant.** A paid plan is created
+  `pending`, and the only things that may set it active are a signature-verified
+  Razorpay webhook and two Super Admin support routes — `confirm-payment`, for
+  reconciling a payment the webhook never delivered, and `grant`, for comping a
+  shop or provisioning one where no gateway is configured. Both are audited, and
+  a grant records itself as a grant rather than as a payment. Merchant Admins
+  cannot set a paid plan, confirm a payment, or grant themselves a feature — all
+  three are refused at the route (§31).
 - Razorpay webhooks are verified by HMAC over the **raw** request body and
   deduplicated on a unique `(gateway, event_id)` key, so redelivery is a no-op.
 - No card number, CVV, PIN, UPI PIN or banking credential is ever received or
@@ -429,8 +433,8 @@ ahead of each route's own `optionalAuth`. Tune the windows with
 ### V3: subscriptions and the AI features
 
 Three tiers, seeded into `subscription_plans` and editable by a Super Admin
-through `PUT /subscriptions/plans/:id` — TOY.md requires the allowances to be
-configurable rather than hardcoded.
+through `PUT /subscription-plans/plans/:id` — TOY.md requires the allowances to
+be configurable rather than hardcoded.
 
 | | Free | Business (₹999) | Premium (₹2,500) |
 |---|---|---|---|
@@ -440,9 +444,25 @@ configurable rather than hardcoded.
 | History / location / timing insights | — | — | ✅ |
 | Social captions | — | — | ✅ |
 
-A shop with no `shop_subscriptions` row, a cancelled one, or one whose
-`expires_at` has passed is on Free. Expiry is resolved on read, so a lapsed
-subscription stops working immediately rather than at the next nightly job.
+`subscription_plans` says what a plan *unlocks*; it does not say which plan a
+shop is on. That is `shop_subscriptions`, the billing record, and the AI layer
+asks `subscription.service.planKeyForShop` for it rather than keeping a second
+answer — so it inherits the same rules payments already follow: a failed
+renewal keeps its features inside the grace window, a cancellation keeps them
+until the period already paid for runs out, and anything lapsed is Free. The
+two tables are joined on plan `code`, so retuning an AI limit never touches a
+subscription and a plan change never needs syncing over.
+
+**Provisioning a paid plan without a payment.** Every ordinary route onto a paid
+plan runs through Razorpay — `checkout` refuses without credentials, and
+`activate` only applies a plan a checkout put in flight — which left no way to
+provision Business or Premium on a staging box or a fresh clone, including for
+the AI entitlements. `POST /subscriptions/shops/:shopId/grant` is that way. It
+is **Super Admin only** (§31 still forbids a merchant moving their own
+subscription into a paid state) and reuses the normal activation path, so a
+granted subscription is shaped like a purchased one. The differences are the
+ones that would otherwise be untrue: zero amount, `payment_status` of
+`not_required`, and a history row naming the Super Admin and their reason.
 
 **The AI itself lives in `TOY-ai-backend/`** (Python / FastAPI, nested inside
 this project), which is the only process holding a Gemini or OpenAI key. This API is what makes it safe to call:

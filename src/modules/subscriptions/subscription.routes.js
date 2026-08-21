@@ -314,6 +314,51 @@ router.put(
 );
 
 /**
+ * Put a shop on a paid plan without taking a payment. **Super Admin only.**
+ *
+ * The merchant-facing `PUT /shops/:shopId` deliberately refuses anything but
+ * Free, because §31 says a merchant must not be able to move their own
+ * subscription into a paid state. That rule is about merchants, not about
+ * support: comping a shop, fixing a botched migration, or standing up a
+ * staging environment with no Razorpay credentials all need a way in, and
+ * without one there was none.
+ *
+ * The grant is recorded as a grant - zero amount, `not_required` payment
+ * status, and an audit trail naming the Super Admin - so it never reads as a
+ * payment that was never taken.
+ */
+router.post(
+  '/shops/:shopId/grant',
+  validate({
+    params: shopIdParam,
+    body: z.object({
+      plan: z.enum(['BUSINESS', 'PREMIUM']),
+      billingCycle: z.enum(['monthly', 'yearly']).default('monthly'),
+      note: z.string().trim().max(255).optional(),
+    }),
+  }),
+  requireSuperAdmin,
+  asyncHandler(async (req, res) => {
+    const shopId = Number(req.params.shopId);
+    const before = await service.getForShop(shopId);
+    const subscription = await service.grantPlan(shopId, req.body.plan, req.user, {
+      billingCycle: req.body.billingCycle,
+      note: req.body.note,
+    });
+
+    await audit.record(req, {
+      action: 'SUBSCRIPTION_GRANTED',
+      entityType: 'shop',
+      entityId: shopId,
+      oldValue: { plan: before.plan },
+      newValue: { plan: subscription.plan, amount: 0, granted: true, note: req.body.note ?? null },
+    });
+
+    ok(res, subscription);
+  }),
+);
+
+/**
  * Manual payment confirmation, **Super Admin only**.
  *
  * Kept as a support tool for reconciling a payment the webhook never delivered,
