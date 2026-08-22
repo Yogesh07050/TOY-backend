@@ -2,6 +2,7 @@
 
 const { rawQuery } = require('../../db/pool');
 const geo = require('../../utils/geo');
+const { dayKeysBetween } = require('../../utils/dateRange');
 
 /**
  * Premium analytics (V3 §8-§25).
@@ -258,6 +259,12 @@ async function overviewTimeline(context) {
     }
     return days.get(key);
   };
+
+  // Seed the whole window before folding the rows in. Each `GROUP BY day` above
+  // skips the days it found nothing on, so without this the chart would drop
+  // its quiet days entirely and the header would count 25 of the 30 days asked
+  // for rather than showing them flat.
+  for (const day of dayKeysBetween(from, to)) touch(day);
 
   for (const row of views) {
     const entry = touch(row.day);

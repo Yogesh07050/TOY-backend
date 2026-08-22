@@ -10,6 +10,7 @@ const { authenticate } = require('../../middleware/auth');
 const { requirePermission, requireGlobalPermission } = require('../../middleware/authorize');
 const accessControl = require('../../services/accessControl');
 const { ok } = require('../../utils/respond');
+const { dayKeysBetween } = require('../../utils/dateRange');
 
 const router = express.Router();
 
@@ -235,15 +236,21 @@ router.get(
       ),
     ]);
 
+    // Seed every day in the window first. `GROUP BY day` only returns days that
+    // have rows, so building the series from the result sets alone drops the
+    // quiet days and leaves the chart plotting the survivors on an axis that
+    // jumps - "last 30 days" would read as 26 evenly spaced bars.
     const timeline = new Map();
+    for (const day of dayKeysBetween(new Date(Date.now() - days * 86400000), new Date())) {
+      timeline.set(day, { day, created: 0, views: 0, clicks: 0, shares: 0, impressions: 0 });
+    }
     for (const row of created) {
-      timeline.set(String(row.day), { day: row.day, created: Number(row.count), views: 0, clicks: 0, shares: 0 });
+      const entry = timeline.get(String(row.day));
+      if (entry) entry.created = Number(row.count);
     }
     for (const row of events) {
-      const key = String(row.day);
-      const entry = timeline.get(key) || { day: row.day, created: 0, views: 0, clicks: 0, shares: 0 };
-      entry[`${row.event_type}s`] = Number(row.count);
-      timeline.set(key, entry);
+      const entry = timeline.get(String(row.day));
+      if (entry) entry[`${row.event_type}s`] = Number(row.count);
     }
 
     ok(res, {
@@ -378,7 +385,12 @@ router.get(
     const scoped = scopeClause(scope, 'b.shop_id');
 
     const rows = await rawQuery(
-      `SELECT b.city, b.state,
+      // Grouped by city alone. Branches of the same city do not always agree on
+      // `state` (older rows leave it NULL), and grouping on the pair split one
+      // city into two rows that each reported the city's whole offer count -
+      // the subquery below has always keyed on city. MAX() skips NULLs, so the
+      // state shown is a real one whenever any branch recorded it.
+      `SELECT b.city, MAX(b.state) AS state,
               COUNT(DISTINCT b.id) AS branch_count,
               COUNT(DISTINCT b.shop_id) AS shop_count,
               (SELECT COUNT(DISTINCT o2.id)
@@ -388,7 +400,7 @@ router.get(
                 WHERE o2.status = 'active') AS active_offers
          FROM shop_branches b
         WHERE b.city IS NOT NULL AND b.status = 'active'${scoped.sql}
-        GROUP BY b.city, b.state
+        GROUP BY b.city
         ORDER BY active_offers DESC, branch_count DESC
         LIMIT ${req.query.limit}`,
       scoped.params,
