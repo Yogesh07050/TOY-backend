@@ -7,6 +7,7 @@ const { limitOffset } = require('../../utils/pagination');
 const accessControl = require('../../services/accessControl');
 const entitlements = require('../../services/entitlements');
 const analyticsEvents = require('../../services/analyticsEvents');
+const notifications = require('../../services/notifications');
 const { FEATURES } = require('../../config/plans');
 
 /**
@@ -804,6 +805,12 @@ async function createBooking(serviceId, payload, user) {
   });
   await analyticsEvents.touchShopCustomer(service.shop_id, user.id);
 
+  // Booking confirmation (Push §18). Fire-and-forget - the booking exists
+  // either way, and a push outage must not fail the request that made it.
+  notifications
+    .notifyBooking(result.insertId, 'BOOKING_CREATED')
+    .catch((error) => console.error('[notifications] booking confirmation failed: %s', error.message));
+
   return mapBooking(await queryOne('SELECT * FROM service_bookings WHERE id = ?', [result.insertId]));
 }
 
@@ -825,6 +832,14 @@ async function updateBookingStatus(bookingId, status, user) {
       serviceId: Number(booking.service_id),
       userId: Number(booking.user_id),
     });
+  }
+
+  // Tell the customer their appointment moved or was called off (Push §18).
+  // Re-saving the status a booking already had is not a change worth a push.
+  if (status !== booking.status) {
+    notifications
+      .notifyBookingStatusChanged(bookingId, status)
+      .catch((error) => console.error('[notifications] booking update failed: %s', error.message));
   }
 
   return mapBooking(await queryOne('SELECT * FROM service_bookings WHERE id = ?', [bookingId]));

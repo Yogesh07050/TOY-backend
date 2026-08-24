@@ -12,6 +12,7 @@ const { authenticate } = require('../../middleware/auth');
 const { requirePermission } = require('../../middleware/authorize');
 const accessControl = require('../../services/accessControl');
 const analyticsEvents = require('../../services/analyticsEvents');
+const notifications = require('../../services/notifications');
 const { limitOffset, paginationSchema } = require('../../utils/pagination');
 const { ok, created, paginated } = require('../../utils/respond');
 
@@ -141,6 +142,14 @@ router.post(
         offerId: Number(req.params.offerId),
         userId: req.user.id,
       });
+
+      // Confirmation carrying the code (Push §16). Only for a genuinely new
+      // claim - re-claiming returns the existing code and must not re-notify.
+      // Fire-and-forget: the claim is already issued, and a push outage must
+      // not turn a successful claim into a failed request.
+      notifications
+        .notifyOfferClaimed(claimId)
+        .catch((error) => console.error('[notifications] claim confirmation failed: %s', error.message));
     }
 
     const rows = await rawQuery(`${CLAIM_SELECT} WHERE c.id = ?`, [claimId]);
@@ -202,6 +211,10 @@ router.post(
       entityId: Number(claim.id),
       newValue: { offerId: Number(claim.offer_id), code: claim.code },
     });
+
+    notifications
+      .notifyOfferRedeemed(claim.id)
+      .catch((error) => console.error('[notifications] redemption notice failed: %s', error.message));
 
     const rows = await rawQuery(`${CLAIM_SELECT} WHERE c.id = ?`, [claim.id]);
     ok(res, mapClaim(rows[0]));

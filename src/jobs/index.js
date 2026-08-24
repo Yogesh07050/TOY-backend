@@ -73,6 +73,19 @@ const jobs = [
     },
   },
   {
+    name: 'push-receipts',
+    // Every 15 minutes. A push ticket only says the relay accepted the
+    // message; the receipt says what Google and Apple did with it, and is
+    // where an uninstalled app finally surfaces as a dead token (Push §31).
+    // Expo discards receipts after 24 hours, so this has to run often enough
+    // to catch them - and is a no-op when there is nothing pending.
+    schedule: '*/15 * * * *',
+    run: async () => {
+      const checked = await notifications.syncPushReceipts();
+      if (checked) console.log('[jobs] push receipts reconciled: %d', checked);
+    },
+  },
+  {
     name: 'analytics-snapshots',
     // 00:20 daily: fold yesterday's events into the daily roll-ups the premium
     // dashboards read (V3 §29). Idempotent - it replaces the day it covers.

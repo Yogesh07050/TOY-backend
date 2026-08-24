@@ -441,7 +441,18 @@ CREATE TABLE IF NOT EXISTS notifications (
   message     VARCHAR(1000)           DEFAULT NULL,
   entity_type VARCHAR(60)             DEFAULT NULL,
   entity_id   BIGINT UNSIGNED         DEFAULT NULL,
+  -- Where tapping this notification lands (Push §26). Stored rather than
+  -- re-derived on the client so the destination a customer taps months later
+  -- is the one that was decided when the notification was created.
+  deep_link   VARCHAR(255)            DEFAULT NULL,
+  -- Rolled up from `push_tickets` (Push §31). 'none' means in-app only: the
+  -- recipient had no registered device, or push was switched off.
+  push_state  ENUM('none','queued','sent','delivered','failed','cancelled','expired')
+              NOT NULL DEFAULT 'none',
   is_read     TINYINT(1)      NOT NULL DEFAULT 0,
+  -- OPENED in the lifecycle: the customer actually tapped through, which is a
+  -- stronger signal than merely having read the row in the feed.
+  opened_at   DATETIME                DEFAULT NULL,
   created_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   KEY idx_notif_user (user_id, is_read, created_at),
@@ -455,11 +466,83 @@ CREATE TABLE IF NOT EXISTS notification_preferences (
   followed_category_offers TINYINT(1) NOT NULL DEFAULT 1,
   nearby_offers        TINYINT(1) NOT NULL DEFAULT 1,
   favorite_expiring    TINYINT(1) NOT NULL DEFAULT 1,
+  saved_service_offer_expiring TINYINT(1) NOT NULL DEFAULT 1,
   offer_updates        TINYINT(1) NOT NULL DEFAULT 1,
+  -- Master switch for push, alongside the existing one for email. Off does not
+  -- silence the in-app feed - the notification is still created and still
+  -- appears in the notification centre, it just is not pushed to a device.
+  push_enabled         TINYINT(1) NOT NULL DEFAULT 1,
+  -- Transactional confirmations (Push §16-§18). Default on; a customer who
+  -- claimed an offer expects the code to arrive.
+  claim_updates        TINYINT(1) NOT NULL DEFAULT 1,
+  redemption_updates   TINYINT(1) NOT NULL DEFAULT 1,
+  booking_updates      TINYINT(1) NOT NULL DEFAULT 1,
   admin_announcements  TINYINT(1) NOT NULL DEFAULT 1,
   updated_at           DATETIME   NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (user_id),
   CONSTRAINT fk_np_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------
+-- Push delivery (Push §37). The in-app feed above is the record of truth;
+-- these two tables are only about getting that same record onto a phone.
+-- ---------------------------------------------------------------------
+
+-- One row per device that can receive a push. A device is identified by its
+-- transport token rather than by its owner: reinstalling issues a new token,
+-- and a phone that signs in as a second user must not inherit the first
+-- account's notifications - so the token is unique and simply carries
+-- whichever user registered it last.
+CREATE TABLE IF NOT EXISTS push_devices (
+  id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  user_id       BIGINT UNSIGNED NOT NULL,
+  -- Expo tokens are ExponentPushToken[...]; sized for the longer raw FCM and
+  -- APNs tokens a future transport would put here instead.
+  token         VARCHAR(255)    NOT NULL,
+  transport     ENUM('expo','fcm','apns') NOT NULL DEFAULT 'expo',
+  platform      VARCHAR(40)             DEFAULT NULL,
+  device_name   VARCHAR(120)            DEFAULT NULL,
+  -- Deactivated rather than deleted when the transport reports the token is
+  -- dead, so a reinstall that re-registers reuses one stable row.
+  is_active     TINYINT(1)      NOT NULL DEFAULT 1,
+  failure_count INT UNSIGNED    NOT NULL DEFAULT 0,
+  last_seen_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  created_at    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_push_token (token),
+  KEY idx_push_user (user_id, is_active),
+  CONSTRAINT fk_pd_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- One row per (notification, device) handed to the transport. A single
+-- notification fans out to every device its owner has, and each copy can
+-- succeed or fail on its own - which is why delivery state lives here and not
+-- as one column on `notifications`. Feeds the SENT -> DELIVERED / FAILED half
+-- of the lifecycle (Push §31) and the per-campaign counts (Push §32).
+CREATE TABLE IF NOT EXISTS push_tickets (
+  id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  notification_id BIGINT UNSIGNED NOT NULL,
+  -- Nullable, and detached rather than deleted when its device goes: signing
+  -- out unregisters the device, and that must not erase the delivery record
+  -- of pushes already sent to it - nor orphan a ticket still waiting on a
+  -- receipt. The row outlives the device; only the ability to retire that
+  -- device from a late failure is lost, which is moot once it is gone.
+  device_id       BIGINT UNSIGNED         DEFAULT NULL,
+  -- Expo's receipt id. Null when the send itself failed outright, in which
+  -- case there is nothing to look up later.
+  ticket_id       VARCHAR(64)             DEFAULT NULL,
+  status          ENUM('queued','sent','delivered','failed') NOT NULL DEFAULT 'queued',
+  error_code      VARCHAR(60)             DEFAULT NULL,
+  sent_at         DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  -- Set once the receipt has been read, so the sweep never re-checks a ticket.
+  checked_at      DATETIME                DEFAULT NULL,
+  PRIMARY KEY (id),
+  KEY idx_pt_pending (status, checked_at, sent_at),
+  KEY idx_pt_notification (notification_id),
+  UNIQUE KEY uq_pt_ticket (ticket_id),
+  CONSTRAINT fk_pt_notification FOREIGN KEY (notification_id) REFERENCES notifications (id) ON DELETE CASCADE,
+  CONSTRAINT fk_pt_device FOREIGN KEY (device_id) REFERENCES push_devices (id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ---------------------------------------------------------------------

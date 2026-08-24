@@ -4,6 +4,7 @@ const { query, queryOne, execute, rawQuery } = require('../db/pool');
 const env = require('../config/env');
 const mailer = require('../utils/mailer');
 const geo = require('../utils/geo');
+const push = require('./push');
 
 /**
  * Notification fan-out (§24). Every notification is persisted in-app; an email
@@ -29,7 +30,63 @@ const PREFERENCE_COLUMN = {
   OFFER_PUBLISHED: 'admin_announcements',
   SUBSCRIPTION_BILLING: 'admin_announcements',
   FEATURE_ACCESS: 'admin_announcements',
+
+  // Transactional confirmations (Push §16-§18).
+  OFFER_CLAIMED: 'claim_updates',
+  SERVICE_OFFER_CLAIMED: 'claim_updates',
+  OFFER_REDEEMED: 'redemption_updates',
+  SERVICE_OFFER_REDEEMED: 'redemption_updates',
+  BOOKING_CREATED: 'booking_updates',
+  BOOKING_UPDATED: 'booking_updates',
+  BOOKING_CANCELLED: 'booking_updates',
 };
+
+/**
+ * Where tapping each notification should land (Push §26).
+ *
+ * Keyed by `entityType` rather than by notification type: several types point
+ * at the same screen, and the entity is what actually identifies the
+ * destination. Anything unmapped falls back to the notification centre, which
+ * is always a valid place to arrive.
+ */
+const DEEP_LINK_PATHS = {
+  offer: (id) => `offer/${id}`,
+  // A service offer has no page of its own - its parent service is the screen,
+  // which is why the expiry sweep already stores the service id here.
+  service_offer: (id) => `service/${id}`,
+  service: (id) => `service/${id}`,
+  shop: (id) => `shop/${id}`,
+};
+
+/**
+ * Builds the `offersapp://...` URL stored on the notification row.
+ *
+ * Claims, redemptions and bookings are deliberately absent from the table
+ * above: their notifications reference a claim or booking record, but the app
+ * has no screen that opens one by id, so deriving `claim/17` would produce a
+ * link that matches no route and quietly does nothing. Those callers pass an
+ * explicit `deepLink` to the listing the record belongs to instead - which is
+ * a real screen, and the one a customer wants anyway.
+ */
+function deepLinkFor(entityType, entityId) {
+  const path = entityId != null && DEEP_LINK_PATHS[entityType]?.(entityId);
+  return `${env.appScheme}://${path || 'notifications'}`;
+}
+
+/**
+ * Transactional notifications are the ones a customer is waiting for, so they
+ * are worth waking the device for; everything else rides at normal priority.
+ */
+const HIGH_PRIORITY_TYPES = new Set([
+  'OFFER_CLAIMED',
+  'SERVICE_OFFER_CLAIMED',
+  'OFFER_REDEEMED',
+  'SERVICE_OFFER_REDEEMED',
+  'BOOKING_CREATED',
+  'BOOKING_UPDATED',
+  'BOOKING_CANCELLED',
+  'SUBSCRIPTION_BILLING',
+]);
 
 async function loadOffer(offerId) {
   return queryOne(
@@ -42,10 +99,17 @@ async function loadOffer(offerId) {
 }
 
 /**
- * Inserts notification rows and sends the matching emails.
+ * Inserts notification rows, sends the matching emails, and pushes to every
+ * device the allowed recipients have registered.
+ *
+ * The in-app row is the record of truth (Push §29): it is written first and
+ * unconditionally, so a customer who had push switched off, whose token had
+ * expired, or who was simply offline still finds the notification waiting in
+ * the notification centre. Email and push are both best-effort layers on top.
+ *
  * @param {Array<{id:number,name:string,email:string}>} recipients
  */
-async function dispatch(recipients, { type, title, message, entityType, entityId, email }) {
+async function dispatch(recipients, { type, title, message, entityType, entityId, email, deepLink }) {
   if (!recipients.length) return 0;
 
   const column = PREFERENCE_COLUMN[type];
@@ -54,7 +118,7 @@ async function dispatch(recipients, { type, title, message, entityType, entityId
 
   // Users without a preferences row fall back to "everything enabled".
   const preferences = await rawQuery(
-    `SELECT user_id, email_enabled, ${column || 'admin_announcements'} AS allowed
+    `SELECT user_id, email_enabled, push_enabled, ${column || 'admin_announcements'} AS allowed
        FROM notification_preferences WHERE user_id IN (${placeholders})`,
     ids,
   );
@@ -66,6 +130,9 @@ async function dispatch(recipients, { type, title, message, entityType, entityId
   });
   if (!allowed.length) return 0;
 
+  // The entity is the right default destination for most types; the ones
+  // whose record has no screen of its own say where to go instead.
+  const destination = deepLink ?? deepLinkFor(entityType, entityId);
   const values = allowed.flatMap((recipient) => [
     recipient.id,
     type,
@@ -73,10 +140,11 @@ async function dispatch(recipients, { type, title, message, entityType, entityId
     message,
     entityType,
     entityId,
+    destination,
   ]);
-  await rawQuery(
-    `INSERT INTO notifications (user_id, type, title, message, entity_type, entity_id)
-     VALUES ${allowed.map(() => '(?, ?, ?, ?, ?, ?)').join(', ')}`,
+  const result = await rawQuery(
+    `INSERT INTO notifications (user_id, type, title, message, entity_type, entity_id, deep_link)
+     VALUES ${allowed.map(() => '(?, ?, ?, ?, ?, ?, ?)').join(', ')}`,
     values,
   );
 
@@ -88,7 +156,153 @@ async function dispatch(recipients, { type, title, message, entityType, entityId
     );
   }
 
+  // Push is the one layer allowed to fail quietly: the notification already
+  // exists, and a dead transport must not turn into a failed claim or a failed
+  // offer publish for the caller upstream.
+  const pushable = allowed.filter((recipient) => byUser.get(recipient.id)?.push_enabled !== 0);
+  await fanOutPush(result, allowed.length, pushable, { type, title, message, deepLink: destination, entityType, entityId })
+    .catch((error) => console.error('[push] fan-out failed for %s: %s', type, error.message));
+
   return allowed.length;
+}
+
+/**
+ * Sends the just-inserted notifications to their owners' devices.
+ *
+ * The insert above was one multi-row statement, so InnoDB allocated a
+ * contiguous block of auto-increment ids starting at `insertId`. Reading the
+ * block back is what pairs each notification id to the user it belongs to,
+ * which the ticket rows need - a single notification fans out to every device
+ * that user has, and each copy succeeds or fails independently.
+ */
+async function fanOutPush(insertResult, insertedCount, recipients, { type, title, message, deepLink, entityType, entityId }) {
+  if (!recipients.length || !push.isConfigured() || !insertResult?.insertId) return;
+
+  const firstId = Number(insertResult.insertId);
+  const [inserted, devices] = await Promise.all([
+    rawQuery(
+      'SELECT id, user_id FROM notifications WHERE id BETWEEN ? AND ? AND type = ?',
+      [firstId, firstId + insertedCount - 1, type],
+    ),
+    rawQuery(
+      `SELECT id, user_id, token FROM push_devices
+        WHERE is_active = 1 AND user_id IN (${recipients.map(() => '?').join(',')})`,
+      recipients.map((recipient) => recipient.id),
+    ),
+  ]);
+  if (!devices.length) return;
+
+  const notificationByUser = new Map(inserted.map((row) => [Number(row.user_id), Number(row.id)]));
+
+  const targets = [];
+  const messages = [];
+  for (const device of devices) {
+    const notificationId = notificationByUser.get(Number(device.user_id));
+    // A device whose owner was filtered out by preferences has no row here.
+    if (!notificationId || !push.isExpoToken(device.token)) continue;
+
+    targets.push({ deviceId: Number(device.id), notificationId });
+    messages.push({
+      to: device.token,
+      title,
+      body: message ?? '',
+      sound: 'default',
+      channelId: 'default',
+      priority: HIGH_PRIORITY_TYPES.has(type) ? 'high' : 'default',
+      // Read by the app's tap handler to open the right screen (Push §27).
+      // Kept small and flat - Expo caps the whole payload at 4 KiB.
+      data: { notificationId, type, entityType, entityId, deepLink },
+    });
+  }
+  if (!messages.length) return;
+
+  const results = await push.send(messages);
+  await recordTickets(targets, results);
+}
+
+/**
+ * Persists one ticket row per attempted device and rolls the outcome up onto
+ * the notification, giving the QUEUED -> SENT / FAILED transitions of the
+ * lifecycle (Push §31). Devices the transport rejected outright are retired
+ * here so the next send does not waste a slot on them.
+ */
+async function recordTickets(targets, results) {
+  const rows = targets.map((target, index) => {
+    const result = results[index] ?? { ok: false, ticketId: null, error: 'NoResult' };
+    return { ...target, ...result };
+  });
+
+  await rawQuery(
+    `INSERT INTO push_tickets (notification_id, device_id, ticket_id, status, error_code)
+     VALUES ${rows.map(() => '(?, ?, ?, ?, ?)').join(', ')}`,
+    rows.flatMap((row) => [
+      row.notificationId,
+      row.deviceId,
+      row.ticketId,
+      row.ok ? 'sent' : 'failed',
+      row.ok ? null : row.error,
+    ]),
+  );
+
+  const sentIds = [...new Set(rows.filter((row) => row.ok).map((row) => row.notificationId))];
+  const failedIds = [...new Set(rows.filter((row) => !row.ok).map((row) => row.notificationId))];
+
+  // A notification counts as sent if it reached at least one of its devices;
+  // only one that reached none of them is a failure.
+  if (sentIds.length) {
+    await rawQuery(
+      `UPDATE notifications SET push_state = 'sent' WHERE id IN (${sentIds.map(() => '?').join(',')})`,
+      sentIds,
+    );
+  }
+  const whollyFailed = failedIds.filter((id) => !sentIds.includes(id));
+  if (whollyFailed.length) {
+    await rawQuery(
+      `UPDATE notifications SET push_state = 'failed' WHERE id IN (${whollyFailed.map(() => '?').join(',')})`,
+      whollyFailed,
+    );
+  }
+
+  await retireFailedDevices(rows);
+}
+
+/**
+ * A token that the transport says is gone is deactivated at once; anything
+ * else (a timeout, a rate limit) only counts against a failure budget, so one
+ * bad afternoon does not unsubscribe a working phone. Any success clears the
+ * count back to zero.
+ */
+async function retireFailedDevices(rows) {
+  // A ticket can outlive its device - signing out unregisters it while a push
+  // may still be awaiting a receipt - so entries with no device left are
+  // simply nothing to retire.
+  const live = rows.filter((row) => row.deviceId);
+  const fatal = live.filter((row) => !row.ok && push.isFatalTokenError(row.error)).map((row) => row.deviceId);
+  const soft = live.filter((row) => !row.ok && !push.isFatalTokenError(row.error)).map((row) => row.deviceId);
+  const healthy = live.filter((row) => row.ok).map((row) => row.deviceId);
+
+  if (fatal.length) {
+    await rawQuery(
+      `UPDATE push_devices SET is_active = 0 WHERE id IN (${fatal.map(() => '?').join(',')})`,
+      fatal,
+    );
+  }
+  if (soft.length) {
+    await rawQuery(
+      `UPDATE push_devices
+          SET failure_count = failure_count + 1,
+              is_active = IF(failure_count + 1 >= ?, 0, is_active)
+        WHERE id IN (${soft.map(() => '?').join(',')})`,
+      [env.push.maxDeviceFailures, ...soft],
+    );
+  }
+  if (healthy.length) {
+    await rawQuery(
+      `UPDATE push_devices SET failure_count = 0, last_seen_at = NOW()
+        WHERE id IN (${healthy.map(() => '?').join(',')}) AND failure_count > 0`,
+      healthy,
+    );
+  }
 }
 
 /** Followers of the shop, followers of the category, and nearby customers. */
@@ -427,6 +641,247 @@ async function notifyExpiringSaved(kind) {
 const notifyExpiringOffers = () => notifyExpiringSaved('offer');
 const notifyExpiringServiceOffers = () => notifyExpiringSaved('service_offer');
 
+/**
+ * Reconciles delivery receipts (Push §31).
+ *
+ * A ticket only means Expo accepted the message. The receipt, available a few
+ * minutes later, is what Google and Apple actually did with it - and is where
+ * a token that has been uninstalled finally shows up as `DeviceNotRegistered`.
+ *
+ * Expo drops receipts after 24 hours, so the window is bounded on both sides:
+ * young enough to still exist, old enough to have been resolved. Anything that
+ * ages out keeps its 'sent' status, which is the honest answer - it was sent,
+ * and delivery was never confirmed either way.
+ */
+async function syncPushReceipts() {
+  const pending = await query(
+    `SELECT id, ticket_id, device_id, notification_id FROM push_tickets
+      WHERE status = 'sent' AND checked_at IS NULL AND ticket_id IS NOT NULL
+        AND sent_at <= DATE_SUB(NOW(), INTERVAL 15 MINUTE)
+        AND sent_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+      ORDER BY sent_at LIMIT 1000`,
+  );
+  if (!pending.length) return 0;
+
+  const receipts = await push.getReceipts(pending.map((row) => row.ticket_id));
+  const resolved = pending
+    .map((row) => ({ row, receipt: receipts.get(row.ticket_id) }))
+    .filter((entry) => entry.receipt);
+  if (!resolved.length) return 0;
+
+  const delivered = resolved.filter((entry) => entry.receipt.ok);
+  const failed = resolved.filter((entry) => !entry.receipt.ok);
+
+  if (delivered.length) {
+    const ids = delivered.map((entry) => entry.row.id);
+    await rawQuery(
+      `UPDATE push_tickets SET status = 'delivered', checked_at = NOW()
+        WHERE id IN (${ids.map(() => '?').join(',')})`,
+      ids,
+    );
+    const notificationIds = [...new Set(delivered.map((entry) => Number(entry.row.notification_id)))];
+    await rawQuery(
+      `UPDATE notifications SET push_state = 'delivered'
+        WHERE id IN (${notificationIds.map(() => '?').join(',')}) AND push_state = 'sent'`,
+      notificationIds,
+    );
+  }
+
+  for (const entry of failed) {
+    await execute(
+      "UPDATE push_tickets SET status = 'failed', error_code = ?, checked_at = NOW() WHERE id = ?",
+      [entry.receipt.error, entry.row.id],
+    );
+  }
+
+  // Same retirement rule as at send time, applied to the errors that only
+  // surface this late.
+  await retireFailedDevices(
+    failed.map((entry) => ({
+      ok: false,
+      error: entry.receipt.error,
+      deviceId: entry.row.device_id === null ? null : Number(entry.row.device_id),
+    })),
+  );
+
+  return resolved.length;
+}
+
+// ---- Transactional customer notifications (Push §16-§18) -------------------
+
+/**
+ * Claim confirmation. The customer is told the code they now need to show at
+ * the counter, so this is the one notification whose body carries the payload
+ * rather than just a pointer to it.
+ */
+async function notifyOfferClaimed(claimId) {
+  const claim = await queryOne(
+    `SELECT c.id, c.code, c.offer_id, u.id AS user_id, u.name, u.email, o.title, s.name AS shop_name
+       FROM offer_claims c
+       JOIN offers o ON o.id = c.offer_id
+       JOIN shops s ON s.id = o.shop_id
+       JOIN users u ON u.id = c.user_id AND u.status = 'active'
+      WHERE c.id = ?`,
+    [claimId],
+  );
+  if (!claim) return 0;
+
+  return dispatch([{ id: Number(claim.user_id), name: claim.name, email: claim.email }], {
+    type: 'OFFER_CLAIMED',
+    title: 'Offer claimed successfully',
+    message: `${claim.shop_name} - ${claim.title}. Claim code: ${claim.code}. Show this at the shop.`,
+    entityType: 'offer_claim',
+    entityId: Number(claim.id),
+    // The claim has no screen of its own; the offer it belongs to is where the
+    // customer can see it again.
+    deepLink: deepLinkFor('offer', Number(claim.offer_id)),
+  });
+}
+
+/** Redemption confirmation, sent after the merchant verifies the code. */
+async function notifyOfferRedeemed(claimId) {
+  const claim = await queryOne(
+    `SELECT c.id, c.offer_id, u.id AS user_id, u.name, u.email, o.title, s.name AS shop_name
+       FROM offer_claims c
+       JOIN offers o ON o.id = c.offer_id
+       JOIN shops s ON s.id = o.shop_id
+       JOIN users u ON u.id = c.user_id AND u.status = 'active'
+      WHERE c.id = ?`,
+    [claimId],
+  );
+  if (!claim) return 0;
+
+  return dispatch([{ id: Number(claim.user_id), name: claim.name, email: claim.email }], {
+    type: 'OFFER_REDEEMED',
+    title: 'Offer redeemed',
+    message: `Your ${claim.title} offer at ${claim.shop_name} has been successfully redeemed.`,
+    entityType: 'offer_claim',
+    entityId: Number(claim.id),
+    deepLink: deepLinkFor('offer', Number(claim.offer_id)),
+  });
+}
+
+async function notifyServiceOfferClaimed(claimId) {
+  const claim = await queryOne(
+    `SELECT c.id, c.code, sv.id AS service_id, u.id AS user_id, u.name, u.email,
+            sv.name AS service_name, s.name AS shop_name
+       FROM service_offer_claims c
+       JOIN service_offers so ON so.id = c.service_offer_id
+       JOIN services sv ON sv.id = so.service_id
+       JOIN shops s ON s.id = sv.shop_id
+       JOIN users u ON u.id = c.user_id AND u.status = 'active'
+      WHERE c.id = ?`,
+    [claimId],
+  );
+  if (!claim) return 0;
+
+  return dispatch([{ id: Number(claim.user_id), name: claim.name, email: claim.email }], {
+    type: 'SERVICE_OFFER_CLAIMED',
+    title: 'Service offer claimed successfully',
+    message: `${claim.shop_name} - ${claim.service_name}. Claim code: ${claim.code}.`,
+    entityType: 'service_offer_claim',
+    entityId: Number(claim.id),
+    deepLink: deepLinkFor('service', Number(claim.service_id)),
+  });
+}
+
+async function notifyServiceOfferRedeemed(claimId) {
+  const claim = await queryOne(
+    `SELECT c.id, sv.id AS service_id, u.id AS user_id, u.name, u.email,
+            sv.name AS service_name, s.name AS shop_name
+       FROM service_offer_claims c
+       JOIN service_offers so ON so.id = c.service_offer_id
+       JOIN services sv ON sv.id = so.service_id
+       JOIN shops s ON s.id = sv.shop_id
+       JOIN users u ON u.id = c.user_id AND u.status = 'active'
+      WHERE c.id = ?`,
+    [claimId],
+  );
+  if (!claim) return 0;
+
+  return dispatch([{ id: Number(claim.user_id), name: claim.name, email: claim.email }], {
+    type: 'SERVICE_OFFER_REDEEMED',
+    title: 'Service offer redeemed',
+    message: `Your ${claim.service_name} offer at ${claim.shop_name} has been successfully redeemed.`,
+    entityType: 'service_offer_claim',
+    entityId: Number(claim.id),
+    deepLink: deepLinkFor('service', Number(claim.service_id)),
+  });
+}
+
+/**
+ * Booking notifications (Push §18). One function covers created, updated and
+ * cancelled: the audience, the lookup and the destination are identical and
+ * only the wording differs, so the alternative would be three copies of the
+ * same query.
+ */
+const BOOKING_MESSAGES = {
+  BOOKING_CREATED: (booking) => ({
+    title: 'Booking confirmed',
+    message: `${booking.service_name} at ${booking.shop_name}${booking.when ? ` - ${booking.when}` : ''}.`,
+  }),
+  BOOKING_UPDATED: (booking) => ({
+    title: 'Booking updated',
+    message: `Your ${booking.service_name} booking with ${booking.shop_name} has been updated${
+      booking.when ? ` to ${booking.when}` : ''
+    }.`,
+  }),
+  BOOKING_CANCELLED: (booking) => ({
+    title: 'Booking cancelled',
+    message: `Your ${booking.service_name} booking with ${booking.shop_name} has been cancelled.`,
+  }),
+};
+
+async function notifyBooking(bookingId, type) {
+  const template = BOOKING_MESSAGES[type];
+  if (!template) throw new Error(`Unknown booking notification type: ${type}`);
+
+  const booking = await queryOne(
+    `SELECT b.id, b.requested_at, b.service_id, u.id AS user_id, u.name, u.email,
+            sv.name AS service_name, s.name AS shop_name
+       FROM service_bookings b
+       JOIN services sv ON sv.id = b.service_id
+       JOIN shops s ON s.id = sv.shop_id
+       JOIN users u ON u.id = b.user_id AND u.status = 'active'
+      WHERE b.id = ?`,
+    [bookingId],
+  );
+  if (!booking) return 0;
+
+  const when = booking.requested_at
+    ? new Date(booking.requested_at).toLocaleString('en-IN', {
+        dateStyle: 'medium',
+        timeStyle: 'short',
+        timeZone: 'Asia/Kolkata',
+      })
+    : null;
+
+  const { title, message } = template({ ...booking, when });
+  return dispatch([{ id: Number(booking.user_id), name: booking.name, email: booking.email }], {
+    type,
+    title,
+    message,
+    entityType: 'service_booking',
+    entityId: Number(booking.id),
+    deepLink: deepLinkFor('service', Number(booking.service_id)),
+  });
+}
+
+/** Maps a booking's new status onto the notification it should produce. */
+const BOOKING_STATUS_TYPES = {
+  confirmed: 'BOOKING_UPDATED',
+  completed: 'BOOKING_UPDATED',
+  cancelled: 'BOOKING_CANCELLED',
+};
+
+async function notifyBookingStatusChanged(bookingId, status) {
+  const type = BOOKING_STATUS_TYPES[status];
+  // 'requested' is the state a booking is created in - the confirmation for it
+  // was already sent by notifyBooking(..., 'BOOKING_CREATED').
+  if (!type) return 0;
+  return notifyBooking(bookingId, type);
+}
+
 /** Broadcast used by Super Admins for platform-wide announcements. */
 async function announce({ title, message, audience = 'all' }) {
   const filters = {
@@ -446,12 +901,22 @@ async function announce({ title, message, audience = 'all' }) {
   });
 }
 
-/** Removes read notifications older than 60 days. */
+/**
+ * Removes read notifications older than 60 days, and the delivery bookkeeping
+ * that outlived its usefulness.
+ *
+ * Tickets belonging to a pruned notification go with it via the foreign key;
+ * this only has to catch tickets whose notification is still around - an
+ * unread one can sit in the feed indefinitely, but its receipt stopped being
+ * answerable after 24 hours and stops being interesting long before 30 days.
+ */
 async function pruneOld() {
-  const result = await execute(
-    'DELETE FROM notifications WHERE is_read = 1 AND created_at < DATE_SUB(NOW(), INTERVAL 60 DAY)',
-  );
-  return result.affectedRows;
+  const [notifications, tickets] = await Promise.all([
+    execute('DELETE FROM notifications WHERE is_read = 1 AND created_at < DATE_SUB(NOW(), INTERVAL 60 DAY)'),
+    execute('DELETE FROM push_tickets WHERE sent_at < DATE_SUB(NOW(), INTERVAL 30 DAY)'),
+  ]);
+  if (tickets.affectedRows) console.log('[notifications] pruned %d push tickets', tickets.affectedRows);
+  return notifications.affectedRows;
 }
 
 module.exports = {
@@ -462,7 +927,15 @@ module.exports = {
   notifyExpiringOffers,
   notifyExpiringServiceOffers,
   notifyExpiringSaved,
+  notifyOfferClaimed,
+  notifyOfferRedeemed,
+  notifyServiceOfferClaimed,
+  notifyServiceOfferRedeemed,
+  notifyBooking,
+  notifyBookingStatusChanged,
+  syncPushReceipts,
   announce,
   pruneOld,
   dispatch,
+  deepLinkFor,
 };

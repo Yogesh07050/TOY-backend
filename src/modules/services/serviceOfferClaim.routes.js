@@ -12,6 +12,7 @@ const { authenticate } = require('../../middleware/auth');
 const { requirePermission } = require('../../middleware/authorize');
 const accessControl = require('../../services/accessControl');
 const analyticsEvents = require('../../services/analyticsEvents');
+const notifications = require('../../services/notifications');
 const { limitOffset, paginationSchema } = require('../../utils/pagination');
 const { ok, created, paginated } = require('../../utils/respond');
 
@@ -130,6 +131,12 @@ router.post(
         shopId: offer.shop_id,
         userId: req.user.id,
       });
+
+      // Same confirmation as a product-offer claim (Push §16), for the
+      // parallel services domain.
+      notifications
+        .notifyServiceOfferClaimed(claimId)
+        .catch((error) => console.error('[notifications] service claim confirmation failed: %s', error.message));
     }
 
     const rows = await rawQuery(`${CLAIM_SELECT} WHERE c.id = ?`, [claimId]);
@@ -189,6 +196,10 @@ router.post(
       entityId: Number(claim.id),
       newValue: { serviceOfferId: Number(claim.service_offer_id), code: claim.code },
     });
+
+    notifications
+      .notifyServiceOfferRedeemed(claim.id)
+      .catch((error) => console.error('[notifications] service redemption notice failed: %s', error.message));
 
     const rows = await rawQuery(`${CLAIM_SELECT} WHERE c.id = ?`, [claim.id]);
     ok(res, mapClaim(rows[0]));

@@ -89,6 +89,32 @@ const COLUMN_PATCHES = [
     sql: "ALTER TABLE notification_preferences ADD COLUMN saved_service_offer_expiring TINYINT(1) NOT NULL DEFAULT 1 AFTER favorite_expiring",
   },
 
+  // ---- Push notifications --------------------------------------------------
+  // `push_devices` and `push_tickets` are new tables, so schema.sql creates
+  // them on any install; only the columns bolted onto the two pre-existing
+  // notification tables need patching here.
+  {
+    table: 'notification_preferences',
+    column: 'push_enabled',
+    sql: 'ALTER TABLE notification_preferences ADD COLUMN push_enabled TINYINT(1) NOT NULL DEFAULT 1 AFTER offer_updates',
+    after: [
+      'ALTER TABLE notification_preferences ADD COLUMN claim_updates TINYINT(1) NOT NULL DEFAULT 1 AFTER push_enabled',
+      'ALTER TABLE notification_preferences ADD COLUMN redemption_updates TINYINT(1) NOT NULL DEFAULT 1 AFTER claim_updates',
+      'ALTER TABLE notification_preferences ADD COLUMN booking_updates TINYINT(1) NOT NULL DEFAULT 1 AFTER redemption_updates',
+    ],
+  },
+  {
+    table: 'notifications',
+    column: 'deep_link',
+    sql: 'ALTER TABLE notifications ADD COLUMN deep_link VARCHAR(255) DEFAULT NULL AFTER entity_id',
+    after: [
+      `ALTER TABLE notifications ADD COLUMN push_state
+         ENUM('none','queued','sent','delivered','failed','cancelled','expired')
+         NOT NULL DEFAULT 'none' AFTER deep_link`,
+      'ALTER TABLE notifications ADD COLUMN opened_at DATETIME DEFAULT NULL AFTER is_read',
+    ],
+  },
+
   // ---- V3 Razorpay payments -----------------------------------------------
   // Gateway bookkeeping on the existing one-row-per-shop subscription.
   {
@@ -242,6 +268,29 @@ const STATEMENT_PATCHES = [
           [entry.featureKey, entry.name, entry.description, entry.category],
         );
       }
+    },
+  },
+  {
+    name: 'push_tickets.device_id detaches instead of cascading',
+    // The first cut of this table cascaded, so signing out - which unregisters
+    // the device - deleted the delivery history of every push already sent to
+    // it. Rebuilt as SET NULL so the ticket outlives the device.
+    check: async (connection, dbName) => {
+      const [rows] = await connection.query(
+        `SELECT 1 FROM information_schema.REFERENTIAL_CONSTRAINTS
+          WHERE CONSTRAINT_SCHEMA = ? AND TABLE_NAME = 'push_tickets'
+            AND CONSTRAINT_NAME = 'fk_pt_device' AND DELETE_RULE = 'CASCADE' LIMIT 1`,
+        [dbName],
+      );
+      return rows.length > 0;
+    },
+    run: async (connection) => {
+      await connection.query('ALTER TABLE push_tickets DROP FOREIGN KEY fk_pt_device');
+      await connection.query('ALTER TABLE push_tickets MODIFY device_id BIGINT UNSIGNED DEFAULT NULL');
+      await connection.query(
+        `ALTER TABLE push_tickets ADD CONSTRAINT fk_pt_device FOREIGN KEY (device_id)
+           REFERENCES push_devices (id) ON DELETE SET NULL`,
+      );
     },
   },
   {

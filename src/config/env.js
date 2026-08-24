@@ -28,6 +28,12 @@ const env = {
   corsOrigins: list(process.env.CORS_ORIGINS, ['http://localhost:4200']),
   publicApiUrl: (process.env.PUBLIC_API_URL || 'http://localhost:3000').replace(/\/$/, ''),
   appUrl: (process.env.APP_URL || 'http://localhost:4200').replace(/\/$/, ''),
+  /**
+   * Custom scheme the mobile app registers (`app.json` -> expo.scheme). Every
+   * notification stores a deep link built from this, so tapping one opens the
+   * screen it names instead of wherever the app was last (Push §26, §27).
+   */
+  appScheme: process.env.MOBILE_APP_SCHEME || 'offersapp',
 
   db: {
     host: process.env.DB_HOST || '127.0.0.1',
@@ -127,6 +133,28 @@ const env = {
     },
     /** Billing cycles a mandate is authorised for before it must be renewed. */
     totalCount: int(process.env.RAZORPAY_TOTAL_COUNT, 120),
+  },
+
+  /**
+   * Mobile push (Push §37). The app is a managed Expo build, so the default
+   * transport is Expo's relay: it needs no FCM/APNs credentials and accepts
+   * the ExponentPushToken the client already produces.
+   *
+   * `enabled` false leaves the whole in-app notification system working and
+   * only skips the device fan-out - which is what a dev machine without
+   * outbound network access wants, and what the mail config does already.
+   */
+  push: {
+    enabled: bool(process.env.PUSH_ENABLED, true),
+    transport: process.env.PUSH_TRANSPORT || 'expo',
+    expoApiBase: (process.env.EXPO_PUSH_API_BASE || 'https://exp.host/--/api/v2/push').replace(/\/$/, ''),
+    /** Only needed once "push security" is switched on for the Expo project. */
+    expoAccessToken: process.env.EXPO_ACCESS_TOKEN || '',
+    /** Expo accepts at most 100 messages per request and 1000 receipt ids. */
+    batchSize: int(process.env.PUSH_BATCH_SIZE, 100),
+    requestTimeoutMs: int(process.env.PUSH_TIMEOUT_MS, 15000),
+    /** Consecutive transport failures before a device token is retired. */
+    maxDeviceFailures: int(process.env.PUSH_MAX_DEVICE_FAILURES, 5),
   },
 
   billing: {
