@@ -2,6 +2,7 @@
 
 const { z } = require('zod');
 const { paginationSchema } = require('../../utils/pagination');
+const { queryBoolean } = require('../../utils/queryBoolean');
 const { APPLICABILITY } = require('../offers/offer.schema');
 
 const PRICING_TYPES = ['fixed', 'starting_from', 'price_on_enquiry'];
@@ -46,14 +47,14 @@ const listServicesSchema = z
     radius: z.coerce.number().min(0.1, 'Radius must be positive').max(500).optional(),
     pricingType: z.enum(PRICING_TYPES).optional(),
     bookingType: z.enum(BOOKING_TYPES).optional(),
-    homeService: z.coerce.boolean().optional(),
-    hasOffer: z.coerce.boolean().optional(),
+    homeService: queryBoolean(),
+    hasOffer: queryBoolean(),
     status: z.enum([...STATUSES, 'all']).optional(),
     startDate: z.coerce.date().optional(),
     endDate: z.coerce.date().optional(),
-    saved: z.coerce.boolean().optional(),
+    saved: queryBoolean(),
     /** Management view: returns non-active services, scoped to the caller's shops. */
-    manage: z.coerce.boolean().optional(),
+    manage: queryBoolean(),
     sort: z.enum(SORTS).default('newest'),
   })
   .refine((data) => !(data.radius && (data.latitude === undefined || data.longitude === undefined)), {

@@ -2,6 +2,7 @@
 
 const { z } = require('zod');
 const { paginationSchema } = require('../../utils/pagination');
+const { queryBoolean } = require('../../utils/queryBoolean');
 
 const OFFER_TYPES = ['percentage', 'flat', 'price_drop', 'other'];
 const DISCOUNT_TYPES = ['percentage', 'flat', 'none'];
@@ -15,7 +16,7 @@ const listServiceOffersSchema = z.object({
   ...paginationSchema,
   status: z.enum([...STATUSES, 'all']).optional(),
   /** Management view: returns non-active offers, scoped by the caller's permission check. */
-  manage: z.coerce.boolean().optional(),
+  manage: queryBoolean(),
 });
 
 const serviceOfferBody = z

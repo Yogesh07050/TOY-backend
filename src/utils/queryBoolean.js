@@ -15,6 +15,12 @@ const { z } = require('zod');
  * This reads the word rather than the truthiness. A real boolean is passed
  * through unchanged, so the same helper works for a JSON body.
  *
+ * Use it for anything parsed out of `req.query`. Request bodies reach us as
+ * JSON, where a boolean arrives as a boolean and `z.coerce.boolean()` is
+ * harmless - that is why the body schemas still use it. If a body ever starts
+ * arriving as multipart or urlencoded, its booleans become strings too and
+ * they will need this as well.
+ *
  * @param {boolean} [defaultValue] applied when the parameter is absent.
  */
 const TRUE_WORDS = new Set(['true', '1', 'yes', 'on']);

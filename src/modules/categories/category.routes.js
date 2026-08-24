@@ -2,6 +2,7 @@
 
 const express = require('express');
 const { z } = require('zod');
+const { queryBoolean } = require('../../utils/queryBoolean');
 const { query, queryOne, execute } = require('../../db/pool');
 const ApiError = require('../../utils/ApiError');
 const { uniqueSlug } = require('../../utils/slug');
@@ -26,7 +27,7 @@ const categoryBody = z.object({
 const listQuery = z.object({
   status: z.enum(['active', 'inactive', 'all']).optional(),
   parentId: z.coerce.number().int().positive().optional(),
-  withCounts: z.coerce.boolean().optional().default(true),
+  withCounts: queryBoolean(true),
 });
 
 const idParam = z.object({ id: z.coerce.number().int().positive() });

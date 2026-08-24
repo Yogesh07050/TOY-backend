@@ -9,6 +9,7 @@ const audit = require('../../utils/audit');
 const { authenticate } = require('../../middleware/auth');
 const { requirePermission } = require('../../middleware/authorize');
 const { paginationSchema } = require('../../utils/pagination');
+const { queryBoolean } = require('../../utils/queryBoolean');
 const { ok, created, noContent, paginated } = require('../../utils/respond');
 
 const router = express.Router();
@@ -18,7 +19,7 @@ const listQuery = z.object({
   status: z.enum(['draft', 'scheduled', 'published', 'expired', 'deactivated', 'all']).optional(),
   shopId: z.coerce.number().int().positive().optional(),
   search: z.string().trim().max(200).optional(),
-  live: z.coerce.boolean().optional(),
+  live: queryBoolean(),
 });
 
 /**

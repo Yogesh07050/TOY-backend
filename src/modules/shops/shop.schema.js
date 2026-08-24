@@ -2,6 +2,7 @@
 
 const { z } = require('zod');
 const { paginationSchema } = require('../../utils/pagination');
+const { queryBoolean } = require('../../utils/queryBoolean');
 
 const latitude = z.coerce.number().min(-90).max(90).optional().nullable();
 const longitude = z.coerce.number().min(-180).max(180).optional().nullable();
@@ -23,7 +24,7 @@ const listShopsSchema = z.object({
   categoryId: z.coerce.number().int().positive().optional(),
   city: z.string().trim().max(120).optional(),
   status: z.enum(['active', 'inactive', 'all']).optional(),
-  mine: z.coerce.boolean().optional(),
+  mine: queryBoolean(),
   latitude: z.coerce.number().min(-90).max(90).optional(),
   longitude: z.coerce.number().min(-180).max(180).optional(),
   radius: z.coerce.number().min(0.1).max(500).optional(),

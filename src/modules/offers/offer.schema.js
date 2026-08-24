@@ -2,6 +2,7 @@
 
 const { z } = require('zod');
 const { paginationSchema } = require('../../utils/pagination');
+const { queryBoolean } = require('../../utils/queryBoolean');
 
 const OFFER_TYPES = ['percentage', 'flat', 'buy_x_get_y', 'price_drop', 'up_to', 'other'];
 const DISCOUNT_TYPES = ['percentage', 'flat', 'none'];
@@ -48,10 +49,10 @@ const listOffersSchema = z
     expiringInHours: z.coerce.number().int().min(1).max(8760).optional(),
     startDate: z.coerce.date().optional(),
     endDate: z.coerce.date().optional(),
-    favorites: z.coerce.boolean().optional(),
-    following: z.coerce.boolean().optional(),
+    favorites: queryBoolean(),
+    following: queryBoolean(),
     /** Management view: returns non-active offers, scoped to the caller's shops. */
-    manage: z.coerce.boolean().optional(),
+    manage: queryBoolean(),
     sort: z.enum(SORTS).default('newest'),
   })
   .refine((data) => !(data.radius && (data.latitude === undefined || data.longitude === undefined)), {
