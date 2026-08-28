@@ -14,7 +14,19 @@ const upload = multer({
   limits: { fileSize: env.storage.maxUploadBytes, files: 8 },
   fileFilter: (_req, file, cb) => {
     if (!ALLOWED_MIME.has(file.mimetype)) {
-      return cb(ApiError.badRequest('Unsupported image type. Use JPEG, PNG, WebP, GIF or AVIF.'));
+      // §49: the merchant is told what would work, not what went wrong. The
+      // detail carries the specifics so the form can list the accepted
+      // formats next to the field rather than only in a toast.
+      return cb(
+        ApiError.badRequest(
+          'This image can’t be uploaded. Please choose a supported image format within the allowed size.',
+          {
+            reason: 'UNSUPPORTED_TYPE',
+            allowedFormats: ['JPEG', 'PNG', 'WebP', 'GIF', 'AVIF'],
+            maxSizeMb: Math.round(env.storage.maxUploadBytes / (1024 * 1024)),
+          },
+        ),
+      );
     }
     cb(null, true);
   },

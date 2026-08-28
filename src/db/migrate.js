@@ -314,6 +314,16 @@ const COLUMN_PATCHES = [
       'ALTER TABLE claim_verifications ADD KEY idx_cv_service_claim (service_claim_id, created_at)',
     ],
   },
+
+  // ---- V5: Business Dashboard ---------------------------------------------
+  // Merchant acquisition channel, which the retention cohort chart and the
+  // dashboard filters both slice by (Business §17, §32).
+  {
+    table: 'shops',
+    column: 'acquisition_channel',
+    sql: 'ALTER TABLE shops ADD COLUMN acquisition_channel VARCHAR(60) DEFAULT NULL AFTER status',
+    after: ['ALTER TABLE shops ADD KEY idx_shops_channel (acquisition_channel)'],
+  },
 ];
 
 /**

@@ -48,6 +48,14 @@ router.use('/campaigns', require('./modules/campaigns/campaign.routes'));
 router.use('/subscription-plans', require('./modules/subscriptions/plan.routes'));
 router.use('/ai', require('./modules/ai/ai.routes'));
 
+// ---- V5: Business Dashboard (Super Admin only) ----
+// A sibling of `/analytics` rather than a child of it, because it answers a
+// different question for a different person: `/analytics` is the merchant's
+// view of their own shop, this is the platform owner's view of the business
+// (Business §1: "This dashboard is separate from merchant dashboards"). The
+// router requires Super Admin on every route it owns.
+router.use('/business', require('./modules/business/business.routes'));
+
 // ---- V4: Services ----
 router.use('/services', require('./modules/services/service.routes'));
 router.use('/service-offer-claims', require('./modules/services/serviceOfferClaim.routes'));

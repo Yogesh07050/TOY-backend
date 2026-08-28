@@ -11,6 +11,8 @@ const authService = require('../modules/auth/auth.service');
 const subscriptionService = require('../modules/subscriptions/subscription.service');
 const featureOverrides = require('../modules/featureOverrides/featureOverride.service');
 const claimService = require('../modules/claims/claim.service');
+const failureLog = require('../services/failureLog');
+const idempotency = require('../middleware/idempotency');
 
 /**
  * Background maintenance. Everything here is idempotent, so running a job twice
@@ -131,15 +133,40 @@ const jobs = [
     },
   },
   {
+    name: 'idempotency-sweep',
+    // Every 5 minutes. Releases keys claimed by a request whose process died
+    // before it could answer (§50) - without this, an interrupted payment
+    // leaves its key stuck `in_progress` and the merchant unable to retry at
+    // all, which is worse than the duplicate the key was preventing.
+    schedule: '*/5 * * * *',
+    run: async () => {
+      const released = await idempotency.releaseStale(15);
+      if (released) console.log('[jobs] idempotency: %d stale keys released', released);
+    },
+  },
+  {
     name: 'prune',
     // Nightly cleanup of spent tokens and stale read notifications.
     schedule: '30 3 * * *',
     run: async () => {
-      const [tokens, notices] = await Promise.all([
+      // The failure log joins the sweep (Business §56): it is diagnostic data
+      // with a user id attached, so it is kept only as long as it is useful
+      // for tracing a support ticket.
+      const [tokens, notices, failures, keys] = await Promise.all([
         authService.pruneExpiredTokens(),
         notifications.pruneOld(),
+        failureLog.pruneOlderThan(90),
+        // A settled key is only useful while a client might still retry with
+        // it; two days is far beyond any timeout worth honouring.
+        idempotency.pruneCompleted(48),
       ]);
-      console.log('[jobs] pruned %d tokens and %d notifications', tokens, notices);
+      console.log(
+        '[jobs] pruned %d tokens, %d notifications, %d failure records and %d idempotency keys',
+        tokens,
+        notices,
+        failures,
+        keys,
+      );
     },
   },
 ];

@@ -23,9 +23,10 @@ const { ok } = require('../../utils/respond');
 
 const router = express.Router();
 
-// `filterQuery`/`resolveRange` are reused as-is - same date-range and filter
+// `filterQuery` and the shared range resolver are reused as-is - same date-range and filter
 // contract as the offer dashboards, so the two analytics areas stay consistent.
-const { filterQuery, resolveRange } = premiumRoutes;
+const { filterQuery } = premiumRoutes;
+const { resolvePresetRange } = require('../../utils/dateRange');
 
 const serviceFilterQuery = filterQuery
   .omit({ offerId: true, campaignId: true, offerType: true, discountType: true })
@@ -53,7 +54,7 @@ async function resolveContext(req, feature) {
   if (permitted === null) {
     return {
       shopIds: requested === null ? null : [requested],
-      range: resolveRange(req.query),
+      range: resolvePresetRange(req.query),
       filters: filtersFrom(req.query),
       plan: 'PLATFORM',
     };
@@ -71,7 +72,7 @@ async function resolveContext(req, feature) {
 
   return {
     shopIds: entitled,
-    range: resolveRange(req.query),
+    range: resolvePresetRange(req.query),
     filters: filtersFrom(req.query),
     plan: await subscriptions.planKeyForShop(entitled[0]),
   };

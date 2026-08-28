@@ -14,6 +14,7 @@ const { requireShopScope, requireSuperAdmin } = require('../../middleware/author
 const accessControl = require('../../services/accessControl');
 const ApiError = require('../../utils/ApiError');
 const { ok } = require('../../utils/respond');
+const { idempotent } = require('../../middleware/idempotency');
 
 const router = express.Router();
 
@@ -177,6 +178,11 @@ router.post(
     }),
   }),
   requireShopScope('MANAGE_SUBSCRIPTION'),
+  // §51 puts Payment first on the list. A merchant who taps Upgrade twice must
+  // not end up with two Razorpay orders against one intent - and after §50's
+  // timeout, the retry has to be handed the original order rather than opening
+  // a second checkout for the same month.
+  idempotent(),
   asyncHandler(async (req, res) => {
     const shopId = Number(req.params.shopId);
     const checkout = await payments.startCheckout(shopId, req.body.plan, req.user, {

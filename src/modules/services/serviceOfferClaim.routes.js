@@ -12,6 +12,7 @@ const notifications = require('../../services/notifications');
 const { limitOffset, paginationSchema } = require('../../utils/pagination');
 const { ok, created, paginated } = require('../../utils/respond');
 const claims = require('../claims/claim.service');
+const { idempotent } = require('../../middleware/idempotency');
 
 const router = express.Router();
 
@@ -100,6 +101,7 @@ router.get(
 router.post(
   '/:serviceOfferId(\\d+)',
   validate({ params: serviceOfferIdParam }),
+  idempotent(),
   asyncHandler(async (req, res) => {
     const { claimId, isNew, offer } = await claims.issue(
       req.params.serviceOfferId,

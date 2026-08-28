@@ -7,6 +7,7 @@ const reviewSchema = require('../reviews/review.schema');
 const validate = require('../../middleware/validate');
 const asyncHandler = require('../../utils/asyncHandler');
 const { authenticate, optionalAuth } = require('../../middleware/auth');
+const { idempotent } = require('../../middleware/idempotency');
 const {
   requirePermission,
   requireShopScope,
@@ -51,6 +52,11 @@ router.post(
   validate({ body: schema.createOfferSchema }),
   requirePermission('CREATE_OFFER'),
   requireShopScope('CREATE_OFFER', 'shopId'),
+  // §51: a merchant who taps Publish twice on a slow connection, or retries
+  // after §36's "your changes haven't been submitted yet", must end up with one
+  // offer. Nothing else here would stop a second: an offer has no natural
+  // unique key, and two identical ones are perfectly legal.
+  idempotent(),
   asyncHandler(controller.create),
 );
 

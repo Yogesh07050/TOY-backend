@@ -52,6 +52,19 @@ const EVENT_TYPES = {
   CUSTOMER_SIGNUP: 'CUSTOMER_SIGNUP',
   CUSTOMER_RETURN: 'CUSTOMER_RETURN',
 
+  // ---- V5 active-user signals (Business §5.1) -------------------------------
+  // DAU/MAU need to know that someone opened the app at all, not only that
+  // they went on to look at something. Without these, a customer who launches
+  // the app, sees nothing they like and closes it is invisible - and "did
+  // people come back today?" is exactly the question DAU is asked.
+  //
+  // APP_OPEN is the mobile client; WEB_VISIT is the browser's equivalent, kept
+  // apart so platform mix is answerable. MAP_USE is §5.1's "Map Use": panning
+  // or searching the map is deliberate engagement even when nothing is tapped.
+  APP_OPEN: 'APP_OPEN',
+  WEB_VISIT: 'WEB_VISIT',
+  MAP_USE: 'MAP_USE',
+
   // ---- V2 personalization (§32) --------------------------------------------
   // *_SELECTED/STARTED are pure UI signals fired as the customer moves through
   // onboarding - client-postable. *_COMPLETED/UPDATED are recorded server-side
@@ -107,6 +120,9 @@ const CLIENT_EVENT_TYPES = [
   EVENT_TYPES.BANNER_IMPRESSION,
   EVENT_TYPES.OFFER_CLAIM_VIEW,
   EVENT_TYPES.CLAIM_QR_VIEW,
+  EVENT_TYPES.APP_OPEN,
+  EVENT_TYPES.WEB_VISIT,
+  EVENT_TYPES.MAP_USE,
 
   EVENT_TYPES.PREFERENCE_ONBOARDING_STARTED,
   EVENT_TYPES.PREFERENCE_CATEGORY_SELECTED,

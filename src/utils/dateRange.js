@@ -40,4 +40,99 @@ function dayKeysBetween(from, to) {
   return keys;
 }
 
-module.exports = { dayKey, dayKeysBetween, MAX_DAYS };
+/** The date presets every dashboard filter bar offers (V3 §27, Business §32). */
+const DATE_PRESETS = [
+  'today',
+  'yesterday',
+  'last7',
+  'last30',
+  'last90',
+  'thisMonth',
+  'lastMonth',
+  'custom',
+];
+
+const startOfDay = (date) => {
+  const value = new Date(date);
+  value.setHours(0, 0, 0, 0);
+  return value;
+};
+
+const endOfDay = (date) => {
+  const value = new Date(date);
+  value.setHours(23, 59, 59, 999);
+  return value;
+};
+
+/**
+ * Turns a preset (or an explicit custom range) into an absolute window, plus
+ * the equally long window immediately before it.
+ *
+ * Every KPI card compares like-for-like periods, so the comparison window has
+ * to be derived from the same place as the window itself - deriving it per
+ * query is how "current: 30 days vs previous: last month" gets shipped, which
+ * is exactly what Business §33 forbids.
+ */
+function resolvePresetRange(query = {}) {
+  const now = new Date();
+  let from;
+  let to;
+
+  switch (query.preset) {
+    case 'today':
+      from = startOfDay(now);
+      to = endOfDay(now);
+      break;
+    case 'yesterday': {
+      const yesterday = new Date(now);
+      yesterday.setDate(yesterday.getDate() - 1);
+      from = startOfDay(yesterday);
+      to = endOfDay(yesterday);
+      break;
+    }
+    case 'last7':
+    case 'last30':
+    case 'last90': {
+      const days = { last7: 7, last30: 30, last90: 90 }[query.preset];
+      to = endOfDay(now);
+      from = startOfDay(new Date(now.getTime() - (days - 1) * 86400000));
+      break;
+    }
+    case 'thisMonth':
+      from = startOfDay(new Date(now.getFullYear(), now.getMonth(), 1));
+      to = endOfDay(now);
+      break;
+    case 'lastMonth':
+      from = startOfDay(new Date(now.getFullYear(), now.getMonth() - 1, 1));
+      to = endOfDay(new Date(now.getFullYear(), now.getMonth(), 0));
+      break;
+    case 'custom':
+    default:
+      if (!query.from || !query.to) {
+        to = endOfDay(now);
+        from = startOfDay(new Date(now.getTime() - 29 * 86400000));
+      } else {
+        from = startOfDay(query.from);
+        to = endOfDay(query.to);
+      }
+  }
+
+  const span = to.getTime() - from.getTime();
+  return {
+    from,
+    to,
+    previousFrom: new Date(from.getTime() - span - 1),
+    previousTo: new Date(from.getTime() - 1),
+    preset: query.preset ?? 'last30',
+  };
+}
+
+module.exports = {
+  dayKey,
+  dayKeysBetween,
+  MAX_DAYS,
+  DATE_PRESETS,
+  startOfDay,
+  endOfDay,
+  resolvePresetRange,
+};

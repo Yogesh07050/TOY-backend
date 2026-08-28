@@ -38,6 +38,34 @@ class ApiError extends Error {
   static tooMany(message = 'Too many requests') {
     return new ApiError(429, message, undefined, 'RATE_LIMITED');
   }
+
+  /**
+   * A fault of ours. The wording is §38's, verbatim: it admits the failure,
+   * says it is being worked on, and names nothing - not the database, not the
+   * service, not the status code that caused it.
+   */
+  static internal(message = 'Something went wrong on our side. We’re working to restore the service. Please try again shortly.') {
+    return new ApiError(500, message, undefined, 'INTERNAL_ERROR');
+  }
+
+  /**
+   * A dependency we need is not answering. Distinct from `internal` only in
+   * status: 503 is what tells a client this is worth retrying, which is what
+   * §37's [Retry] button acts on.
+   */
+  static serviceUnavailable(
+    message = 'We’re having trouble connecting to Offers App. Please try again.',
+  ) {
+    return new ApiError(503, message, undefined, 'SERVICE_UNAVAILABLE');
+  }
+
+  /**
+   * A safe operation that timed out. §50 splits these from critical ones: this
+   * carries the retryable code, and a payment or redemption must never use it.
+   */
+  static timeout(message = 'This is taking longer than expected. Please try again.') {
+    return new ApiError(504, message, undefined, 'TIMEOUT');
+  }
 }
 
 module.exports = ApiError;

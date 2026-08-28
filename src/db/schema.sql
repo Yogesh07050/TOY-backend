@@ -167,12 +167,18 @@ CREATE TABLE IF NOT EXISTS shops (
   -- { mon: [{open, close}], ... }; the API validates it, MySQL only stores it.
   opening_hours  JSON                    DEFAULT NULL,
   status         ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  -- How this merchant came to the platform (Business Dashboard §17, §32).
+  -- Free text rather than an enum: the channels a sales team invents outlive
+  -- any list we could fix here, and nothing branches on the value - it is only
+  -- ever grouped by. NULL means nobody recorded it.
+  acquisition_channel VARCHAR(60)        DEFAULT NULL,
   created_by     BIGINT UNSIGNED         DEFAULT NULL,
   updated_by     BIGINT UNSIGNED         DEFAULT NULL,
   created_at     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   UNIQUE KEY uq_shops_slug (slug),
+  KEY idx_shops_channel (acquisition_channel),
   KEY idx_shops_status (status),
   KEY idx_shops_name (name),
   CONSTRAINT fk_shops_created_by FOREIGN KEY (created_by) REFERENCES users (id) ON DELETE SET NULL,
@@ -1468,4 +1474,90 @@ CREATE TABLE IF NOT EXISTS ai_generations (
   CONSTRAINT fk_ai_gen_shop  FOREIGN KEY (shop_id)  REFERENCES shops (id)  ON DELETE CASCADE,
   CONSTRAINT fk_ai_gen_user  FOREIGN KEY (user_id)  REFERENCES users (id)  ON DELETE SET NULL,
   CONSTRAINT fk_ai_gen_offer FOREIGN KEY (offer_id) REFERENCES offers (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- =====================================================================
+--  V5 additions - Business Dashboard & graceful failure
+--  ("Business Dashboard & Graceful Failure Requirements" §34-§59)
+-- =====================================================================
+
+-- ---------------------------------------------------------------------
+-- Internal failure log (§56).
+--
+-- What a customer is shown for a failure is deliberately vague (§37, §38);
+-- this is where the detail that was withheld from them actually lands, so
+-- support can answer "what happened to request REQ-82917?" without shell
+-- access to a log file.
+--
+-- Deliberately absent: request bodies, headers, tokens, email addresses and
+-- anything else §56 calls "unnecessary sensitive information". A user id is
+-- kept because tracing one person's broken checkout is the whole point; the
+-- message is truncated rather than stored whole for the same reason.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS error_logs (
+  id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  -- The reference shown to the user, e.g. REQ-82917 (§57). Unique so the
+  -- support lookup is a single indexed read.
+  request_id   VARCHAR(40)     NOT NULL,
+  user_id      BIGINT UNSIGNED         DEFAULT NULL,
+  shop_id      BIGINT UNSIGNED         DEFAULT NULL,
+  method       VARCHAR(10)     NOT NULL,
+  -- The route pattern where Express knows it (`/offers/:id`), so a thousand
+  -- failures on one endpoint group instead of scattering across ids.
+  endpoint     VARCHAR(255)    NOT NULL,
+  error_type   VARCHAR(80)     NOT NULL,
+  http_status  SMALLINT UNSIGNED NOT NULL,
+  -- Which dependency was blamed: DATABASE, RAZORPAY, PUSH, STORAGE, GEOCODING,
+  -- EMAIL, AI or NULL for a fault of our own.
+  dependency   VARCHAR(40)             DEFAULT NULL,
+  message      VARCHAR(500)            DEFAULT NULL,
+  -- Reported by the client (§56): 'web', 'ios', 'android'.
+  platform     VARCHAR(40)             DEFAULT NULL,
+  app_version  VARCHAR(40)             DEFAULT NULL,
+  created_at   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_error_request (request_id),
+  -- The spike detector's read path (§59): one dependency, one short window.
+  KEY idx_error_dependency_time (dependency, created_at),
+  KEY idx_error_time (created_at),
+  KEY idx_error_endpoint (endpoint, created_at),
+  CONSTRAINT fk_error_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE SET NULL,
+  CONSTRAINT fk_error_shop FOREIGN KEY (shop_id) REFERENCES shops (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------
+-- Idempotency keys (§50, §51).
+--
+-- §50 says that after a timeout on a payment, claim, redemption or booking
+-- the client must "first determine whether the original request was
+-- completed" rather than blindly repeating it. It cannot determine that on
+-- its own - the whole problem is that it never heard back - so the server
+-- remembers instead: the client sends the same key on the retry and gets the
+-- original answer, not a second charge.
+--
+-- The unique key is (idempotency_key, user_id): keys are client-generated, so
+-- scoping them to the user is what stops one client's UUID collision from
+-- handing someone else's response to a stranger.
+--
+-- `fingerprint` is a hash of the request body. A key reused with different
+-- content is a client bug, and answering it with the first request's result
+-- would silently drop the second - so it is refused loudly instead.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+  id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  idempotency_key VARCHAR(120)    NOT NULL,
+  user_id         BIGINT UNSIGNED         DEFAULT NULL,
+  endpoint        VARCHAR(255)    NOT NULL,
+  fingerprint     CHAR(64)        NOT NULL,
+  -- 'in_progress' is the window between the first request starting and
+  -- finishing. A retry arriving inside it is told to wait rather than being
+  -- allowed to run a second copy of a payment.
+  status          ENUM('in_progress','completed') NOT NULL DEFAULT 'in_progress',
+  response_status SMALLINT UNSIGNED       DEFAULT NULL,
+  response_body   JSON                    DEFAULT NULL,
+  created_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  completed_at    DATETIME                DEFAULT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_idempotency (idempotency_key, user_id),
+  KEY idx_idempotency_created (created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

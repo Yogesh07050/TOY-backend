@@ -15,9 +15,15 @@ const { healthCheck } = require('./db/pool');
 const mailer = require('./utils/mailer');
 const { apiLimiter } = require('./middleware/rateLimit');
 const cachePolicy = require('./middleware/cachePolicy');
+const requestId = require('./middleware/requestId');
 const { notFoundHandler, errorHandler } = require('./middleware/errorHandler');
 
 const app = express();
+
+// First in, so every log line, every failure row and every error response for
+// this request carries the same reference (§57). Ahead of the body parser
+// too - a malformed JSON body still produces a traceable failure.
+app.use(requestId);
 
 // Behind a reverse proxy (nginx / load balancer) so req.ip and the rate limiter
 // see the real client address rather than the proxy's.
@@ -74,7 +80,10 @@ app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 app.use(cookieParser());
 
 if (env.nodeEnv !== 'test') {
-  app.use(morgan(env.isProduction ? 'combined' : 'dev'));
+  // The correlation id goes in the access log too, so "find me REQ-82917"
+  // works whether the request failed loudly or just behaved oddly (§57).
+  morgan.token('request-id', (req) => req.id ?? '-');
+  app.use(morgan(env.isProduction ? ':request-id :remote-addr :method :url :status :response-time ms' : 'dev'));
 }
 
 // Processed images. `immutable` is safe because filenames are content-unique.
@@ -83,6 +92,15 @@ app.use(
   express.static(env.storage.uploadDir, { maxAge: '30d', immutable: true, fallthrough: true }),
 );
 
+/**
+ * Liveness probe for load balancers and uptime monitors.
+ *
+ * Deliberately thin: it answers "is this process able to serve requests?" and
+ * nothing else. The dependency-by-dependency breakdown §34 asks for is Super
+ * Admin material and lives behind auth at `/business/health` - §55 is explicit
+ * that internal diagnostics are never exposed to customers or merchants, and an
+ * unauthenticated endpoint is exposed to everyone.
+ */
 app.get('/health', async (_req, res) => {
   const database = await healthCheck().catch(() => false);
   res.status(database ? 200 : 503).json({

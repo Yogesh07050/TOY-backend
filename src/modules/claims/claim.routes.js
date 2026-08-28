@@ -12,6 +12,7 @@ const notifications = require('../../services/notifications');
 const { limitOffset, paginationSchema } = require('../../utils/pagination');
 const { ok, created, paginated } = require('../../utils/respond');
 const claims = require('./claim.service');
+const { idempotent } = require('../../middleware/idempotency');
 
 const router = express.Router();
 
@@ -108,6 +109,11 @@ router.get(
 router.post(
   '/:offerId(\\d+)',
   validate({ params: offerIdParam }),
+  // Belt to the unique key's braces (§51). The database already stops a second
+  // claim; this is what lets a client that timed out mid-claim retry and be
+  // handed the *original* 201 with its code, instead of a 200 it has to guess
+  // the meaning of.
+  idempotent(),
   asyncHandler(async (req, res) => {
     const { claimId, isNew, offer } = await claims.issue(req.params.offerId, req.user.id);
 
