@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 420" role="img" aria-label="OffersOffer">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 320" role="img" aria-label="OffersOffer">
   <title>OffersOffer</title>
   <defs>
     <linearGradient id="oo-gold" x1="0" y1="0" x2="1" y2="1">
@@ -11,17 +11,16 @@
       <stop offset="0.55" stop-color="#232326"/>
       <stop offset="1" stop-color="#151517"/>
     </linearGradient>
-    <!-- The upper crossing only: where the black ring passes in front. -->
     <clipPath id="oo-cross">
-      <rect x="286" y="52" width="104" height="140"/>
+      <rect x="225" y="0" width="110" height="123"/>
     </clipPath>
   </defs>
 
-  <g fill="none" stroke-width="50" stroke-linecap="butt">
-    <path d="M 363.77 142.49 A 150 122 -14 1 1 217.86 88.48" stroke="url(#oo-ink)"/>
-    <path d="M 276.23 277.51 A 150 122 -14 1 1 422.14 331.52" stroke="url(#oo-gold)"/>
+  <g fill="none" stroke-width="36" stroke-linecap="butt">
+    <path d="M 343.09 121.2 A 146 94 -20 1 1 270.91 60.94" stroke="url(#oo-ink)"/>
+    <path d="M 216.91 198.8 A 146 94 -20 1 1 289.09 259.06" stroke="url(#oo-gold)"/>
     <g clip-path="url(#oo-cross)">
-      <path d="M 363.77 142.49 A 150 122 -14 1 1 217.86 88.48" stroke="url(#oo-ink)"/>
+      <path d="M 343.09 121.2 A 146 94 -20 1 1 270.91 60.94" stroke="url(#oo-ink)"/>
     </g>
   </g>
 </svg>
