@@ -77,5 +77,5 @@ async def announce() -> None:
             "No API key for %s. Set %s in the repository-root .env or in "
             "TOY-ai-backend/.env.",
             settings.provider_name,
-            "GEMINI_API_KEY" if settings.use_gemini else "OPENAI_API_KEY",
+            settings.api_key_env_var,
         )

@@ -16,7 +16,7 @@ Node API (TOY-backend)      auth · plan limits · merchant data · usage log ·
       ↓  HTTP + x-ai-service-token
 Python AI service (this)    provider switch · prompts · structured output · fact guard
       ↓
-Gemini (default)  |  OpenAI
+Groq (default)  |  OpenAI
 ```
 
 ## Running it
@@ -44,16 +44,17 @@ folder**, loaded outermost first so the closest one wins:
 OTY/.env  →  TOY-backend/.env  →  TOY-backend/TOY-ai-backend/.env  →  real env
 ```
 
-Two things fall out of that: `GEMINI_API_KEY` is picked up from the repo-root
+Two things fall out of that: `GROQ_API_KEY` is picked up from the repo-root
 `.env` where the project already keeps it, and `AI_SERVICE_TOKEN` set for the
 Node API is shared with this service automatically, so the two cannot drift.
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `USE_GEMINI` | `true` | **The provider switch.** `true` → Gemini, `false` → OpenAI. |
-| `GEMINI_API_KEY` | — | Read from the root `.env` if not set here. |
-| `GEMINI_MODEL` | `gemini-flash-lite-latest` | Small, free-tier friendly. The `-latest` alias survives model retirement. |
-| `OPENAI_API_KEY` | — | Only needed when `USE_GEMINI=false`. |
+| `USE_GROQ` | `true` | **The provider switch.** `true` → Groq, `false` → OpenAI. |
+| `AI_PROVIDER` | — | Optional override. Names a provider outright (`groq`, `openai`, or the legacy `gemini`) and ignores `USE_GROQ`. |
+| `GROQ_API_KEY` | — | Read from the root `.env` if not set here. Get one at <https://console.groq.com/keys>. |
+| `GROQ_MODEL` | `llama-3.3-70b-versatile` | Free-tier friendly and honours JSON `response_format`. `llama-3.1-8b-instant` is cheaper and faster. |
+| `OPENAI_API_KEY` | — | Only needed when `USE_GROQ=false`. |
 | `OPENAI_MODEL` | `gpt-4o-mini` | |
 | `AI_SERVICE_TOKEN` | — | Shared secret with the Node API. Required in production; a warning-only no-op in development. |
 | `AI_TEMPERATURE` | `0.7` | Corrections always re-run at 0.2. |
@@ -121,9 +122,9 @@ database connection and no write path of any kind.
 ```
 app/
   main.py            FastAPI app, CORS, one error shape for the Node API
-  config.py          env loading (root .env + local .env) and the USE_GEMINI switch
+  config.py          env loading (root .env + local .env) and the USE_GROQ switch
   security.py        shared-secret check for service-to-service calls
-  providers/         base interface + gemini.py + openai.py + normalised errors
+  providers/         base interface + groq.py + openai.py + gemini.py + normalised errors
   prompts/           system rules (§23/§24/§35/§38) and per-feature user prompts
   schemas/           request/response models — the contract with the Node API
   services/          orchestration: llm runner, JSON repair, fact guard, features
