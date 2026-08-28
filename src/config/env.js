@@ -52,6 +52,16 @@ const env = {
   },
   bcryptRounds: int(process.env.BCRYPT_ROUNDS, 12),
 
+  claims: {
+    /**
+     * Signs the QR payload printed on a claim (Claim/Redemption §6). Optional:
+     * left unset, the key is derived from the access secret, which keeps a
+     * fresh install working while still being a different key from the one
+     * that signs sessions.
+     */
+    qrSecret: process.env.CLAIM_QR_SECRET || '',
+  },
+
   /**
    * The httpOnly refresh cookie the web app uses (§22).
    *

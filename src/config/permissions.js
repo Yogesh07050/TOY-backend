@@ -34,7 +34,17 @@ const PERMISSIONS = {
   DELETE_BANNER: { category: 'Banners', description: 'Delete featured banners' },
   PUBLISH_BANNER: { category: 'Banners', description: 'Publish or deactivate banners' },
 
-  REDEEM_CLAIM: { category: 'Offers', description: 'Redeem a customer offer claim' },
+  // Claim & redemption (Claim/Redemption §25). Deliberately four grants rather
+  // than one: reading who claimed what, pointing a camera at a code, actually
+  // giving the benefit away, and taking the history off the platform are
+  // different amounts of trust, and a shop with counter staff needs to hand
+  // out the middle two without the last.
+  VIEW_CLAIMS: { category: 'Offers', description: 'View the claims made on a shop\'s offers' },
+  VERIFY_CLAIM: { category: 'Offers', description: 'Look up a claim by QR scan or code' },
+  REDEEM_OFFER: { category: 'Offers', description: 'Confirm redemption of a customer offer claim' },
+  VIEW_REDEMPTION_HISTORY: { category: 'Offers', description: 'View past redemptions' },
+  EXPORT_REDEMPTION_REPORT: { category: 'Offers', description: 'Export the redemption history' },
+  REVOKE_CLAIM: { category: 'Offers', description: 'Invalidate a claim during a dispute' },
 
   VIEW_ANALYTICS: { category: 'Insights', description: 'View analytics dashboards' },
   VIEW_AUDIT_LOGS: { category: 'Insights', description: 'View audit logs' },
@@ -112,7 +122,14 @@ const SYSTEM_ROLES = {
       'MANAGE_LOCATIONS',
       'VIEW_ANALYTICS',
       'EXPORT_ANALYTICS',
-      'REDEEM_CLAIM',
+      'VIEW_CLAIMS',
+      'VERIFY_CLAIM',
+      'REDEEM_OFFER',
+      'VIEW_REDEMPTION_HISTORY',
+      'EXPORT_REDEMPTION_REPORT',
+      // Deliberately no REVOKE_CLAIM: §26 puts invalidating a claim - which is
+      // what happens when a customer and a shop disagree - with the Super
+      // Admin who is arbitrating, not with either side of the argument.
       // The merchant owns their own plan, so an Admin of the shop can see it
       // and change it. What the plan then unlocks is enforced separately (§30).
       'VIEW_SUBSCRIPTION',
@@ -171,6 +188,10 @@ const MANAGEMENT_PERMISSIONS = [
   'MODERATE_REVIEWS',
   'VIEW_AUDIT_LOGS',
   'EXPORT_ANALYTICS',
+  'VIEW_CLAIMS',
+  'VERIFY_CLAIM',
+  'REDEEM_OFFER',
+  'VIEW_REDEMPTION_HISTORY',
   'VIEW_SUBSCRIPTION',
   'MANAGE_SUBSCRIPTION',
   'MANAGE_CAMPAIGNS',

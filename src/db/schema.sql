@@ -263,6 +263,17 @@ CREATE TABLE IF NOT EXISTS offers (
   status            ENUM('draft','scheduled','active','expired','deactivated') NOT NULL DEFAULT 'draft',
   -- how the offer maps to physical locations (§8.3)
   applicability_type ENUM('shop_wide','selected_branches','online') NOT NULL DEFAULT 'shop_wide',
+  -- Claim rules (Claim/Redemption §17). The backend is the only enforcer of
+  -- these: a client that hides the Claim button is a courtesy, not a limit.
+  -- How many codes one customer may hold for this offer. 1 is the usual rule.
+  claim_limit_per_customer  INT UNSIGNED    NOT NULL DEFAULT 1,
+  -- Ceiling across every customer, for a genuinely limited promotion.
+  total_claim_limit         INT UNSIGNED            DEFAULT NULL,
+  -- How long a code stays live once issued. NULL means "until the offer ends",
+  -- which is the right default: a code that outlives its offer is worthless.
+  claim_validity_hours      INT UNSIGNED            DEFAULT NULL,
+  -- §15: one code, one redemption, unless the offer explicitly says otherwise.
+  max_redemptions_per_claim INT UNSIGNED    NOT NULL DEFAULT 1,
   view_count        INT UNSIGNED    NOT NULL DEFAULT 0,
   click_count       INT UNSIGNED    NOT NULL DEFAULT 0,
   favorite_count    INT UNSIGNED    NOT NULL DEFAULT 0,
@@ -630,22 +641,87 @@ CREATE TABLE IF NOT EXISTS offer_claims (
   id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   offer_id     BIGINT UNSIGNED NOT NULL,
   user_id      BIGINT UNSIGNED NOT NULL,
+  -- Denormalised from the offer so shop-scoped lookups - the merchant's own
+  -- claim list, the Super Admin search - hit an index instead of a join.
+  shop_id      BIGINT UNSIGNED NOT NULL,
+  -- Where the code was redeemed, filled in at redemption time. Which branches
+  -- *may* redeem it is the offer's business (`offer_locations`), not the claim's.
   branch_id    BIGINT UNSIGNED         DEFAULT NULL,
   code         VARCHAR(24)     NOT NULL,
-  status       ENUM('claimed','redeemed','expired','cancelled') NOT NULL DEFAULT 'claimed',
+  -- Nth code this customer holds for this offer, 1-based. Only exists to give
+  -- the unique key below something to be unique on once an offer allows more
+  -- than one claim per customer; never shown to anyone.
+  claim_seq    INT UNSIGNED    NOT NULL DEFAULT 1,
+  status       ENUM('claimed','redeemed','expired','cancelled','revoked') NOT NULL DEFAULT 'claimed',
   claimed_at   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  -- §31. Always set: a code with no stated end is a code nobody can refuse.
+  expires_at   DATETIME        NOT NULL,
   redeemed_at  DATETIME                DEFAULT NULL,
   redeemed_by  BIGINT UNSIGNED         DEFAULT NULL,
+  -- How the merchant found the claim they redeemed (§30).
+  verification_method ENUM('QR_SCAN','CODE_ENTRY') DEFAULT NULL,
+  -- Count rather than a flag, because §15 allows an offer to permit several.
+  redemption_count INT UNSIGNED   NOT NULL DEFAULT 0,
+  revoked_at   DATETIME                DEFAULT NULL,
+  revoked_by   BIGINT UNSIGNED         DEFAULT NULL,
+  revoke_reason VARCHAR(255)           DEFAULT NULL,
+  created_at   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   UNIQUE KEY uq_claim_code (code),
-  -- One live claim per customer per offer; re-claiming returns the same code.
-  UNIQUE KEY uq_claim_user_offer (user_id, offer_id),
+  -- The per-customer claim limit is checked in application code, but two
+  -- simultaneous requests would both pass that check. This key is what
+  -- actually stops them: the loser gets a duplicate-key error, not a
+  -- second code.
+  UNIQUE KEY uq_claim_user_offer_seq (user_id, offer_id, claim_seq),
   KEY idx_claim_offer (offer_id, status),
+  KEY idx_claim_shop_status (shop_id, status, claimed_at),
+  KEY idx_claim_redeemed (shop_id, redeemed_at),
   KEY idx_claim_claimed (claimed_at),
+  KEY idx_claim_expiry (status, expires_at),
   CONSTRAINT fk_claim_offer       FOREIGN KEY (offer_id)    REFERENCES offers (id)        ON DELETE CASCADE,
   CONSTRAINT fk_claim_user        FOREIGN KEY (user_id)     REFERENCES users (id)         ON DELETE CASCADE,
+  CONSTRAINT fk_claim_shop        FOREIGN KEY (shop_id)     REFERENCES shops (id)         ON DELETE CASCADE,
   CONSTRAINT fk_claim_branch      FOREIGN KEY (branch_id)   REFERENCES shop_branches (id) ON DELETE SET NULL,
-  CONSTRAINT fk_claim_redeemed_by FOREIGN KEY (redeemed_by) REFERENCES users (id)         ON DELETE SET NULL
+  CONSTRAINT fk_claim_redeemed_by FOREIGN KEY (redeemed_by) REFERENCES users (id)         ON DELETE SET NULL,
+  CONSTRAINT fk_claim_revoked_by  FOREIGN KEY (revoked_by)  REFERENCES users (id)         ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Every time a merchant points the scanner at something (§30). This is both
+-- the audit trail and the evidence the rate limiter (§28) counts, which is why
+-- failures are recorded as carefully as successes: a run of REJECTED rows
+-- against invented codes is exactly what someone probing for a live code looks
+-- like, and it leaves no other trace.
+CREATE TABLE IF NOT EXISTS claim_verifications (
+  id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  -- NULL when the code matched nothing - there is no claim to point at, and
+  -- that attempt is the one most worth keeping.
+  claim_id      BIGINT UNSIGNED         DEFAULT NULL,
+  offer_id      BIGINT UNSIGNED         DEFAULT NULL,
+  shop_id       BIGINT UNSIGNED         DEFAULT NULL,
+  branch_id     BIGINT UNSIGNED         DEFAULT NULL,
+  customer_id   BIGINT UNSIGNED         DEFAULT NULL,
+  -- The merchant user who scanned or typed.
+  verified_by   BIGINT UNSIGNED         DEFAULT NULL,
+  code_attempted VARCHAR(24)            DEFAULT NULL,
+  method        ENUM('QR_SCAN','CODE_ENTRY') NOT NULL DEFAULT 'CODE_ENTRY',
+  action        ENUM('VERIFIED','REDEEMED','REJECTED','REVOKED') NOT NULL,
+  -- Machine-readable why, e.g. NOT_FOUND, EXPIRED, ALREADY_REDEEMED. The
+  -- merchant is told far less than this (§13) - it is here for disputes.
+  reason        VARCHAR(60)             DEFAULT NULL,
+  ip_address    VARCHAR(45)             DEFAULT NULL,
+  created_at    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_cv_claim (claim_id, created_at),
+  KEY idx_cv_shop (shop_id, created_at),
+  -- The rate limiter's read path: this user's recent failures.
+  KEY idx_cv_actor (verified_by, action, created_at),
+  CONSTRAINT fk_cv_claim    FOREIGN KEY (claim_id)    REFERENCES offer_claims (id)  ON DELETE SET NULL,
+  CONSTRAINT fk_cv_offer    FOREIGN KEY (offer_id)    REFERENCES offers (id)        ON DELETE SET NULL,
+  CONSTRAINT fk_cv_shop     FOREIGN KEY (shop_id)     REFERENCES shops (id)         ON DELETE SET NULL,
+  CONSTRAINT fk_cv_branch   FOREIGN KEY (branch_id)   REFERENCES shop_branches (id) ON DELETE SET NULL,
+  CONSTRAINT fk_cv_customer FOREIGN KEY (customer_id) REFERENCES users (id)         ON DELETE SET NULL,
+  CONSTRAINT fk_cv_actor    FOREIGN KEY (verified_by) REFERENCES users (id)         ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Search terms, used only as a mild recommendation signal (§20).

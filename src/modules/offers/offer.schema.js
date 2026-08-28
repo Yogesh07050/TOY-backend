@@ -92,6 +92,15 @@ const offerBody = z
     status: z.enum(['draft', 'scheduled', 'active']).default('draft'),
     applicabilityType: z.enum(APPLICABILITY).default('shop_wide'),
     branchIds: idList.optional().default([]),
+    // Claim rules (Claim/Redemption §17). The defaults are the ordinary shop's
+    // answer - one code each, one use, valid as long as the offer runs - so a
+    // merchant who never opens this section gets sensible behaviour.
+    claimLimitPerCustomer: z.coerce.number().int().min(1).max(100).default(1),
+    totalClaimLimit: z.coerce.number().int().min(1).max(1000000).optional().nullable(),
+    // Hours from claiming; null means "until the offer ends". Capped at a year
+    // because the offer's own end date is the real ceiling either way.
+    claimValidityHours: z.coerce.number().int().min(1).max(8760).optional().nullable(),
+    maxRedemptionsPerClaim: z.coerce.number().int().min(1).max(100).default(1),
     images: z
       .array(
         z.object({
@@ -121,6 +130,16 @@ const offerBody = z
     }
     if (data.applicabilityType === 'selected_branches' && data.branchIds.length === 0) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['branchIds'], message: 'Select at least one branch' });
+    }
+    if (
+      data.totalClaimLimit != null &&
+      data.claimLimitPerCustomer > data.totalClaimLimit
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['totalClaimLimit'],
+        message: 'The total claim limit cannot be lower than the per-customer limit',
+      });
     }
     if (data.isRecurring && !data.recurrenceType) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['recurrenceType'], message: 'Choose how often the offer recurs' });

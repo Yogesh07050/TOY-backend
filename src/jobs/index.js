@@ -10,6 +10,7 @@ const analyticsSnapshots = require('../services/analyticsSnapshots');
 const authService = require('../modules/auth/auth.service');
 const subscriptionService = require('../modules/subscriptions/subscription.service');
 const featureOverrides = require('../modules/featureOverrides/featureOverride.service');
+const claimService = require('../modules/claims/claim.service');
 
 /**
  * Background maintenance. Everything here is idempotent, so running a job twice
@@ -37,6 +38,18 @@ const jobs = [
           banners.expired,
         );
       }
+    },
+  },
+  {
+    name: 'claim-expiry',
+    // Claim/Redemption §12: a claim past its expiry becomes EXPIRED. The
+    // redemption path never trusts this status - it compares timestamps on
+    // every attempt - so a late sweep can only make a list look stale, never
+    // let an expired code through.
+    schedule: '*/5 * * * *',
+    run: async () => {
+      const expired = await claimService.syncExpiredClaims();
+      if (expired) console.log('[jobs] claim expiry: %d expired', expired);
     },
   },
   {

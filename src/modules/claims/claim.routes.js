@@ -1,79 +1,46 @@
 'use strict';
 
-const crypto = require('node:crypto');
 const express = require('express');
 const { z } = require('zod');
 const { queryOne, execute, rawQuery } = require('../../db/pool');
 const ApiError = require('../../utils/ApiError');
 const validate = require('../../middleware/validate');
 const asyncHandler = require('../../utils/asyncHandler');
-const audit = require('../../utils/audit');
 const { authenticate } = require('../../middleware/auth');
-const { requirePermission } = require('../../middleware/authorize');
-const accessControl = require('../../services/accessControl');
 const analyticsEvents = require('../../services/analyticsEvents');
 const notifications = require('../../services/notifications');
 const { limitOffset, paginationSchema } = require('../../utils/pagination');
 const { ok, created, paginated } = require('../../utils/respond');
+const claims = require('./claim.service');
 
 const router = express.Router();
 
 /**
- * Offer claims and redemptions.
+ * The customer's half of the claim workflow (§3, §5, §34, §36).
  *
- * A claim is the customer reserving an offer; redemption is shop staff marking
- * it used. Together they close the funnel in §24
- * (impressions → views → saves → claims → redemptions) and give the mobile app
- * (§26) its QR flow: the code below is what a scan resolves to.
+ * Everything a customer can do to their own claim lives here: take one out,
+ * look at the code and QR, and give it back. Redeeming is deliberately absent -
+ * §25 is explicit that a customer must never be able to mark their own claim
+ * redeemed, and the way to guarantee that is for no route on this router to be
+ * able to write `redeemed` at all. That lives in redemption.routes.js, behind a
+ * merchant permission.
  */
 
 const offerIdParam = z.object({ offerId: z.coerce.number().int().positive() });
-const codeParam = z.object({ code: z.string().trim().min(6).max(24) });
+const claimIdParam = z.object({ claimId: z.coerce.number().int().positive() });
+
 const listQuery = z.object({
   ...paginationSchema,
-  status: z.enum(['claimed', 'redeemed', 'expired', 'cancelled', 'all']).optional(),
+  status: z.enum(['claimed', 'redeemed', 'expired', 'cancelled', 'revoked', 'active', 'all']).optional(),
   offerId: z.coerce.number().int().positive().optional(),
 });
 
-/** Short, unambiguous code: no O/0/I/1 so it survives being read aloud. */
-function generateCode() {
-  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  const bytes = crypto.randomBytes(10);
-  return Array.from(bytes, (byte) => alphabet[byte % alphabet.length]).join('');
-}
-
-const mapClaim = (row) => ({
-  id: Number(row.id),
-  code: row.code,
-  status: row.status,
-  claimedAt: row.claimed_at,
-  redeemedAt: row.redeemed_at,
-  offer: {
-    id: Number(row.offer_id),
-    title: row.offer_title,
-    offerText: row.offer_text,
-    endDate: row.offer_end_date,
-    imageUrl: row.image_url ?? null,
-  },
-  shop: { id: Number(row.shop_id), name: row.shop_name },
-  branch: row.branch_id ? { id: Number(row.branch_id), name: row.branch_name } : null,
-  customer: row.customer_name ? { id: Number(row.user_id), name: row.customer_name } : undefined,
-});
-
-const CLAIM_SELECT = `
-  SELECT c.*, o.title AS offer_title, o.offer_text, o.end_date AS offer_end_date,
-         o.shop_id, s.name AS shop_name, b.branch_name, u.name AS customer_name,
-         (SELECT oi.image_url FROM offer_images oi
-           WHERE oi.offer_id = o.id ORDER BY oi.display_order, oi.id LIMIT 1) AS image_url
-    FROM offer_claims c
-    JOIN offers o ON o.id = c.offer_id
-    JOIN shops  s ON s.id = o.shop_id
-    JOIN users  u ON u.id = c.user_id
-    LEFT JOIN shop_branches b ON b.id = c.branch_id`;
-
 router.use(authenticate);
 
-/** The signed-in customer's own claims. */
+/**
+ * The signed-in customer's own claims - "My Claims" (§5) and, filtered to
+ * redeemed, "Redeemed Offers" (§36).
+ */
 router.get(
   '/',
   validate({ query: listQuery }),
@@ -83,141 +50,135 @@ router.get(
     const params = [req.user.id];
 
     if (req.query.status && req.query.status !== 'all') {
-      where.push('c.status = ?');
-      params.push(req.query.status);
+      if (req.query.status === 'active') {
+        // What the customer thinks of as "my coupons": still usable right now.
+        // Checked on the timestamp rather than the status so a claim that
+        // expired since the last sweep does not show up as ready to use.
+        where.push("c.status = 'claimed' AND c.expires_at >= NOW()");
+      } else {
+        where.push('c.status = ?');
+        params.push(req.query.status);
+      }
+    }
+    if (req.query.offerId) {
+      where.push('c.offer_id = ?');
+      params.push(req.query.offerId);
     }
 
     const whereSql = `WHERE ${where.join(' AND ')}`;
     const [rows, countRows] = await Promise.all([
-      rawQuery(`${CLAIM_SELECT} ${whereSql} ORDER BY c.claimed_at DESC LIMIT ${limit} OFFSET ${offset}`, params),
+      rawQuery(
+        `${claims.CLAIM_SELECT} ${whereSql} ORDER BY c.claimed_at DESC LIMIT ${limit} OFFSET ${offset}`,
+        params,
+      ),
       rawQuery(`SELECT COUNT(*) AS total FROM offer_claims c ${whereSql}`, params),
     ]);
 
-    paginated(res, rows.map(mapClaim), { page, limit, total: Number(countRows[0].total) });
+    paginated(
+      res,
+      rows.map((row) => claims.mapClaim(row, 'customer')),
+      { page, limit, total: Number(countRows[0].total) },
+    );
   }),
 );
 
 /**
- * Claims an offer. Idempotent: claiming twice returns the existing code rather
- * than issuing a second one, which is what the unique (user, offer) key enforces.
+ * One claim, with its code and QR. Owner-only: a claim id is a small integer,
+ * so without this check the QR of every customer in the country would be one
+ * `for` loop away.
+ */
+router.get(
+  '/:claimId(\\d+)',
+  validate({ params: claimIdParam }),
+  asyncHandler(async (req, res) => {
+    const row = await claims.findById(req.params.claimId);
+    if (!row || Number(row.user_id) !== req.user.id) throw ApiError.notFound('Claim not found');
+    ok(res, claims.mapClaim(row, 'customer'));
+  }),
+);
+
+/**
+ * Claims an offer (§3).
+ *
+ * Idempotent by design: while the customer still holds a live code for this
+ * offer, claiming again returns that same code rather than issuing another.
+ * That is what makes the button safe to press twice on a flaky connection, and
+ * it is also §17 - a customer cannot manufacture extra claims by retrying.
  */
 router.post(
-  '/:offerId',
+  '/:offerId(\\d+)',
   validate({ params: offerIdParam }),
   asyncHandler(async (req, res) => {
-    const offer = await queryOne(
-      `SELECT o.id, o.shop_id, o.status, o.end_date, o.start_date, s.status AS shop_status
-         FROM offers o JOIN shops s ON s.id = o.shop_id WHERE o.id = ?`,
-      [req.params.offerId],
-    );
-    if (!offer) throw ApiError.notFound('Offer not found');
+    const { claimId, isNew, offer } = await claims.issue(req.params.offerId, req.user.id);
 
-    // Only a live offer can be claimed - otherwise the code would be worthless
-    // at the counter.
-    const live =
-      offer.status === 'active' &&
-      offer.shop_status === 'active' &&
-      new Date(offer.end_date) >= new Date() &&
-      new Date(offer.start_date) <= new Date();
-    if (!live) throw ApiError.badRequest('This offer is not available to claim');
+    if (isNew) {
+      // Only a genuinely new claim counts. Re-claiming returns the same code
+      // and must not inflate the funnel (§19) or the frequent-claimer segment.
+      await claims.recordClaimEvents(offer, req.user.id);
 
-    const existing = await queryOne(
-      'SELECT id FROM offer_claims WHERE user_id = ? AND offer_id = ?',
-      [req.user.id, req.params.offerId],
-    );
-
-    let claimId = existing?.id;
-    if (!claimId) {
-      const result = await execute(
-        'INSERT INTO offer_claims (offer_id, user_id, code) VALUES (?, ?, ?)',
-        [req.params.offerId, req.user.id, generateCode()],
-      );
-      claimId = result.insertId;
-
-      // Only a genuinely new claim counts - re-claiming returns the same code
-      // and must not inflate the funnel (§10) or the frequent-claimer segment.
-      await analyticsEvents.touchShopCustomer(offer.shop_id, req.user.id, 'claim');
-      await analyticsEvents.record(analyticsEvents.EVENT_TYPES.OFFER_CLAIM, {
-        shopId: offer.shop_id,
-        offerId: Number(req.params.offerId),
-        userId: req.user.id,
-      });
-
-      // Confirmation carrying the code (Push §16). Only for a genuinely new
-      // claim - re-claiming returns the existing code and must not re-notify.
-      // Fire-and-forget: the claim is already issued, and a push outage must
-      // not turn a successful claim into a failed request.
+      // Confirmation carrying the code (§37). Fire-and-forget: the claim is
+      // already issued, and a push outage must not turn a successful claim
+      // into a failed request.
       notifications
         .notifyOfferClaimed(claimId)
         .catch((error) => console.error('[notifications] claim confirmation failed: %s', error.message));
     }
 
-    const rows = await rawQuery(`${CLAIM_SELECT} WHERE c.id = ?`, [claimId]);
-    created(res, mapClaim(rows[0]));
+    const row = await claims.findById(claimId);
+    const body = claims.mapClaim(row, 'customer');
+    if (isNew) created(res, body);
+    else ok(res, body);
   }),
 );
 
-/** Looks a claim up by code, for the staff redemption screen / QR scan. */
-router.get(
-  '/lookup/:code',
-  requirePermission('REDEEM_CLAIM'),
-  validate({ params: codeParam }),
-  asyncHandler(async (req, res) => {
-    const rows = await rawQuery(`${CLAIM_SELECT} WHERE c.code = ?`, [req.params.code.toUpperCase()]);
-    if (!rows.length) throw ApiError.notFound('No claim found for that code');
-
-    // Staff may only look up claims for offers belonging to their own shop.
-    if (!accessControl.hasShopPermission(req.user, rows[0].shop_id, 'REDEEM_CLAIM')) {
-      throw ApiError.forbidden('That claim belongs to another shop');
-    }
-    ok(res, mapClaim(rows[0]));
-  }),
-);
-
-/** Marks a claim redeemed. Shop-scoped, and refuses to double-redeem. */
+/**
+ * The customer gives a claim back (§12 CANCELLED).
+ *
+ * Only a live claim can be cancelled - a redeemed one is a record of something
+ * that physically happened, and nothing a customer does afterwards should be
+ * able to erase it. Cancelling frees the claim against the offer's limit, so
+ * this is also how someone who claimed by accident gets their one claim back.
+ */
 router.post(
-  '/lookup/:code/redeem',
-  requirePermission('REDEEM_CLAIM'),
-  validate({ params: codeParam }),
+  '/:claimId(\\d+)/cancel',
+  validate({ params: claimIdParam }),
   asyncHandler(async (req, res) => {
-    const claim = await queryOne(
-      `SELECT c.*, o.shop_id, o.end_date FROM offer_claims c
-         JOIN offers o ON o.id = c.offer_id WHERE c.code = ?`,
-      [req.params.code.toUpperCase()],
-    );
-    if (!claim) throw ApiError.notFound('No claim found for that code');
-    if (!accessControl.hasShopPermission(req.user, claim.shop_id, 'REDEEM_CLAIM')) {
-      throw ApiError.forbidden('That claim belongs to another shop');
-    }
-    if (claim.status === 'redeemed') throw ApiError.conflict('This claim was already redeemed');
-    if (new Date(claim.end_date) < new Date()) throw ApiError.badRequest('The offer has expired');
+    const row = await queryOne('SELECT id, user_id, status FROM offer_claims WHERE id = ?', [
+      req.params.claimId,
+    ]);
+    if (!row || Number(row.user_id) !== req.user.id) throw ApiError.notFound('Claim not found');
+    if (row.status === 'redeemed') throw ApiError.conflict('This claim has already been redeemed');
+    if (row.status !== 'claimed') throw ApiError.badRequest('This claim is no longer active');
 
-    await execute(
-      `UPDATE offer_claims SET status = 'redeemed', redeemed_at = NOW(), redeemed_by = ?
-        WHERE id = ?`,
-      [req.user.id, claim.id],
-    );
-    await analyticsEvents.touchShopCustomer(claim.shop_id, Number(claim.user_id), 'redeem');
-    await analyticsEvents.record(analyticsEvents.EVENT_TYPES.OFFER_REDEMPTION, {
-      shopId: claim.shop_id,
-      offerId: Number(claim.offer_id),
-      userId: Number(claim.user_id),
-      branchId: claim.branch_id === null ? null : Number(claim.branch_id),
+    await execute("UPDATE offer_claims SET status = 'cancelled' WHERE id = ?", [row.id]);
+    ok(res, claims.mapClaim(await claims.findById(row.id), 'customer'));
+  }),
+);
+
+/**
+ * Resolves the token inside a scanned QR back to the claim it belongs to, for
+ * the customer's own app (§6): a customer who scans their own code from a
+ * printout should land on the claim, not on a login wall.
+ *
+ * Merchants do not come through here - their scan posts to
+ * `/redemptions/verify`, which is where the permission and audit trail are.
+ */
+router.get(
+  '/scan/:token',
+  validate({ params: z.object({ token: z.string().min(10).max(512) }) }),
+  asyncHandler(async (req, res) => {
+    const code = claims.readQrPayload(req.params.token);
+    if (!code) throw ApiError.badRequest('That QR code could not be read');
+
+    const row = await claims.findByCode(code);
+    if (!row || Number(row.user_id) !== req.user.id) throw ApiError.notFound('Claim not found');
+
+    await analyticsEvents.record(analyticsEvents.EVENT_TYPES.CLAIM_QR_VIEW, {
+      shopId: Number(row.shop_id),
+      offerId: Number(row.offer_id),
+      userId: req.user.id,
     });
-
-    await audit.record(req, {
-      action: 'CLAIM_REDEEMED',
-      entityType: 'offer_claim',
-      entityId: Number(claim.id),
-      newValue: { offerId: Number(claim.offer_id), code: claim.code },
-    });
-
-    notifications
-      .notifyOfferRedeemed(claim.id)
-      .catch((error) => console.error('[notifications] redemption notice failed: %s', error.message));
-
-    const rows = await rawQuery(`${CLAIM_SELECT} WHERE c.id = ?`, [claim.id]);
-    ok(res, mapClaim(rows[0]));
+    ok(res, claims.mapClaim(row, 'customer'));
   }),
 );
 

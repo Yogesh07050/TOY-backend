@@ -128,6 +128,16 @@ function mapOffer(row, { includeRelations = false } = {}) {
     endDate: row.end_date,
     status: row.status,
     applicabilityType: row.applicability_type,
+    // Claim rules (Claim/Redemption §17). Present on every offer so the Claim
+    // button can say "1 per customer" without a second request.
+    claimLimitPerCustomer: Number(row.claim_limit_per_customer ?? 1),
+    totalClaimLimit: row.total_claim_limit === null || row.total_claim_limit === undefined
+      ? null
+      : Number(row.total_claim_limit),
+    claimValidityHours: row.claim_validity_hours === null || row.claim_validity_hours === undefined
+      ? null
+      : Number(row.claim_validity_hours),
+    maxRedemptionsPerClaim: Number(row.max_redemptions_per_claim ?? 1),
     imageUrl: row.image_url ?? null,
     thumbnailUrl: row.thumbnail_url ?? null,
     viewCount: Number(row.view_count ?? 0),
@@ -507,6 +517,26 @@ async function getById(id, user, { forManagement = false, position = null } = {}
   offer.rating = { count: Number(rating.count), average: rating.average === null ? null : Number(rating.average) };
   offer.branchIds = offer.branches.map((branch) => branch.id);
 
+  // Claim/Redemption §3/§5: a customer who already holds a code must see the
+  // code, not the Claim button. Only the id, code and status travel - the QR is
+  // the claim endpoint's business, and this response is also served to staff.
+  if (user) {
+    const held = await queryOne(
+      `SELECT id, code, status, expires_at FROM offer_claims
+        WHERE offer_id = ? AND user_id = ? AND status NOT IN ('cancelled','revoked')
+        ORDER BY FIELD(status, 'claimed', 'redeemed', 'expired'), claimed_at DESC LIMIT 1`,
+      [id, user.id],
+    );
+    offer.myClaim = held
+      ? {
+          id: Number(held.id),
+          code: held.code,
+          status: held.status,
+          expiresAt: held.expires_at,
+        }
+      : null;
+  }
+
   return offer;
 }
 
@@ -571,8 +601,10 @@ async function create(payload, user) {
          offer_type, discount_type, discount_value, original_price, discounted_price,
          buy_quantity, get_quantity, min_purchase, terms_conditions, eligibility,
          usage_restrictions, applicable_products, is_recurring, recurrence_type,
-         start_date, end_date, status, applicability_type, created_by, updated_by
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         start_date, end_date, status, applicability_type,
+         claim_limit_per_customer, total_claim_limit, claim_validity_hours,
+         max_redemptions_per_claim, created_by, updated_by
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         payload.shopId,
         payload.categoryId ?? null,
@@ -599,6 +631,10 @@ async function create(payload, user) {
         payload.endDate,
         status,
         payload.applicabilityType,
+        payload.claimLimitPerCustomer,
+        payload.totalClaimLimit ?? null,
+        payload.claimValidityHours ?? null,
+        payload.maxRedemptionsPerClaim,
         user.id,
         user.id,
       ],
@@ -666,7 +702,9 @@ async function update(offerId, payload, user, previous) {
          original_price = ?, discounted_price = ?, buy_quantity = ?, get_quantity = ?,
          min_purchase = ?, terms_conditions = ?, eligibility = ?, usage_restrictions = ?,
          applicable_products = ?, is_recurring = ?, recurrence_type = ?, start_date = ?,
-         end_date = ?, status = ?, applicability_type = ?, updated_by = ?
+         end_date = ?, status = ?, applicability_type = ?,
+         claim_limit_per_customer = ?, total_claim_limit = ?, claim_validity_hours = ?,
+         max_redemptions_per_claim = ?, updated_by = ?
        WHERE id = ?`,
       [
         payload.categoryId ?? null,
@@ -693,6 +731,10 @@ async function update(offerId, payload, user, previous) {
         payload.endDate,
         keepStatus,
         payload.applicabilityType,
+        payload.claimLimitPerCustomer,
+        payload.totalClaimLimit ?? null,
+        payload.claimValidityHours ?? null,
+        payload.maxRedemptionsPerClaim,
         user.id,
         offerId,
       ],

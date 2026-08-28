@@ -68,4 +68,25 @@ const aiLimiter = rateLimit({
   message: message('You are generating a lot at once. Please wait a moment and try again.'),
 });
 
-module.exports = { apiLimiter, authLimiter, emailLimiter, uploadLimiter, aiLimiter };
+/**
+ * Claim verification (Claim/Redemption §28).
+ *
+ * The first of two layers, and the crude one: it caps how fast anyone can post
+ * to the verify screen at all. The second layer lives in the claims service and
+ * counts *failed* attempts per merchant user out of the database, which is what
+ * actually distinguishes someone guessing codes from a queue on a Saturday.
+ * This one only exists so a script cannot make thousands of attempts before
+ * that check has had a chance to notice.
+ *
+ * Per user rather than per IP: a shop's tills share one connection, and a
+ * merchant who moves between phones is still the same person (§17).
+ */
+const claimVerifyLimiter = rateLimit({
+  ...base,
+  windowMs: 60 * 1000,
+  limit: 30,
+  keyGenerator: (req) => (req.user?.id ? `user:${req.user.id}` : req.ip),
+  message: message('Too many unsuccessful attempts. Please try again later.'),
+});
+
+module.exports = { apiLimiter, authLimiter, emailLimiter, uploadLimiter, aiLimiter, claimVerifyLimiter };

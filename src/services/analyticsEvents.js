@@ -23,6 +23,22 @@ const EVENT_TYPES = {
   OFFER_CLAIM: 'OFFER_CLAIM',
   OFFER_REDEMPTION: 'OFFER_REDEMPTION',
 
+  // ---- V3 claim codes & redemption (§32) ----------------------------------
+  // The customer looking at a code they already hold, and looking at the QR
+  // specifically. Both are client-posted: they are screen views, and the only
+  // question they answer is whether customers can find their codes again.
+  OFFER_CLAIM_VIEW: 'OFFER_CLAIM_VIEW',
+  CLAIM_QR_VIEW: 'CLAIM_QR_VIEW',
+  // The merchant's side, all server-recorded. ATTEMPT is every scan or typed
+  // code; SUCCESS and FAILURE split it by outcome. A shop whose attempts run
+  // far ahead of its successes is either training staff badly or being probed.
+  CLAIM_VERIFICATION_ATTEMPT: 'CLAIM_VERIFICATION_ATTEMPT',
+  CLAIM_VERIFICATION_SUCCESS: 'CLAIM_VERIFICATION_SUCCESS',
+  CLAIM_VERIFICATION_FAILURE: 'CLAIM_VERIFICATION_FAILURE',
+  // A verified claim the merchant then declined to redeem, which is not the
+  // same as a code that failed to verify.
+  OFFER_REDEMPTION_REJECTED: 'OFFER_REDEMPTION_REJECTED',
+
   BANNER_IMPRESSION: 'BANNER_IMPRESSION',
   BANNER_CLICK: 'BANNER_CLICK',
 
@@ -89,6 +105,8 @@ const CLIENT_EVENT_TYPES = [
   EVENT_TYPES.LOCATION_SEARCH,
   EVENT_TYPES.NEARBY_OFFER_VIEW,
   EVENT_TYPES.BANNER_IMPRESSION,
+  EVENT_TYPES.OFFER_CLAIM_VIEW,
+  EVENT_TYPES.CLAIM_QR_VIEW,
 
   EVENT_TYPES.PREFERENCE_ONBOARDING_STARTED,
   EVENT_TYPES.PREFERENCE_CATEGORY_SELECTED,

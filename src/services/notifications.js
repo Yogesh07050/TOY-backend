@@ -56,17 +56,20 @@ const DEEP_LINK_PATHS = {
   service_offer: (id) => `service/${id}`,
   service: (id) => `service/${id}`,
   shop: (id) => `shop/${id}`,
+  // Claim/Redemption §5/§34 gave the claim a screen of its own, which is what
+  // the "[View Claim]" button in §37 opens: the code and the QR, not the offer
+  // the customer already knows they claimed.
+  offer_claim: (id) => `claim/${id}`,
 };
 
 /**
  * Builds the `offersapp://...` URL stored on the notification row.
  *
- * Claims, redemptions and bookings are deliberately absent from the table
- * above: their notifications reference a claim or booking record, but the app
- * has no screen that opens one by id, so deriving `claim/17` would produce a
- * link that matches no route and quietly does nothing. Those callers pass an
- * explicit `deepLink` to the listing the record belongs to instead - which is
- * a real screen, and the one a customer wants anyway.
+ * An entity type absent from the table above - a booking, say - has no screen
+ * that opens it by id, so deriving `booking/17` would produce a link matching
+ * no route that quietly does nothing. Those callers pass an explicit `deepLink`
+ * to the listing the record belongs to instead, which is a real screen and the
+ * one a customer wants anyway.
  */
 function deepLinkFor(entityType, entityId) {
   const path = entityId != null && DEEP_LINK_PATHS[entityType]?.(entityId);
@@ -732,9 +735,9 @@ async function notifyOfferClaimed(claimId) {
     message: `${claim.shop_name} - ${claim.title}. Claim code: ${claim.code}. Show this at the shop.`,
     entityType: 'offer_claim',
     entityId: Number(claim.id),
-    // The claim has no screen of its own; the offer it belongs to is where the
-    // customer can see it again.
-    deepLink: deepLinkFor('offer', Number(claim.offer_id)),
+    // §37's "[View Claim]": the code and QR, which is what the customer is
+    // about to need at the counter.
+    deepLink: deepLinkFor('offer_claim', Number(claim.id)),
   });
 }
 
@@ -757,7 +760,7 @@ async function notifyOfferRedeemed(claimId) {
     message: `Your ${claim.title} offer at ${claim.shop_name} has been successfully redeemed.`,
     entityType: 'offer_claim',
     entityId: Number(claim.id),
-    deepLink: deepLinkFor('offer', Number(claim.offer_id)),
+    deepLink: deepLinkFor('offer_claim', Number(claim.id)),
   });
 }
 

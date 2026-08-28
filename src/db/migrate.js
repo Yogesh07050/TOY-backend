@@ -164,6 +164,61 @@ const COLUMN_PATCHES = [
       'UPDATE refresh_tokens SET family_id = REPLACE(UUID(), \'-\', \'\') WHERE family_id IS NULL',
     ],
   },
+
+  // ---- V3 claim codes & redemption ----------------------------------------
+  // Claim rules on the offer (§17). Every existing offer keeps the behaviour it
+  // already had - one claim per customer, one redemption - because that is what
+  // the defaults spell out.
+  {
+    table: 'offers',
+    column: 'claim_limit_per_customer',
+    sql: `ALTER TABLE offers ADD COLUMN claim_limit_per_customer INT UNSIGNED NOT NULL DEFAULT 1
+            AFTER applicability_type`,
+    after: [
+      'ALTER TABLE offers ADD COLUMN total_claim_limit INT UNSIGNED DEFAULT NULL AFTER claim_limit_per_customer',
+      'ALTER TABLE offers ADD COLUMN claim_validity_hours INT UNSIGNED DEFAULT NULL AFTER total_claim_limit',
+      `ALTER TABLE offers ADD COLUMN max_redemptions_per_claim INT UNSIGNED NOT NULL DEFAULT 1
+         AFTER claim_validity_hours`,
+    ],
+  },
+  // The claim itself grows the fields §30/§31 ask for. `expires_at` is declared
+  // NOT NULL in schema.sql but has to be added nullable here and back-filled
+  // first, because existing rows have nothing to put in it until the offer's
+  // end date is copied across.
+  {
+    table: 'offer_claims',
+    column: 'expires_at',
+    sql: 'ALTER TABLE offer_claims ADD COLUMN expires_at DATETIME NULL AFTER claimed_at',
+    after: [
+      `UPDATE offer_claims c JOIN offers o ON o.id = c.offer_id
+          SET c.expires_at = o.end_date WHERE c.expires_at IS NULL`,
+      'ALTER TABLE offer_claims MODIFY COLUMN expires_at DATETIME NOT NULL',
+      'ALTER TABLE offer_claims ADD COLUMN shop_id BIGINT UNSIGNED NULL AFTER user_id',
+      'UPDATE offer_claims c JOIN offers o ON o.id = c.offer_id SET c.shop_id = o.shop_id WHERE c.shop_id IS NULL',
+      'ALTER TABLE offer_claims MODIFY COLUMN shop_id BIGINT UNSIGNED NOT NULL',
+      `ALTER TABLE offer_claims ADD CONSTRAINT fk_claim_shop FOREIGN KEY (shop_id)
+         REFERENCES shops (id) ON DELETE CASCADE`,
+      'ALTER TABLE offer_claims ADD COLUMN claim_seq INT UNSIGNED NOT NULL DEFAULT 1 AFTER code',
+      `ALTER TABLE offer_claims ADD COLUMN verification_method ENUM('QR_SCAN','CODE_ENTRY')
+         DEFAULT NULL AFTER redeemed_by`,
+      `ALTER TABLE offer_claims ADD COLUMN redemption_count INT UNSIGNED NOT NULL DEFAULT 0
+         AFTER verification_method`,
+      // Rows redeemed before this column existed have exactly one redemption.
+      "UPDATE offer_claims SET redemption_count = 1 WHERE status = 'redeemed'",
+      'ALTER TABLE offer_claims ADD COLUMN revoked_at DATETIME DEFAULT NULL AFTER redemption_count',
+      'ALTER TABLE offer_claims ADD COLUMN revoked_by BIGINT UNSIGNED DEFAULT NULL AFTER revoked_at',
+      'ALTER TABLE offer_claims ADD COLUMN revoke_reason VARCHAR(255) DEFAULT NULL AFTER revoked_by',
+      `ALTER TABLE offer_claims ADD CONSTRAINT fk_claim_revoked_by FOREIGN KEY (revoked_by)
+         REFERENCES users (id) ON DELETE SET NULL`,
+      `ALTER TABLE offer_claims ADD COLUMN created_at DATETIME NOT NULL
+         DEFAULT CURRENT_TIMESTAMP AFTER revoke_reason`,
+      `ALTER TABLE offer_claims ADD COLUMN updated_at DATETIME NOT NULL
+         DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP AFTER created_at`,
+      'ALTER TABLE offer_claims ADD KEY idx_claim_shop_status (shop_id, status, claimed_at)',
+      'ALTER TABLE offer_claims ADD KEY idx_claim_redeemed (shop_id, redeemed_at)',
+      'ALTER TABLE offer_claims ADD KEY idx_claim_expiry (status, expires_at)',
+    ],
+  },
 ];
 
 /**
@@ -309,6 +364,103 @@ const STATEMENT_PATCHES = [
     sql: `ALTER TABLE analytics_events
             ADD CONSTRAINT fk_ae_service FOREIGN KEY (service_id)
             REFERENCES services (id) ON DELETE CASCADE`,
+  },
+
+  // ---- V3 claim codes & redemption ----------------------------------------
+  {
+    name: "offer_claims.status += 'revoked'",
+    // §12: a claim invalidated by an authorised action is not the same thing
+    // as one the customer cancelled, and a dispute needs to tell them apart.
+    check: async (connection, dbName) => {
+      const [rows] = await connection.query(
+        `SELECT COLUMN_TYPE AS t FROM information_schema.COLUMNS
+          WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'offer_claims' AND COLUMN_NAME = 'status'`,
+        [dbName],
+      );
+      return rows.length > 0 && !rows[0].t.includes('revoked');
+    },
+    sql: `ALTER TABLE offer_claims
+            MODIFY COLUMN status ENUM('claimed','redeemed','expired','cancelled','revoked')
+            NOT NULL DEFAULT 'claimed'`,
+  },
+  {
+    name: 'offer_claims unique key admits more than one claim per customer',
+    // The original key was (user_id, offer_id), which hard-coded "one claim per
+    // customer per offer" into the schema. §17 makes that a per-offer setting,
+    // so the sequence number joins the key: the limit is now enforced in code
+    // and this still stops two concurrent requests from both issuing a code.
+    check: async (connection, dbName) => {
+      const [rows] = await connection.query(
+        `SELECT 1 FROM information_schema.STATISTICS
+          WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'offer_claims'
+            AND INDEX_NAME = 'uq_claim_user_offer' LIMIT 1`,
+        [dbName],
+      );
+      return rows.length > 0;
+    },
+    run: async (connection) => {
+      await connection.query(
+        `ALTER TABLE offer_claims ADD UNIQUE KEY uq_claim_user_offer_seq (user_id, offer_id, claim_seq)`,
+      );
+      await connection.query('ALTER TABLE offer_claims DROP INDEX uq_claim_user_offer');
+    },
+  },
+  {
+    name: 'REDEEM_CLAIM is renamed to REDEEM_OFFER',
+    // §25 names the permission REDEEM_OFFER. Renaming the row rather than
+    // inserting a second one is what keeps every existing grant intact:
+    // role_permissions points at the id, which does not move.
+    check: async (connection) => {
+      const [rows] = await connection.query(
+        "SELECT 1 FROM permissions WHERE name = 'REDEEM_CLAIM' LIMIT 1",
+      );
+      return rows.length > 0;
+    },
+    run: async (connection) => {
+      // A REDEEM_OFFER row can only already exist if the seeder ran first, in
+      // which case the grants live on that one and the old row is dead weight.
+      const [existing] = await connection.query(
+        "SELECT id FROM permissions WHERE name = 'REDEEM_OFFER' LIMIT 1",
+      );
+      if (existing.length) {
+        await connection.query(
+          `INSERT IGNORE INTO role_permissions (role_id, permission_id)
+             SELECT rp.role_id, ? FROM role_permissions rp
+              JOIN permissions p ON p.id = rp.permission_id AND p.name = 'REDEEM_CLAIM'`,
+          [existing[0].id],
+        );
+        await connection.query("DELETE FROM permissions WHERE name = 'REDEEM_CLAIM'");
+        return;
+      }
+      await connection.query(
+        "UPDATE permissions SET name = 'REDEEM_OFFER' WHERE name = 'REDEEM_CLAIM'",
+      );
+    },
+  },
+  {
+    name: 'shop Admins may verify claims and read their redemption history',
+    // §25 splits what used to be one blunt "can redeem" grant into scanning,
+    // redeeming, listing and exporting. An Admin who could already redeem must
+    // keep being able to reach the screen that redeems - so the new companion
+    // permissions follow REDEEM_OFFER onto the role rather than waiting for a
+    // Super Admin to notice.
+    check: async (connection) => {
+      const [rows] = await connection.query(
+        `SELECT 1 FROM roles r
+           JOIN permissions p ON p.name IN ('VIEW_CLAIMS','VERIFY_CLAIM','VIEW_REDEMPTION_HISTORY',
+                                          'EXPORT_REDEMPTION_REPORT')
+          WHERE r.name = 'ADMIN'
+            AND NOT EXISTS (SELECT 1 FROM role_permissions rp
+                             WHERE rp.role_id = r.id AND rp.permission_id = p.id)
+          LIMIT 1`,
+      );
+      return rows.length > 0;
+    },
+    sql: `INSERT IGNORE INTO role_permissions (role_id, permission_id)
+          SELECT r.id, p.id FROM roles r
+            JOIN permissions p ON p.name IN ('VIEW_CLAIMS','VERIFY_CLAIM','VIEW_REDEMPTION_HISTORY',
+                                             'EXPORT_REDEMPTION_REPORT')
+           WHERE r.name = 'ADMIN'`,
   },
 ];
 

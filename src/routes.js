@@ -25,6 +25,11 @@ router.use('/banners', require('./modules/banners/banner.routes'));
 router.use('/discovery', require('./modules/discovery/discovery.routes'));
 router.use('/search', require('./modules/search/search.routes'));
 router.use('/claims', require('./modules/claims/claim.routes'));
+// The merchant's side of the same workflow (Claim/Redemption §7-§11, §24-§26).
+// Split from `/claims` on purpose: nothing a customer can reach is allowed to
+// write a redemption, and separate routers make that impossible rather than
+// merely unlikely.
+router.use('/redemptions', require('./modules/claims/redemption.routes'));
 
 // ---- V3 ----
 router.use('/subscriptions', require('./modules/subscriptions/subscription.routes'));

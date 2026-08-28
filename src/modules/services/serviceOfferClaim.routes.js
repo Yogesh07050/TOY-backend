@@ -146,13 +146,13 @@ router.post(
 
 router.get(
   '/lookup/:code',
-  requirePermission('REDEEM_CLAIM'),
+  requirePermission('REDEEM_OFFER'),
   validate({ params: codeParam }),
   asyncHandler(async (req, res) => {
     const rows = await rawQuery(`${CLAIM_SELECT} WHERE c.code = ?`, [req.params.code.toUpperCase()]);
     if (!rows.length) throw ApiError.notFound('No claim found for that code');
 
-    if (!accessControl.hasShopPermission(req.user, rows[0].shop_id, 'REDEEM_CLAIM')) {
+    if (!accessControl.hasShopPermission(req.user, rows[0].shop_id, 'REDEEM_OFFER')) {
       throw ApiError.forbidden('That claim belongs to another shop');
     }
     ok(res, mapClaim(rows[0]));
@@ -161,7 +161,7 @@ router.get(
 
 router.post(
   '/lookup/:code/redeem',
-  requirePermission('REDEEM_CLAIM'),
+  requirePermission('REDEEM_OFFER'),
   validate({ params: codeParam }),
   asyncHandler(async (req, res) => {
     const claim = await queryOne(
@@ -172,7 +172,7 @@ router.post(
       [req.params.code.toUpperCase()],
     );
     if (!claim) throw ApiError.notFound('No claim found for that code');
-    if (!accessControl.hasShopPermission(req.user, claim.shop_id, 'REDEEM_CLAIM')) {
+    if (!accessControl.hasShopPermission(req.user, claim.shop_id, 'REDEEM_OFFER')) {
       throw ApiError.forbidden('That claim belongs to another shop');
     }
     if (claim.status === 'redeemed') throw ApiError.conflict('This claim was already redeemed');
