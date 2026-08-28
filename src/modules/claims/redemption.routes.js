@@ -63,12 +63,19 @@ router.use(authenticate);
 async function resolveAttempt(req, { code, qrToken, method, branchId }) {
   await claims.assertNotRateLimited(req.user.id);
 
-  const presented = qrToken ? claims.readQrPayload(qrToken) : claims.normaliseCode(code);
+  // A scanned QR names its own kind; a typed code names nothing, so both
+  // tables are searched (§22). Either way the shopkeeper is never asked which
+  // sort of coupon they are holding.
+  const scanned = qrToken ? claims.readQrPayload(qrToken) : null;
+  const presented = qrToken ? scanned?.code ?? null : claims.normaliseCode(code);
+
   await analyticsEvents.record(analyticsEvents.EVENT_TYPES.CLAIM_VERIFICATION_ATTEMPT, {
     userId: req.user.id,
   });
 
-  const row = presented ? await claims.findByCode(presented) : null;
+  const found = presented ? await claims.findAnyByCode(presented, scanned?.kind) : null;
+  const row = found?.row ?? null;
+  const kind = found?.kind ?? 'offer';
 
   // A forged QR and an invented code are the same event as far as anyone
   // outside is concerned (§13); the log below is where they are told apart.
@@ -86,12 +93,13 @@ async function resolveAttempt(req, { code, qrToken, method, branchId }) {
   }
 
   const branch = claims.resolveBranch(req.user, row.shop_id, branchId);
-  const verdict = await claims.evaluate(row, req.user, branch);
+  const verdict = await claims.evaluate(row, req.user, branch, kind);
 
   if (!verdict.ok) {
     await claims.logVerification(req, {
       claimId: Number(row.id),
-      offerId: Number(row.offer_id),
+      kind,
+      parentId: Number(row.offer_id),
       // A claim for another shop is logged against the shop that *tried*, not
       // the one that owns it - it is the attempt that is worth investigating,
       // and attributing it to the innocent shop would bury it.
@@ -105,7 +113,7 @@ async function resolveAttempt(req, { code, qrToken, method, branchId }) {
     });
     await analyticsEvents.record(analyticsEvents.EVENT_TYPES.CLAIM_VERIFICATION_FAILURE, {
       shopId: verdict.reason === 'WRONG_SHOP' ? null : Number(row.shop_id),
-      offerId: Number(row.offer_id),
+      offerId: kind === 'offer' ? Number(row.offer_id) : null,
       userId: req.user.id,
     });
 
@@ -127,7 +135,7 @@ async function resolveAttempt(req, { code, qrToken, method, branchId }) {
     throw error;
   }
 
-  return { row, branch };
+  return { row, branch, kind };
 }
 
 /**
@@ -140,11 +148,12 @@ router.post(
   requirePermission('VERIFY_CLAIM'),
   validate({ body: verifyBody }),
   asyncHandler(async (req, res) => {
-    const { row, branch } = await resolveAttempt(req, req.body);
+    const { row, branch, kind } = await resolveAttempt(req, req.body);
 
     await claims.logVerification(req, {
       claimId: Number(row.id),
-      offerId: Number(row.offer_id),
+      kind,
+      parentId: Number(row.offer_id),
       shopId: Number(row.shop_id),
       branchId: branch,
       customerId: Number(row.user_id),
@@ -154,12 +163,12 @@ router.post(
     });
     await analyticsEvents.record(analyticsEvents.EVENT_TYPES.CLAIM_VERIFICATION_SUCCESS, {
       shopId: Number(row.shop_id),
-      offerId: Number(row.offer_id),
+      offerId: kind === 'offer' ? Number(row.offer_id) : null,
       userId: req.user.id,
     });
 
     ok(res, {
-      ...claims.mapClaim(row, 'merchant'),
+      ...claims.mapClaim(row, 'merchant', kind),
       // §10's "READY TO REDEEM". Verifying does not redeem, so the screen needs
       // to be told in as many words that the second button is still to come.
       verdict: 'READY_TO_REDEEM',
@@ -181,7 +190,7 @@ router.post(
   requirePermission('REDEEM_OFFER'),
   validate({ body: verifyBody }),
   asyncHandler(async (req, res) => {
-    const { row, branch } = await resolveAttempt(req, req.body);
+    const { row, branch, kind } = await resolveAttempt(req, req.body);
     if (!accessControl.hasShopPermission(req.user, row.shop_id, 'REDEEM_OFFER')) {
       throw ApiError.forbidden('You do not have permission to redeem claims for this shop');
     }
@@ -192,7 +201,7 @@ router.post(
     // UPDATE of the two can match. Losing that race is not an error the
     // shopkeeper caused, so it is reported as §15's "already redeemed".
     const result = await execute(
-      `UPDATE offer_claims
+      `UPDATE ${claims.kindOf(kind).claimsTable}
           SET redemption_count = redemption_count + 1,
               status = CASE WHEN redemption_count + 1 >= ? THEN 'redeemed' ELSE status END,
               redeemed_at = NOW(),
@@ -206,7 +215,8 @@ router.post(
     if (!Number(result.affectedRows)) {
       await claims.logVerification(req, {
         claimId: Number(row.id),
-        offerId: Number(row.offer_id),
+        kind,
+        parentId: Number(row.offer_id),
         shopId: Number(row.shop_id),
         branchId: branch,
         customerId: Number(row.user_id),
@@ -220,7 +230,8 @@ router.post(
 
     await claims.logVerification(req, {
       claimId: Number(row.id),
-      offerId: Number(row.offer_id),
+      kind,
+      parentId: Number(row.offer_id),
       shopId: Number(row.shop_id),
       branchId: branch,
       customerId: Number(row.user_id),
@@ -232,30 +243,40 @@ router.post(
     // §18/§19: this is the verified offline conversion, and the only event in
     // the funnel that says a customer actually walked in.
     await analyticsEvents.touchShopCustomer(Number(row.shop_id), Number(row.user_id), 'redeem');
-    await analyticsEvents.record(analyticsEvents.EVENT_TYPES.OFFER_REDEMPTION, {
-      shopId: Number(row.shop_id),
-      offerId: Number(row.offer_id),
-      userId: Number(row.user_id),
-      branchId: branch,
-    });
+    await analyticsEvents.record(
+      kind === 'service_offer'
+        ? analyticsEvents.EVENT_TYPES.SERVICE_OFFER_REDEEM
+        : analyticsEvents.EVENT_TYPES.OFFER_REDEMPTION,
+      {
+        shopId: Number(row.shop_id),
+        // analytics_events.offer_id has a foreign key to `offers`, so a service
+        // redemption is tagged by shop and branch alone.
+        offerId: kind === 'offer' ? Number(row.offer_id) : null,
+        userId: Number(row.user_id),
+        branchId: branch,
+      },
+    );
 
     await audit.record(req, {
-      action: 'CLAIM_REDEEMED',
-      entityType: 'offer_claim',
+      action: kind === 'service_offer' ? 'SERVICE_OFFER_CLAIM_REDEEMED' : 'CLAIM_REDEEMED',
+      entityType: kind === 'service_offer' ? 'service_offer_claim' : 'offer_claim',
       entityId: Number(row.id),
       newValue: {
-        offerId: Number(row.offer_id),
+        kind,
+        listingId: Number(row.offer_id),
         code: row.code,
         branchId: branch,
         method: req.body.method,
       },
     });
 
-    notifications
-      .notifyOfferRedeemed(Number(row.id))
-      .catch((error) => console.error('[notifications] redemption notice failed: %s', error.message));
+    const notify =
+      kind === 'service_offer' ? notifications.notifyServiceOfferRedeemed : notifications.notifyOfferRedeemed;
+    notify(Number(row.id)).catch((error) =>
+      console.error('[notifications] redemption notice failed: %s', error.message),
+    );
 
-    ok(res, claims.mapClaim(await claims.findById(row.id), 'merchant'));
+    ok(res, claims.mapClaim(await claims.findById(row.id, kind), 'merchant', kind));
   }),
 );
 
@@ -277,14 +298,17 @@ router.post(
     }),
   }),
   asyncHandler(async (req, res) => {
-    const row = await claims.findByCode(req.body.code);
+    const found = await claims.findAnyByCode(req.body.code);
+    const row = found?.row;
+    const kind = found?.kind ?? 'offer';
     if (!row || !accessControl.hasShopPermission(req.user, row.shop_id, 'VERIFY_CLAIM')) {
       throw ApiError.notFound(claims.REJECTIONS.NOT_FOUND);
     }
 
     await claims.logVerification(req, {
       claimId: Number(row.id),
-      offerId: Number(row.offer_id),
+      kind,
+      parentId: Number(row.offer_id),
       shopId: Number(row.shop_id),
       customerId: Number(row.user_id),
       code: row.code,
@@ -294,7 +318,7 @@ router.post(
     });
     await analyticsEvents.record(analyticsEvents.EVENT_TYPES.OFFER_REDEMPTION_REJECTED, {
       shopId: Number(row.shop_id),
-      offerId: Number(row.offer_id),
+      offerId: kind === 'offer' ? Number(row.offer_id) : null,
       userId: req.user.id,
     });
 
@@ -340,8 +364,41 @@ function shopScopeClause(user, permission, requestedShopId) {
   return { sql: `c.shop_id IN (${scope.map(() => '?').join(',')})`, params: scope };
 }
 
+/**
+ * The joins and searchable columns each kind's list queries need.
+ *
+ * The COUNT(*) beside every list has to repeat the joins its WHERE touches,
+ * and the searchable title lives on a different table for each kind - so both
+ * are described once here rather than spelled out at four call sites.
+ */
+const LIST_SHAPES = {
+  offer: {
+    countFrom: `FROM offer_claims c
+                  JOIN offers o ON o.id = c.offer_id
+                  JOIN users  u ON u.id = c.user_id`,
+    titleColumn: 'o.title',
+  },
+  service_offer: {
+    countFrom: `FROM service_offer_claims c
+                  JOIN service_offers so ON so.id = c.service_offer_id
+                  JOIN services sv ON sv.id = so.service_id
+                  JOIN users u ON u.id = c.user_id`,
+    titleColumn: 'sv.name',
+  },
+};
+
+const shapeFor = (kind) => LIST_SHAPES[kind] ?? LIST_SHAPES.offer;
+
+const kindQuery = z.enum(['offer', 'service_offer']).default('offer');
+
 const historyQuery = z.object({
   ...paginationSchema,
+  /**
+   * Which listing type to report on (§22). The merchant console shows one at a
+   * time rather than a union: the two have different column headings, and a
+   * merged list would have to blank half of each row.
+   */
+  kind: kindQuery,
   shopId: z.coerce.number().int().positive().optional(),
   branchId: z.coerce.number().int().positive().optional(),
   offerId: z.coerce.number().int().positive().optional(),
@@ -355,6 +412,7 @@ const historyQuery = z.object({
 /** Builds the shared WHERE for the history and claims lists. */
 function historyWhere(req, permission, extra = []) {
   const scope = shopScopeClause(req.user, permission, req.query.shopId);
+  const shape = shapeFor(req.query.kind);
   const where = [scope.sql, ...extra];
   const params = [...scope.params];
 
@@ -375,7 +433,7 @@ function historyWhere(req, permission, extra = []) {
     params.push(claims.normaliseCode(req.query.code));
   }
   if (req.query.search) {
-    where.push('(o.title LIKE ? OR u.name LIKE ? OR c.code LIKE ?)');
+    where.push(`(${shape.titleColumn} LIKE ? OR u.name LIKE ? OR c.code LIKE ?)`);
     const like = `%${req.query.search}%`;
     params.push(like, like, like);
   }
@@ -388,6 +446,7 @@ router.get(
   requirePermission('VIEW_REDEMPTION_HISTORY'),
   validate({ query: historyQuery }),
   asyncHandler(async (req, res) => {
+    const kind = req.query.kind;
     const { limit, page, offset } = limitOffset(req.query);
     const { where, params } = historyWhere(req, 'VIEW_REDEMPTION_HISTORY', [
       'c.redeemed_at IS NOT NULL',
@@ -405,21 +464,16 @@ router.get(
     const whereSql = `WHERE ${where.join(' AND ')}`;
     const [rows, countRows] = await Promise.all([
       rawQuery(
-        `${claims.CLAIM_SELECT} ${whereSql} ORDER BY c.redeemed_at DESC LIMIT ${limit} OFFSET ${offset}`,
+        `${claims.selectFor(kind)} ${whereSql} ORDER BY c.redeemed_at DESC LIMIT ${limit} OFFSET ${offset}`,
         params,
       ),
-      rawQuery(
-        `SELECT COUNT(*) AS total FROM offer_claims c
-           JOIN offers o ON o.id = c.offer_id
-           JOIN users  u ON u.id = c.user_id ${whereSql}`,
-        params,
-      ),
+      rawQuery(`SELECT COUNT(*) AS total ${shapeFor(kind).countFrom} ${whereSql}`, params),
     ]);
 
     const audience = req.user.isSuperAdmin ? 'admin' : 'merchant';
     paginated(
       res,
-      rows.map((row) => claims.mapClaim(row, audience)),
+      rows.map((row) => claims.mapClaim(row, audience, kind)),
       { page, limit, total: Number(countRows[0].total) },
     );
   }),
@@ -437,24 +491,31 @@ router.get(
   asyncHandler(async (req, res) => {
     const scope = shopScopeClause(req.user, 'VIEW_CLAIMS', req.query.shopId);
 
-    const row = await queryOne(
-      `SELECT
-         SUM(DATE(c.claimed_at) = CURDATE())                                    AS claims_today,
-         SUM(DATE(c.redeemed_at) = CURDATE())                                   AS redemptions_today,
-         SUM(c.status = 'claimed' AND c.expires_at >= NOW())                    AS pending,
-         COUNT(*)                                                               AS claims_total,
-         SUM(c.redeemed_at IS NOT NULL)                                         AS redemptions_total
-       FROM offer_claims c WHERE ${scope.sql}`,
-      scope.params,
-    );
+    // Both kinds, added together. The shopkeeper looking at this is asking
+    // "how busy was the counter today", and a customer redeeming a service
+    // coupon walked through the same door as one redeeming a product coupon.
+    const totals = { claims_today: 0, redemptions_today: 0, pending: 0, claims_total: 0, redemptions_total: 0 };
+    for (const descriptor of Object.values(claims.KINDS)) {
+      const row = await queryOne(
+        `SELECT
+           SUM(DATE(c.claimed_at) = CURDATE())                  AS claims_today,
+           SUM(DATE(c.redeemed_at) = CURDATE())                 AS redemptions_today,
+           SUM(c.status = 'claimed' AND c.expires_at >= NOW())  AS pending,
+           COUNT(*)                                             AS claims_total,
+           SUM(c.redeemed_at IS NOT NULL)                       AS redemptions_total
+         FROM ${descriptor.claimsTable} c WHERE ${scope.sql}`,
+        scope.params,
+      );
+      for (const key of Object.keys(totals)) totals[key] += Number(row?.[key] ?? 0);
+    }
 
-    const claimsTotal = Number(row?.claims_total ?? 0);
-    const redemptionsTotal = Number(row?.redemptions_total ?? 0);
+    const claimsTotal = totals.claims_total;
+    const redemptionsTotal = totals.redemptions_total;
 
     ok(res, {
-      claimsToday: Number(row?.claims_today ?? 0),
-      redemptionsToday: Number(row?.redemptions_today ?? 0),
-      pending: Number(row?.pending ?? 0),
+      claimsToday: totals.claims_today,
+      redemptionsToday: totals.redemptions_today,
+      pending: totals.pending,
       claimsTotal,
       redemptionsTotal,
       // §20's "Claim → Redemption". Null rather than 0 when nothing has been
@@ -481,6 +542,7 @@ router.get(
     }),
   }),
   asyncHandler(async (req, res) => {
+    const kind = req.query.kind;
     const { limit, page, offset } = limitOffset(req.query);
     const { where, params } = historyWhere(req, 'VIEW_CLAIMS');
 
@@ -504,21 +566,16 @@ router.get(
     const whereSql = `WHERE ${where.join(' AND ')}`;
     const [rows, countRows] = await Promise.all([
       rawQuery(
-        `${claims.CLAIM_SELECT} ${whereSql} ORDER BY c.claimed_at DESC LIMIT ${limit} OFFSET ${offset}`,
+        `${claims.selectFor(kind)} ${whereSql} ORDER BY c.claimed_at DESC LIMIT ${limit} OFFSET ${offset}`,
         params,
       ),
-      rawQuery(
-        `SELECT COUNT(*) AS total FROM offer_claims c
-           JOIN offers o ON o.id = c.offer_id
-           JOIN users  u ON u.id = c.user_id ${whereSql}`,
-        params,
-      ),
+      rawQuery(`SELECT COUNT(*) AS total ${shapeFor(kind).countFrom} ${whereSql}`, params),
     ]);
 
     const audience = req.user.isSuperAdmin ? 'admin' : 'merchant';
     paginated(
       res,
-      rows.map((row) => claims.mapClaim(row, audience)),
+      rows.map((row) => claims.mapClaim(row, audience, kind)),
       { page, limit, total: Number(countRows[0].total) },
     );
   }),
@@ -533,9 +590,13 @@ router.get(
 router.get(
   '/claims/:claimId(\\d+)/audit',
   requirePermission('VIEW_CLAIMS'),
-  validate({ params: z.object({ claimId: z.coerce.number().int().positive() }) }),
+  validate({
+    params: z.object({ claimId: z.coerce.number().int().positive() }),
+    query: z.object({ kind: kindQuery }),
+  }),
   asyncHandler(async (req, res) => {
-    const claim = await claims.findById(req.params.claimId);
+    const kind = req.query.kind;
+    const claim = await claims.findById(req.params.claimId, kind);
     if (!claim) throw ApiError.notFound('Claim not found');
     if (!accessControl.hasShopPermission(req.user, claim.shop_id, 'VIEW_CLAIMS')) {
       throw ApiError.forbidden('That claim belongs to another shop');
@@ -547,12 +608,13 @@ router.get(
          FROM claim_verifications v
          LEFT JOIN users u ON u.id = v.verified_by
          LEFT JOIN shop_branches b ON b.id = v.branch_id
-        WHERE v.claim_id = ? ORDER BY v.created_at DESC, v.id DESC LIMIT 100`,
+        WHERE v.${claims.kindOf(kind).verificationClaimColumn} = ?
+        ORDER BY v.created_at DESC, v.id DESC LIMIT 100`,
       [req.params.claimId],
     );
 
     ok(res, {
-      claim: claims.mapClaim(claim, req.user.isSuperAdmin ? 'admin' : 'merchant'),
+      claim: claims.mapClaim(claim, req.user.isSuperAdmin ? 'admin' : 'merchant', kind),
       events: rows.map((row) => ({
         id: Number(row.id),
         action: row.action,
@@ -577,10 +639,12 @@ router.post(
   requirePermission('REVOKE_CLAIM'),
   validate({
     params: z.object({ claimId: z.coerce.number().int().positive() }),
+    query: z.object({ kind: kindQuery }),
     body: z.object({ reason: z.string().trim().min(3).max(255) }),
   }),
   asyncHandler(async (req, res) => {
-    const claim = await claims.findById(req.params.claimId);
+    const kind = req.query.kind;
+    const claim = await claims.findById(req.params.claimId, kind);
     if (!claim) throw ApiError.notFound('Claim not found');
     if (!accessControl.hasShopPermission(req.user, claim.shop_id, 'REVOKE_CLAIM')) {
       throw ApiError.forbidden('That claim belongs to another shop');
@@ -588,7 +652,7 @@ router.post(
     if (claim.status === 'revoked') throw ApiError.conflict('This claim is already revoked');
 
     await execute(
-      `UPDATE offer_claims
+      `UPDATE ${claims.kindOf(kind).claimsTable}
           SET status = 'revoked', revoked_at = NOW(), revoked_by = ?, revoke_reason = ?
         WHERE id = ?`,
       [req.user.id, req.body.reason, claim.id],
@@ -596,7 +660,8 @@ router.post(
 
     await claims.logVerification(req, {
       claimId: Number(claim.id),
-      offerId: Number(claim.offer_id),
+      kind,
+      parentId: Number(claim.offer_id),
       shopId: Number(claim.shop_id),
       customerId: Number(claim.user_id),
       code: claim.code,
@@ -605,14 +670,14 @@ router.post(
       reason: 'ADMIN_REVOKED',
     });
     await audit.record(req, {
-      action: 'CLAIM_REVOKED',
-      entityType: 'offer_claim',
+      action: kind === 'service_offer' ? 'SERVICE_OFFER_CLAIM_REVOKED' : 'CLAIM_REVOKED',
+      entityType: kind === 'service_offer' ? 'service_offer_claim' : 'offer_claim',
       entityId: Number(claim.id),
       oldValue: { status: claim.status },
       newValue: { status: 'revoked', reason: req.body.reason },
     });
 
-    ok(res, claims.mapClaim(await claims.findById(claim.id), 'admin'));
+    ok(res, claims.mapClaim(await claims.findById(claim.id, kind), 'admin', kind));
   }),
 );
 
@@ -654,7 +719,7 @@ router.get(
     // Capped rather than unbounded: an export is a synchronous response held in
     // memory, and a merchant who needs more than this needs a date range.
     const rows = await rawQuery(
-      `${claims.CLAIM_SELECT} WHERE ${where.join(' AND ')}
+      `${claims.selectFor(req.query.kind)} WHERE ${where.join(' AND ')}
         ORDER BY c.redeemed_at DESC LIMIT 10000`,
       params,
     );

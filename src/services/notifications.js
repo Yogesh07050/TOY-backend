@@ -60,6 +60,9 @@ const DEEP_LINK_PATHS = {
   // the "[View Claim]" button in §37 opens: the code and the QR, not the offer
   // the customer already knows they claimed.
   offer_claim: (id) => `claim/${id}`,
+  // Service claims got the same screen as product ones (§22), so tapping the
+  // notification now opens the code rather than the service it came from.
+  service_offer_claim: (id) => `service-claim/${id}`,
 };
 
 /**
@@ -784,7 +787,7 @@ async function notifyServiceOfferClaimed(claimId) {
     message: `${claim.shop_name} - ${claim.service_name}. Claim code: ${claim.code}.`,
     entityType: 'service_offer_claim',
     entityId: Number(claim.id),
-    deepLink: deepLinkFor('service', Number(claim.service_id)),
+    deepLink: deepLinkFor('service_offer_claim', Number(claim.id)),
   });
 }
 
@@ -808,7 +811,7 @@ async function notifyServiceOfferRedeemed(claimId) {
     message: `Your ${claim.service_name} offer at ${claim.shop_name} has been successfully redeemed.`,
     entityType: 'service_offer_claim',
     entityId: Number(claim.id),
-    deepLink: deepLinkFor('service', Number(claim.service_id)),
+    deepLink: deepLinkFor('service_offer_claim', Number(claim.id)),
   });
 }
 

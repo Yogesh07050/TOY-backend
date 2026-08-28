@@ -249,6 +249,71 @@ const COLUMN_PATCHES = [
       'ALTER TABLE offer_claims ADD KEY idx_claim_expiry (status, expires_at)',
     ],
   },
+
+  // ---- V3 claim codes: the service-offer half (§22) -----------------------
+  // Service offers get the same four claim rules, with the same defaults, so
+  // existing ones keep behaving exactly as they did.
+  {
+    table: 'service_offers',
+    column: 'claim_limit_per_customer',
+    sql: `ALTER TABLE service_offers ADD COLUMN claim_limit_per_customer INT UNSIGNED NOT NULL DEFAULT 1
+            AFTER status`,
+    after: [
+      'ALTER TABLE service_offers ADD COLUMN total_claim_limit INT UNSIGNED DEFAULT NULL AFTER claim_limit_per_customer',
+      'ALTER TABLE service_offers ADD COLUMN claim_validity_hours INT UNSIGNED DEFAULT NULL AFTER total_claim_limit',
+      `ALTER TABLE service_offers ADD COLUMN max_redemptions_per_claim INT UNSIGNED NOT NULL DEFAULT 1
+         AFTER claim_validity_hours`,
+    ],
+  },
+  // The service claim grows into the same shape as `offer_claims`. Same
+  // nullable-then-backfill dance for the two NOT NULL columns.
+  {
+    table: 'service_offer_claims',
+    column: 'expires_at',
+    sql: 'ALTER TABLE service_offer_claims ADD COLUMN expires_at DATETIME NULL AFTER claimed_at',
+    after: [
+      `UPDATE service_offer_claims c JOIN service_offers so ON so.id = c.service_offer_id
+          SET c.expires_at = so.end_date WHERE c.expires_at IS NULL`,
+      'ALTER TABLE service_offer_claims MODIFY COLUMN expires_at DATETIME NOT NULL',
+      'ALTER TABLE service_offer_claims ADD COLUMN shop_id BIGINT UNSIGNED NULL AFTER user_id',
+      `UPDATE service_offer_claims c JOIN service_offers so ON so.id = c.service_offer_id
+          SET c.shop_id = so.shop_id WHERE c.shop_id IS NULL`,
+      'ALTER TABLE service_offer_claims MODIFY COLUMN shop_id BIGINT UNSIGNED NOT NULL',
+      `ALTER TABLE service_offer_claims ADD CONSTRAINT fk_soc_shop FOREIGN KEY (shop_id)
+         REFERENCES shops (id) ON DELETE CASCADE`,
+      'ALTER TABLE service_offer_claims ADD COLUMN claim_seq INT UNSIGNED NOT NULL DEFAULT 1 AFTER code',
+      `ALTER TABLE service_offer_claims ADD COLUMN verification_method ENUM('QR_SCAN','CODE_ENTRY')
+         DEFAULT NULL AFTER redeemed_by`,
+      `ALTER TABLE service_offer_claims ADD COLUMN redemption_count INT UNSIGNED NOT NULL DEFAULT 0
+         AFTER verification_method`,
+      "UPDATE service_offer_claims SET redemption_count = 1 WHERE status = 'redeemed'",
+      'ALTER TABLE service_offer_claims ADD COLUMN revoked_at DATETIME DEFAULT NULL AFTER redemption_count',
+      'ALTER TABLE service_offer_claims ADD COLUMN revoked_by BIGINT UNSIGNED DEFAULT NULL AFTER revoked_at',
+      'ALTER TABLE service_offer_claims ADD COLUMN revoke_reason VARCHAR(255) DEFAULT NULL AFTER revoked_by',
+      `ALTER TABLE service_offer_claims ADD CONSTRAINT fk_soc_revoked_by FOREIGN KEY (revoked_by)
+         REFERENCES users (id) ON DELETE SET NULL`,
+      `ALTER TABLE service_offer_claims ADD COLUMN created_at DATETIME NOT NULL
+         DEFAULT CURRENT_TIMESTAMP AFTER revoke_reason`,
+      `ALTER TABLE service_offer_claims ADD COLUMN updated_at DATETIME NOT NULL
+         DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP AFTER created_at`,
+      'ALTER TABLE service_offer_claims ADD KEY idx_service_claim_shop_status (shop_id, status, claimed_at)',
+      'ALTER TABLE service_offer_claims ADD KEY idx_service_claim_redeemed (shop_id, redeemed_at)',
+      'ALTER TABLE service_offer_claims ADD KEY idx_service_claim_expiry (status, expires_at)',
+    ],
+  },
+  // The verification log learns to point at either kind of claim.
+  {
+    table: 'claim_verifications',
+    column: 'service_claim_id',
+    sql: `ALTER TABLE claim_verifications ADD COLUMN service_claim_id BIGINT UNSIGNED DEFAULT NULL
+            AFTER claim_id`,
+    after: [
+      `ALTER TABLE claim_verifications ADD COLUMN claim_kind ENUM('offer','service_offer')
+         NOT NULL DEFAULT 'offer' AFTER id`,
+      'ALTER TABLE claim_verifications ADD COLUMN service_offer_id BIGINT UNSIGNED DEFAULT NULL AFTER offer_id',
+      'ALTER TABLE claim_verifications ADD KEY idx_cv_service_claim (service_claim_id, created_at)',
+    ],
+  },
 ];
 
 /**
@@ -512,6 +577,71 @@ const STATEMENT_PATCHES = [
             JOIN permissions p ON p.name IN ('VIEW_CLAIMS','VERIFY_CLAIM','VIEW_REDEMPTION_HISTORY',
                                              'EXPORT_REDEMPTION_REPORT')
            WHERE r.name = 'ADMIN'`,
+  },
+  {
+    name: "service_offer_claims.status += 'revoked'",
+    check: async (connection, dbName) => {
+      const [rows] = await connection.query(
+        `SELECT COLUMN_TYPE AS t FROM information_schema.COLUMNS
+          WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'service_offer_claims' AND COLUMN_NAME = 'status'`,
+        [dbName],
+      );
+      return rows.length > 0 && !rows[0].t.includes('revoked');
+    },
+    sql: `ALTER TABLE service_offer_claims
+            MODIFY COLUMN status ENUM('claimed','redeemed','expired','cancelled','revoked')
+            NOT NULL DEFAULT 'claimed'`,
+  },
+  {
+    name: 'service_offer_claims unique key admits more than one claim per customer',
+    check: async (connection, dbName) => {
+      const [rows] = await connection.query(
+        `SELECT 1 FROM information_schema.STATISTICS
+          WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'service_offer_claims'
+            AND INDEX_NAME = 'uq_service_claim_user_offer' LIMIT 1`,
+        [dbName],
+      );
+      return rows.length > 0;
+    },
+    run: async (connection) => {
+      await connection.query(
+        `ALTER TABLE service_offer_claims
+           ADD UNIQUE KEY uq_service_claim_user_offer_seq (user_id, service_offer_id, claim_seq)`,
+      );
+      await connection.query('ALTER TABLE service_offer_claims DROP INDEX uq_service_claim_user_offer');
+    },
+  },
+  {
+    name: 'claim_verifications.service_claim_id -> service_offer_claims FK',
+    // `service_offer_claims` is created later in schema.sql than
+    // `claim_verifications`, so on a fresh install this has to come after both.
+    check: async (connection, dbName) => {
+      const [rows] = await connection.query(
+        `SELECT 1 FROM information_schema.TABLE_CONSTRAINTS
+          WHERE CONSTRAINT_SCHEMA = ? AND TABLE_NAME = 'claim_verifications'
+            AND CONSTRAINT_NAME = 'fk_cv_service_claim' LIMIT 1`,
+        [dbName],
+      );
+      return rows.length === 0;
+    },
+    sql: `ALTER TABLE claim_verifications
+            ADD CONSTRAINT fk_cv_service_claim FOREIGN KEY (service_claim_id)
+            REFERENCES service_offer_claims (id) ON DELETE SET NULL`,
+  },
+  {
+    name: 'claim_verifications.service_offer_id -> service_offers FK',
+    check: async (connection, dbName) => {
+      const [rows] = await connection.query(
+        `SELECT 1 FROM information_schema.TABLE_CONSTRAINTS
+          WHERE CONSTRAINT_SCHEMA = ? AND TABLE_NAME = 'claim_verifications'
+            AND CONSTRAINT_NAME = 'fk_cv_service_offer' LIMIT 1`,
+        [dbName],
+      );
+      return rows.length === 0;
+    },
+    sql: `ALTER TABLE claim_verifications
+            ADD CONSTRAINT fk_cv_service_offer FOREIGN KEY (service_offer_id)
+            REFERENCES service_offers (id) ON DELETE SET NULL`,
   },
 ];
 

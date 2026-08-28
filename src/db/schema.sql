@@ -712,10 +712,16 @@ CREATE TABLE IF NOT EXISTS offer_claims (
 -- like, and it leaves no other trace.
 CREATE TABLE IF NOT EXISTS claim_verifications (
   id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  -- NULL when the code matched nothing - there is no claim to point at, and
-  -- that attempt is the one most worth keeping.
+  -- Which kind of claim was presented. A shopkeeper cannot tell them apart and
+  -- is not asked to; this is what lets the log say which table was hit.
+  claim_kind    ENUM('offer','service_offer') NOT NULL DEFAULT 'offer',
+  -- Exactly one of these is set, and neither is when the code matched nothing -
+  -- which is the attempt most worth keeping. Two columns rather than one
+  -- polymorphic id so both keep a real foreign key.
   claim_id      BIGINT UNSIGNED         DEFAULT NULL,
+  service_claim_id BIGINT UNSIGNED      DEFAULT NULL,
   offer_id      BIGINT UNSIGNED         DEFAULT NULL,
+  service_offer_id BIGINT UNSIGNED      DEFAULT NULL,
   shop_id       BIGINT UNSIGNED         DEFAULT NULL,
   branch_id     BIGINT UNSIGNED         DEFAULT NULL,
   customer_id   BIGINT UNSIGNED         DEFAULT NULL,
@@ -731,9 +737,12 @@ CREATE TABLE IF NOT EXISTS claim_verifications (
   created_at    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   KEY idx_cv_claim (claim_id, created_at),
+  KEY idx_cv_service_claim (service_claim_id, created_at),
   KEY idx_cv_shop (shop_id, created_at),
   -- The rate limiter's read path: this user's recent failures.
   KEY idx_cv_actor (verified_by, action, created_at),
+  -- `service_offer_claims` is created further down this file, so its two
+  -- constraints are attached by a migration patch rather than inline.
   CONSTRAINT fk_cv_claim    FOREIGN KEY (claim_id)    REFERENCES offer_claims (id)  ON DELETE SET NULL,
   CONSTRAINT fk_cv_offer    FOREIGN KEY (offer_id)    REFERENCES offers (id)        ON DELETE SET NULL,
   CONSTRAINT fk_cv_shop     FOREIGN KEY (shop_id)     REFERENCES shops (id)         ON DELETE SET NULL,
@@ -1070,6 +1079,12 @@ CREATE TABLE IF NOT EXISTS service_offers (
   start_date       DATETIME        NOT NULL,
   end_date         DATETIME        NOT NULL,
   status           ENUM('draft','scheduled','active','expired','deactivated') NOT NULL DEFAULT 'draft',
+  -- Claim rules, identical in meaning to the ones on `offers` (§17, §22): a
+  -- service offer is claimed and redeemed by exactly the same mechanism.
+  claim_limit_per_customer  INT UNSIGNED   NOT NULL DEFAULT 1,
+  total_claim_limit         INT UNSIGNED           DEFAULT NULL,
+  claim_validity_hours      INT UNSIGNED           DEFAULT NULL,
+  max_redemptions_per_claim INT UNSIGNED   NOT NULL DEFAULT 1,
   view_count       INT UNSIGNED    NOT NULL DEFAULT 0,
   claim_count      INT UNSIGNED    NOT NULL DEFAULT 0,
   created_by       BIGINT UNSIGNED         DEFAULT NULL,
@@ -1084,25 +1099,43 @@ CREATE TABLE IF NOT EXISTS service_offers (
   CONSTRAINT fk_so_shop    FOREIGN KEY (shop_id)    REFERENCES shops (id)    ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- Column-for-column the same shape as `offer_claims`, because §22 makes it the
+-- same workflow: the shopkeeper scanning a code has no idea whether it belongs
+-- to a shirt or to an AC service, and nothing about the counter differs.
 CREATE TABLE IF NOT EXISTS service_offer_claims (
   id               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   service_offer_id BIGINT UNSIGNED NOT NULL,
   user_id          BIGINT UNSIGNED NOT NULL,
+  shop_id          BIGINT UNSIGNED NOT NULL,
   branch_id        BIGINT UNSIGNED         DEFAULT NULL,
   code             VARCHAR(24)     NOT NULL,
-  status           ENUM('claimed','redeemed','expired','cancelled') NOT NULL DEFAULT 'claimed',
+  claim_seq        INT UNSIGNED    NOT NULL DEFAULT 1,
+  status           ENUM('claimed','redeemed','expired','cancelled','revoked') NOT NULL DEFAULT 'claimed',
   claimed_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  expires_at       DATETIME        NOT NULL,
   redeemed_at      DATETIME                DEFAULT NULL,
   redeemed_by      BIGINT UNSIGNED         DEFAULT NULL,
+  verification_method ENUM('QR_SCAN','CODE_ENTRY') DEFAULT NULL,
+  redemption_count INT UNSIGNED    NOT NULL DEFAULT 0,
+  revoked_at       DATETIME                DEFAULT NULL,
+  revoked_by       BIGINT UNSIGNED         DEFAULT NULL,
+  revoke_reason    VARCHAR(255)            DEFAULT NULL,
+  created_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   UNIQUE KEY uq_service_claim_code (code),
-  UNIQUE KEY uq_service_claim_user_offer (user_id, service_offer_id),
+  UNIQUE KEY uq_service_claim_user_offer_seq (user_id, service_offer_id, claim_seq),
   KEY idx_service_claim_offer (service_offer_id, status),
+  KEY idx_service_claim_shop_status (shop_id, status, claimed_at),
+  KEY idx_service_claim_redeemed (shop_id, redeemed_at),
   KEY idx_service_claim_claimed (claimed_at),
+  KEY idx_service_claim_expiry (status, expires_at),
   CONSTRAINT fk_soc_offer       FOREIGN KEY (service_offer_id) REFERENCES service_offers (id) ON DELETE CASCADE,
   CONSTRAINT fk_soc_user        FOREIGN KEY (user_id)          REFERENCES users (id)          ON DELETE CASCADE,
+  CONSTRAINT fk_soc_shop        FOREIGN KEY (shop_id)          REFERENCES shops (id)          ON DELETE CASCADE,
   CONSTRAINT fk_soc_branch      FOREIGN KEY (branch_id)        REFERENCES shop_branches (id)  ON DELETE SET NULL,
-  CONSTRAINT fk_soc_redeemed_by FOREIGN KEY (redeemed_by)      REFERENCES users (id)          ON DELETE SET NULL
+  CONSTRAINT fk_soc_redeemed_by FOREIGN KEY (redeemed_by)      REFERENCES users (id)          ON DELETE SET NULL,
+  CONSTRAINT fk_soc_revoked_by  FOREIGN KEY (revoked_by)       REFERENCES users (id)          ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- "Saved offers" for services, mirroring `favorites`.

@@ -79,9 +79,12 @@ const QR_KEY = env.claims?.qrSecret
   ? Buffer.from(env.claims.qrSecret)
   : crypto.createHmac('sha256', env.jwt.accessSecret).update('offer-claim-qr').digest();
 
-function signQrPayload(claim) {
+function signQrPayload(claim, kind = 'offer') {
   const body = Buffer.from(
-    JSON.stringify({ v: 1, id: Number(claim.id), c: claim.code }),
+    // `k` distinguishes a product-offer claim from a service-offer one. Both
+    // live in their own table with their own id sequence, so without it a
+    // scanned token would be ambiguous the moment the two ids collided.
+    JSON.stringify({ v: 1, k: kind, id: Number(claim.id), c: claim.code }),
   ).toString('base64url');
   const signature = crypto.createHmac('sha256', QR_KEY).update(body).digest('base64url');
   return `${body}.${signature}`;
@@ -103,7 +106,10 @@ function readQrPayload(token) {
 
   try {
     const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
-    return typeof payload.c === 'string' ? normaliseCode(payload.c) : null;
+    if (typeof payload.c !== 'string') return null;
+    // Tokens minted before service claims existed carry no `k`; they are all
+    // product-offer claims, which is what the default says.
+    return { code: normaliseCode(payload.c), kind: payload.k === 'service_offer' ? 'service_offer' : 'offer' };
   } catch {
     return null;
   }
@@ -114,7 +120,8 @@ function readQrPayload(token) {
  * so that a scan by any ordinary camera app - not just ours - lands the
  * customer somewhere that explains what they are holding.
  */
-const qrValueFor = (claim) => `${env.appUrl}/claims/scan?t=${signQrPayload(claim)}`;
+const qrValueFor = (claim, kind = 'offer') =>
+  `${env.appUrl}/claims/scan?t=${signQrPayload(claim, kind)}`;
 
 // ---------------------------------------------------------------------------
 // Reading claims
@@ -123,6 +130,9 @@ const qrValueFor = (claim) => `${env.appUrl}/claims/scan?t=${signQrPayload(claim
 const CLAIM_SELECT = `
   SELECT c.*, o.title AS offer_title, o.offer_text, o.end_date AS offer_end_date,
          o.applicability_type, o.max_redemptions_per_claim,
+         -- What the branch restriction is keyed on. For a product offer that
+         -- is the offer itself; the service kind points at its parent service.
+         o.id AS location_parent_id,
          s.name AS shop_name, b.branch_name, u.name AS customer_name, u.phone AS customer_phone,
          ru.name AS redeemed_by_name,
          (SELECT oi.image_url FROM offer_images oi
@@ -144,9 +154,10 @@ const CLAIM_SELECT = `
  * and nothing else, and only 'admin' - a Super Admin investigating a dispute
  * (§26) - sees contact details.
  */
-function mapClaim(row, audience = 'customer') {
+function mapClaim(row, audience = 'customer', kind = 'offer') {
   const claim = {
     id: Number(row.id),
+    kind,
     code: row.code,
     status: row.status,
     claimedAt: row.claimed_at,
@@ -167,7 +178,7 @@ function mapClaim(row, audience = 'customer') {
   };
 
   if (audience === 'customer') {
-    claim.qrValue = qrValueFor(row);
+    claim.qrValue = qrValueFor(row, kind);
     return claim;
   }
 
@@ -182,7 +193,36 @@ function mapClaim(row, audience = 'customer') {
   return claim;
 }
 
-const findById = (id) => queryOne(`${CLAIM_SELECT} WHERE c.id = ?`, [id]);
+/**
+ * The service-offer equivalent, aliased column-for-column onto the same names
+ * the product-offer select uses. That is what lets one `mapClaim`, one
+ * `evaluate` and one set of routes serve both: the difference between the two
+ * kinds is confined to these two queries.
+ *
+ * `offer_title` is the service's name rather than the offer's - "AC Deep
+ * Cleaning" is what the customer recognises, and a service offer is only ever
+ * a price attached to it.
+ */
+const SERVICE_CLAIM_SELECT = `
+  SELECT c.*, c.service_offer_id AS offer_id,
+         sv.name AS offer_title, so.offer_text, so.end_date AS offer_end_date,
+         sv.applicability_type, so.max_redemptions_per_claim,
+         sv.id AS location_parent_id,
+         s.name AS shop_name, b.branch_name, u.name AS customer_name, u.phone AS customer_phone,
+         ru.name AS redeemed_by_name,
+         (SELECT si.image_url FROM service_images si
+           WHERE si.service_id = sv.id ORDER BY si.display_order, si.id LIMIT 1) AS image_url
+    FROM service_offer_claims c
+    JOIN service_offers so ON so.id = c.service_offer_id
+    JOIN services sv ON sv.id = so.service_id
+    JOIN shops  s ON s.id = c.shop_id
+    JOIN users  u ON u.id = c.user_id
+    LEFT JOIN shop_branches b ON b.id = c.branch_id
+    LEFT JOIN users ru ON ru.id = c.redeemed_by`;
+
+const selectFor = (kind) => (kindOf(kind).key === 'service_offer' ? SERVICE_CLAIM_SELECT : CLAIM_SELECT);
+
+const findById = (id, kind = 'offer') => queryOne(`${selectFor(kind)} WHERE c.id = ?`, [id]);
 
 /**
  * Looks a claim up by what someone typed or scanned.
@@ -192,10 +232,34 @@ const findById = (id) => queryOne(`${CLAIM_SELECT} WHERE c.id = ?`, [id]);
  * would invalidate every printed and screenshotted code that already exists.
  * The unique index means at most one of the two can match.
  */
-function findByCode(code) {
+function findByCode(code, kind = 'offer') {
   const prefixed = normaliseCode(code);
   const bare = prefixed.slice(CODE_PREFIX.length);
-  return queryOne(`${CLAIM_SELECT} WHERE c.code IN (?, ?)`, [prefixed, bare]);
+  return queryOne(`${selectFor(kind)} WHERE c.code IN (?, ?)`, [prefixed, bare]);
+}
+
+/**
+ * Finds a code without being told which kind it is (§22).
+ *
+ * The shopkeeper at the counter does not know whether the coupon in front of
+ * them is for a shirt or for an air-conditioner service, and should not have
+ * to pick a tab before scanning. So a lookup tries both tables and reports
+ * which one answered.
+ *
+ * `preferred` is the kind a scanned QR claimed to be - checking that one first
+ * saves a query on the common path without trusting it, since the other table
+ * is still searched if it misses.
+ */
+async function findAnyByCode(code, preferred = 'offer') {
+  const order = kindOf(preferred).key === 'service_offer'
+    ? ['service_offer', 'offer']
+    : ['offer', 'service_offer'];
+
+  for (const kind of order) {
+    const row = await findByCode(code, kind);
+    if (row) return { row, kind };
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +281,36 @@ function expiryFor(offer, now = new Date()) {
 }
 
 /**
+ * Loads the listing a claim would hang off, normalised to one shape.
+ *
+ * The two kinds differ only in where the shop lives: an offer joins to its
+ * shop directly, a service offer already carries `shop_id` denormalised. The
+ * claim rules and the dates are named identically on both tables, which is
+ * what lets every check below read one row without caring which it got.
+ */
+async function loadClaimableParent(parentId, descriptor) {
+  if (descriptor.key === 'service_offer') {
+    return queryOne(
+      `SELECT so.id, so.shop_id, so.status, so.start_date, so.end_date,
+              so.claim_limit_per_customer, so.total_claim_limit, so.claim_validity_hours,
+              s.status AS shop_status
+         FROM service_offers so
+         JOIN services sv ON sv.id = so.service_id
+         JOIN shops s ON s.id = so.shop_id
+        WHERE so.id = ? AND sv.status <> 'deactivated'`,
+      [parentId],
+    );
+  }
+  return queryOne(
+    `SELECT o.id, o.shop_id, o.status, o.start_date, o.end_date,
+            o.claim_limit_per_customer, o.total_claim_limit, o.claim_validity_hours,
+            s.status AS shop_status
+       FROM offers o JOIN shops s ON s.id = o.shop_id WHERE o.id = ?`,
+    [parentId],
+  );
+}
+
+/**
  * Everything §3 lists, checked in the order that produces the most useful
  * message: what the offer is, then whether this customer may have it.
  *
@@ -225,15 +319,10 @@ function expiryFor(offer, now = new Date()) {
  * setting), claiming again must hand back the same code rather than mint a
  * second one, so the button stays safe to press twice.
  */
-async function assertClaimable(offerId, userId) {
-  const offer = await queryOne(
-    `SELECT o.id, o.shop_id, o.status, o.start_date, o.end_date, o.title,
-            o.claim_limit_per_customer, o.total_claim_limit, o.claim_validity_hours,
-            s.status AS shop_status
-       FROM offers o JOIN shops s ON s.id = o.shop_id WHERE o.id = ?`,
-    [offerId],
-  );
-  if (!offer) throw ApiError.notFound('Offer not found');
+async function assertClaimable(parentId, userId, kind = 'offer') {
+  const descriptor = kindOf(kind);
+  const offer = await loadClaimableParent(parentId, descriptor);
+  if (!offer) throw ApiError.notFound(descriptor.key === 'offer' ? 'Offer not found' : 'Service offer not found');
 
   const now = new Date();
   const live =
@@ -241,15 +330,21 @@ async function assertClaimable(offerId, userId) {
     offer.shop_status === 'active' &&
     new Date(offer.start_date) <= now &&
     new Date(offer.end_date) >= now;
-  if (!live) throw ApiError.badRequest('This offer is not available to claim');
+  if (!live) {
+    throw ApiError.badRequest(
+      descriptor.key === 'offer'
+        ? 'This offer is not available to claim'
+        : 'This service offer is not available to claim',
+    );
+  }
 
   // Claims this customer already holds. Cancelled and revoked ones do not count
   // against the limit - the customer got nothing for them.
   const mine = await rawQuery(
-    `SELECT id, status, claim_seq FROM offer_claims
-      WHERE user_id = ? AND offer_id = ? AND status NOT IN ('cancelled','revoked')
+    `SELECT id, status, claim_seq FROM ${descriptor.claimsTable}
+      WHERE user_id = ? AND ${descriptor.parentColumn} = ? AND status NOT IN ('cancelled','revoked')
       ORDER BY claim_seq`,
-    [userId, offerId],
+    [userId, parentId],
   );
 
   const reusable = mine.find((claim) => claim.status === 'claimed');
@@ -266,9 +361,9 @@ async function assertClaimable(offerId, userId) {
 
   if (offer.total_claim_limit) {
     const [{ taken }] = await rawQuery(
-      `SELECT COUNT(*) AS taken FROM offer_claims
-        WHERE offer_id = ? AND status NOT IN ('cancelled','revoked')`,
-      [offerId],
+      `SELECT COUNT(*) AS taken FROM ${descriptor.claimsTable}
+        WHERE ${descriptor.parentColumn} = ? AND status NOT IN ('cancelled','revoked')`,
+      [parentId],
     );
     if (Number(taken) >= Number(offer.total_claim_limit)) {
       throw ApiError.conflict('This offer has been fully claimed');
@@ -287,8 +382,9 @@ const isDuplicate = (error) => error?.code === 'ER_DUP_ENTRY' || error?.errno ==
  * (user, offer, seq) as "another request beat me to it" - which is §17's
  * "duplicate requests" case, and the reason the unique key exists at all.
  */
-async function issue(offerId, userId) {
-  const { offer, existing, nextSeq } = await assertClaimable(offerId, userId);
+async function issue(parentId, userId, kind = 'offer') {
+  const descriptor = kindOf(kind);
+  const { offer, existing, nextSeq } = await assertClaimable(parentId, userId, kind);
   if (existing) return { claimId: Number(existing.id), isNew: false, offer };
 
   const expiresAt = expiryFor(offer);
@@ -296,9 +392,10 @@ async function issue(offerId, userId) {
   for (let attempt = 0; attempt < 5; attempt += 1) {
     try {
       const result = await execute(
-        `INSERT INTO offer_claims (offer_id, user_id, shop_id, code, claim_seq, expires_at)
+        `INSERT INTO ${descriptor.claimsTable}
+           (${descriptor.parentColumn}, user_id, shop_id, code, claim_seq, expires_at)
          VALUES (?, ?, ?, ?, ?, ?)`,
-        [offerId, userId, offer.shop_id, generateCode(), nextSeq, expiresAt],
+        [parentId, userId, offer.shop_id, generateCode(), nextSeq, expiresAt],
       );
       return { claimId: Number(result.insertId), isNew: true, offer };
     } catch (error) {
@@ -307,9 +404,9 @@ async function issue(offerId, userId) {
       // Two requests raced for the same sequence number. The other one won, so
       // hand back what it created rather than issuing a second code.
       const raced = await queryOne(
-        `SELECT id FROM offer_claims
-          WHERE user_id = ? AND offer_id = ? AND claim_seq = ?`,
-        [userId, offerId, nextSeq],
+        `SELECT id FROM ${descriptor.claimsTable}
+          WHERE user_id = ? AND ${descriptor.parentColumn} = ? AND claim_seq = ?`,
+        [userId, parentId, nextSeq],
       );
       if (raced) return { claimId: Number(raced.id), isNew: false, offer };
       // Otherwise it was the code that collided; loop and draw another.
@@ -341,22 +438,69 @@ const REJECTIONS = {
 };
 
 /**
- * The branches an offer may be redeemed at (§16).
+ * The two things a claim can be for (§22).
+ *
+ * A product offer and a service offer are the same workflow with different
+ * tables behind them - the shopkeeper holding the scanner cannot tell which
+ * they have, and nothing about the counter differs. So rather than a second
+ * copy of every check, each kind is described once here and the security
+ * logic below reads the description. A rule fixed in `evaluate` is fixed for
+ * both, which is the whole point.
+ */
+const KINDS = {
+  offer: {
+    key: 'offer',
+    claimsTable: 'offer_claims',
+    parentColumn: 'offer_id',
+    /** Where the branch restriction is configured, and what keys it. */
+    locationsTable: 'offer_locations',
+    locationsKey: 'offer_id',
+    /** Columns in `claim_verifications` that point back at this kind. */
+    verificationClaimColumn: 'claim_id',
+    verificationParentColumn: 'offer_id',
+  },
+  service_offer: {
+    key: 'service_offer',
+    claimsTable: 'service_offer_claims',
+    parentColumn: 'service_offer_id',
+    // A service offer inherits its branches from the service it hangs off,
+    // not from the offer - the offer is a price, the service is the thing
+    // that happens somewhere.
+    locationsTable: 'service_locations',
+    locationsKey: 'service_id',
+    verificationClaimColumn: 'service_claim_id',
+    verificationParentColumn: 'service_offer_id',
+  },
+};
+
+const kindOf = (key) => KINDS[key] ?? KINDS.offer;
+
+/**
+ * The branches a claim may be redeemed at (§16).
  *
  * `shop_wide` means every active branch. `selected_branches` means the ones
- * pinned to the offer. `online` has no counter to walk into, so nothing
+ * pinned to the listing. `online` has no counter to walk into, so nothing
  * qualifies and the check falls through to "wrong branch" - which is the
  * honest answer for a merchant trying to redeem a web-only offer in a shop.
+ *
+ * `locationParentId` is the offer for a product offer and the *service* for a
+ * service offer, which is why the caller supplies it rather than this deriving
+ * it from the claim.
  */
-async function allowedBranchIds(offer) {
-  if (offer.applicability_type === 'online') return [];
-  if (offer.applicability_type === 'selected_branches') {
-    const rows = await rawQuery('SELECT branch_id FROM offer_locations WHERE offer_id = ?', [offer.id]);
+async function allowedBranchIds({ applicabilityType, shopId, locationParentId, kind = 'offer' }) {
+  if (applicabilityType === 'online') return [];
+
+  const descriptor = kindOf(kind);
+  if (applicabilityType === 'selected_branches') {
+    const rows = await rawQuery(
+      `SELECT branch_id FROM ${descriptor.locationsTable} WHERE ${descriptor.locationsKey} = ?`,
+      [locationParentId],
+    );
     return rows.map((row) => Number(row.branch_id));
   }
   const rows = await rawQuery(
     "SELECT id FROM shop_branches WHERE shop_id = ? AND status = 'active'",
-    [offer.shop_id],
+    [shopId],
   );
   return rows.map((row) => Number(row.id));
 }
@@ -370,7 +514,7 @@ async function allowedBranchIds(offer) {
  *
  * @returns {Promise<{ok: true} | {ok: false, reason: string, message: string}>}
  */
-async function evaluate(claim, actor, branchId) {
+async function evaluate(claim, actor, branchId, kind = 'offer') {
   const reject = (reason) => ({ ok: false, reason, message: REJECTIONS[reason] });
 
   if (!accessControl.hasShopPermission(actor, claim.shop_id, 'VERIFY_CLAIM')) {
@@ -394,9 +538,12 @@ async function evaluate(claim, actor, branchId) {
   // and refusing every redemption instead would break every single-site shop.
   if (branchId !== null && branchId !== undefined) {
     const branches = await allowedBranchIds({
-      id: claim.offer_id,
-      shop_id: claim.shop_id,
-      applicability_type: claim.applicability_type,
+      kind,
+      shopId: claim.shop_id,
+      applicabilityType: claim.applicability_type,
+      // Each kind's CLAIM_SELECT exposes this: the offer for a product offer,
+      // the parent service for a service offer.
+      locationParentId: claim.location_parent_id,
     });
     if (!branches.includes(Number(branchId))) return reject('WRONG_BRANCH');
   }
@@ -436,15 +583,20 @@ const VERIFICATION_METHODS = ['QR_SCAN', 'CODE_ENTRY'];
  * successful redemption into an error the customer watches happen.
  */
 async function logVerification(req, entry) {
+  // Which pair of columns the claim and its parent listing go in depends on
+  // the kind; everything else about the row is identical.
+  const descriptor = kindOf(entry.kind);
   try {
     await execute(
       `INSERT INTO claim_verifications
-         (claim_id, offer_id, shop_id, branch_id, customer_id, verified_by,
+         (claim_kind, ${descriptor.verificationClaimColumn}, ${descriptor.verificationParentColumn},
+          shop_id, branch_id, customer_id, verified_by,
           code_attempted, method, action, reason, ip_address)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
+        descriptor.key,
         entry.claimId ?? null,
-        entry.offerId ?? null,
+        entry.parentId ?? null,
         entry.shopId ?? null,
         entry.branchId ?? null,
         entry.customerId ?? null,
@@ -509,10 +661,15 @@ async function failureBudget(userId) {
  * this is what keeps "My Claims" and the merchant's counts honest.
  */
 async function syncExpiredClaims() {
-  const result = await execute(
-    "UPDATE offer_claims SET status = 'expired' WHERE status = 'claimed' AND expires_at < NOW()",
-  );
-  return Number(result.affectedRows ?? 0);
+  let expired = 0;
+  for (const descriptor of Object.values(KINDS)) {
+    const result = await execute(
+      `UPDATE ${descriptor.claimsTable} SET status = 'expired'
+        WHERE status = 'claimed' AND expires_at < NOW()`,
+    );
+    expired += Number(result.affectedRows ?? 0);
+  }
+  return expired;
 }
 
 /** Records the funnel event pair for a claim (§19, §32). */
@@ -528,6 +685,8 @@ async function recordClaimEvents(offer, userId) {
 module.exports = {
   CLAIM_SELECT,
   CODE_PREFIX,
+  KINDS,
+  kindOf,
   VERIFICATION_METHODS,
   FAILURE_LIMIT,
   FAILURE_WINDOW_MINUTES,
@@ -539,6 +698,9 @@ module.exports = {
   mapClaim,
   findById,
   findByCode,
+  findAnyByCode,
+  selectFor,
+  SERVICE_CLAIM_SELECT,
   expiryFor,
   assertClaimable,
   issue,

@@ -29,6 +29,18 @@ function mapServiceOffer(row) {
     status: row.status,
     viewCount: Number(row.view_count ?? 0),
     claimCount: Number(row.claim_count ?? 0),
+    // Claim rules (§17, §22), so the Claim button can state the limit without
+    // a second request - exactly as the product-offer mapper does.
+    claimLimitPerCustomer: Number(row.claim_limit_per_customer ?? 1),
+    totalClaimLimit:
+      row.total_claim_limit === null || row.total_claim_limit === undefined
+        ? null
+        : Number(row.total_claim_limit),
+    claimValidityHours:
+      row.claim_validity_hours === null || row.claim_validity_hours === undefined
+        ? null
+        : Number(row.claim_validity_hours),
+    maxRedemptionsPerClaim: Number(row.max_redemptions_per_claim ?? 1),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -93,8 +105,10 @@ async function create(serviceId, payload) {
     `INSERT INTO service_offers (
        service_id, shop_id, offer_text, offer_type, discount_type, discount_value,
        original_price, offer_price, terms_conditions, is_recurring, recurrence_type,
-       start_date, end_date, status, created_by, updated_by
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       start_date, end_date, status,
+       claim_limit_per_customer, total_claim_limit, claim_validity_hours,
+       max_redemptions_per_claim, created_by, updated_by
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       serviceId,
       service.shop_id,
@@ -110,6 +124,10 @@ async function create(serviceId, payload) {
       payload.startDate,
       payload.endDate,
       status,
+      payload.claimLimitPerCustomer,
+      payload.totalClaimLimit ?? null,
+      payload.claimValidityHours ?? null,
+      payload.maxRedemptionsPerClaim,
       null,
       null,
     ],
@@ -128,7 +146,9 @@ async function update(offerId, payload, previous) {
     `UPDATE service_offers SET
        offer_text = ?, offer_type = ?, discount_type = ?, discount_value = ?,
        original_price = ?, offer_price = ?, terms_conditions = ?, is_recurring = ?,
-       recurrence_type = ?, start_date = ?, end_date = ?, status = ?
+       recurrence_type = ?, start_date = ?, end_date = ?, status = ?,
+       claim_limit_per_customer = ?, total_claim_limit = ?, claim_validity_hours = ?,
+       max_redemptions_per_claim = ?
      WHERE id = ?`,
     [
       payload.offerText ?? null,
@@ -143,6 +163,10 @@ async function update(offerId, payload, previous) {
       payload.startDate,
       payload.endDate,
       keepStatus,
+      payload.claimLimitPerCustomer,
+      payload.totalClaimLimit ?? null,
+      payload.claimValidityHours ?? null,
+      payload.maxRedemptionsPerClaim,
       offerId,
     ],
   );

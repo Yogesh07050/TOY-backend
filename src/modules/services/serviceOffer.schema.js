@@ -33,10 +33,23 @@ const serviceOfferBody = z
     startDate: z.coerce.date({ required_error: 'Start date is required' }),
     endDate: z.coerce.date({ required_error: 'End date is required' }),
     status: z.enum(['draft', 'scheduled', 'active']).default('draft'),
+    // Claim rules, identical to the ones on a product offer (§17, §22). The
+    // defaults give an untouched service offer one code per customer, used once.
+    claimLimitPerCustomer: z.coerce.number().int().min(1).max(100).default(1),
+    totalClaimLimit: z.coerce.number().int().min(1).max(1000000).optional().nullable(),
+    claimValidityHours: z.coerce.number().int().min(1).max(8760).optional().nullable(),
+    maxRedemptionsPerClaim: z.coerce.number().int().min(1).max(100).default(1),
   })
   .superRefine((data, ctx) => {
     if (data.endDate <= data.startDate) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['endDate'], message: 'End date must be after the start date' });
+    }
+    if (data.totalClaimLimit != null && data.claimLimitPerCustomer > data.totalClaimLimit) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['totalClaimLimit'],
+        message: 'The total claim limit cannot be lower than the per-customer limit',
+      });
     }
     if (data.discountType === 'percentage' && data.discountValue != null && data.discountValue > 100) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['discountValue'], message: 'A percentage discount cannot exceed 100' });

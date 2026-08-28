@@ -465,6 +465,27 @@ async function getById(id, user, { forManagement = false, position = null } = {}
   service.shop.contactNumber = row.shop_contact;
   service.branchIds = service.branches.map((branch) => branch.id);
 
+  // The caller's own claim on this service's live offer (§3, §5, §22), so the
+  // page can show the code instead of the Claim button. Mirrors what the
+  // product-offer detail does, and carries no QR - that is the claim
+  // endpoint's business, and this response is served to staff too.
+  if (user && service.activeOffer) {
+    const held = await queryOne(
+      `SELECT id, code, status, expires_at FROM service_offer_claims
+        WHERE service_offer_id = ? AND user_id = ? AND status NOT IN ('cancelled','revoked')
+        ORDER BY FIELD(status, 'claimed', 'redeemed', 'expired'), claimed_at DESC LIMIT 1`,
+      [service.activeOffer.id, user.id],
+    );
+    service.myClaim = held
+      ? {
+          id: Number(held.id),
+          code: held.code,
+          status: held.status,
+          expiresAt: held.expires_at,
+        }
+      : null;
+  }
+
   return service;
 }
 

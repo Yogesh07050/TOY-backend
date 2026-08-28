@@ -167,10 +167,14 @@ router.get(
   '/scan/:token',
   validate({ params: z.object({ token: z.string().min(10).max(512) }) }),
   asyncHandler(async (req, res) => {
-    const code = claims.readQrPayload(req.params.token);
-    if (!code) throw ApiError.badRequest('That QR code could not be read');
+    const scanned = claims.readQrPayload(req.params.token);
+    // A service-offer token is a valid token, just not one this route answers
+    // for - the service claims module has the matching endpoint.
+    if (!scanned || scanned.kind !== 'offer') {
+      throw ApiError.badRequest('That QR code could not be read');
+    }
 
-    const row = await claims.findByCode(code);
+    const row = await claims.findByCode(scanned.code);
     if (!row || Number(row.user_id) !== req.user.id) throw ApiError.notFound('Claim not found');
 
     await analyticsEvents.record(analyticsEvents.EVENT_TYPES.CLAIM_QR_VIEW, {
