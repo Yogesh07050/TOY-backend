@@ -223,4 +223,19 @@ if (env.isProduction) {
   }
 }
 
+/**
+ * A short CLAIM_QR_SECRET is worse than none at all: leaving it blank derives a
+ * full-length key from the access secret, whereas setting it to a handful of
+ * characters silently makes the QR signature forgeable. Checked in every
+ * environment, not just production, so the mistake surfaces on the machine
+ * where it was made.
+ */
+const MIN_QR_SECRET_LENGTH = 32;
+if (env.claims.qrSecret && env.claims.qrSecret.length < MIN_QR_SECRET_LENGTH) {
+  throw new Error(
+    `CLAIM_QR_SECRET must be at least ${MIN_QR_SECRET_LENGTH} characters, or left blank to derive one. ` +
+      'Generate one with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'base64url\'))"',
+  );
+}
+
 module.exports = env;
