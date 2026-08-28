@@ -19,6 +19,8 @@ router.use('/notifications', require('./modules/notifications/notification.route
 router.use('/analytics', require('./modules/analytics/analytics.routes'));
 router.use('/audit-logs', require('./modules/audit/audit.routes'));
 router.use('/uploads', require('./modules/uploads/upload.routes'));
+// Address <-> coordinates for the map picker (V3 shop location, §5).
+router.use('/geo', require('./modules/geo/geo.routes'));
 
 // ---- V2 ----
 router.use('/banners', require('./modules/banners/banner.routes'));

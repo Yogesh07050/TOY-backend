@@ -163,6 +163,9 @@ CREATE TABLE IF NOT EXISTS shops (
   email          VARCHAR(190)            DEFAULT NULL,
   website_url    VARCHAR(500)            DEFAULT NULL,
   social_links   JSON                    DEFAULT NULL,
+  -- Optional on every plan, Free included (§3). Shape is
+  -- { mon: [{open, close}], ... }; the API validates it, MySQL only stores it.
+  opening_hours  JSON                    DEFAULT NULL,
   status         ENUM('active','inactive') NOT NULL DEFAULT 'active',
   created_by     BIGINT UNSIGNED         DEFAULT NULL,
   updated_by     BIGINT UNSIGNED         DEFAULT NULL,
@@ -189,13 +192,28 @@ CREATE TABLE IF NOT EXISTS shop_branches (
   id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   shop_id        BIGINT UNSIGNED NOT NULL,
   branch_name    VARCHAR(160)    NOT NULL,
+  -- `address` stays the single free-text line the whole app already reads and
+  -- prints; `address_line_2` and `area` are the extra structure V3 §24 asks
+  -- for, kept separate rather than folded in so nothing downstream changes.
   address        VARCHAR(500)            DEFAULT NULL,
+  address_line_2 VARCHAR(255)            DEFAULT NULL,
+  area           VARCHAR(160)            DEFAULT NULL,
   city           VARCHAR(120)            DEFAULT NULL,
   state          VARCHAR(120)            DEFAULT NULL,
   country        VARCHAR(120)            DEFAULT NULL,
   pincode        VARCHAR(20)             DEFAULT NULL,
   latitude       DECIMAL(10,7)           DEFAULT NULL,
   longitude      DECIMAL(10,7)           DEFAULT NULL,
+  -- Where the pin came from (§24). A merchant who dragged it or stood in the
+  -- shop is a better authority than the geocoder, and this is what says so.
+  location_source  ENUM('ADDRESS_SEARCH','MAP_PIN','CURRENT_LOCATION','MANUAL')
+                                         DEFAULT NULL,
+  -- Metres of GPS uncertainty, when the device reported any (§25).
+  location_accuracy DECIMAL(8,2)         DEFAULT NULL,
+  -- The merchant ticked "this is my shop" on the map (§8). Publishing needs it.
+  location_confirmed_at DATETIME         DEFAULT NULL,
+  place_id       VARCHAR(120)            DEFAULT NULL,
+  opening_hours  JSON                    DEFAULT NULL,
   contact_number VARCHAR(30)             DEFAULT NULL,
   is_primary     TINYINT(1)      NOT NULL DEFAULT 0,
   status         ENUM('active','inactive') NOT NULL DEFAULT 'active',

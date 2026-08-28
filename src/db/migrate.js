@@ -144,6 +144,36 @@ const COLUMN_PATCHES = [
     sql: "ALTER TABLE shop_subscriptions ADD COLUMN checkout_plan ENUM('FREE','BUSINESS','PREMIUM') DEFAULT NULL AFTER pending_plan",
   },
 
+  // ---- V3 shop location & profile -----------------------------------------
+  // §24's richer location model, plus the confirmation flag §8 requires before
+  // a shop may be published. Existing branches keep their coordinates; what
+  // they gain is a record of where those coordinates came from.
+  {
+    table: 'shop_branches',
+    column: 'location_source',
+    sql: `ALTER TABLE shop_branches ADD COLUMN location_source
+            ENUM('ADDRESS_SEARCH','MAP_PIN','CURRENT_LOCATION','MANUAL')
+            DEFAULT NULL AFTER longitude`,
+    after: [
+      'ALTER TABLE shop_branches ADD COLUMN address_line_2 VARCHAR(255) DEFAULT NULL AFTER address',
+      'ALTER TABLE shop_branches ADD COLUMN area VARCHAR(160) DEFAULT NULL AFTER address_line_2',
+      'ALTER TABLE shop_branches ADD COLUMN location_accuracy DECIMAL(8,2) DEFAULT NULL AFTER location_source',
+      'ALTER TABLE shop_branches ADD COLUMN location_confirmed_at DATETIME DEFAULT NULL AFTER location_accuracy',
+      'ALTER TABLE shop_branches ADD COLUMN place_id VARCHAR(120) DEFAULT NULL AFTER location_confirmed_at',
+      'ALTER TABLE shop_branches ADD COLUMN opening_hours JSON DEFAULT NULL AFTER place_id',
+      // Branches that predate this were geocoded from their address on save,
+      // which is exactly what ADDRESS_SEARCH means. Saying so keeps them out
+      // of "this shop has never confirmed a location" without pretending a
+      // merchant confirmed a pin they were never shown.
+      "UPDATE shop_branches SET location_source = 'ADDRESS_SEARCH' WHERE latitude IS NOT NULL AND location_source IS NULL",
+    ],
+  },
+  {
+    table: 'shops',
+    column: 'opening_hours',
+    sql: 'ALTER TABLE shops ADD COLUMN opening_hours JSON DEFAULT NULL AFTER social_links',
+  },
+
   // ---- Persistent login: refresh_tokens becomes the device-session table ----
   {
     table: 'refresh_tokens',
@@ -347,6 +377,27 @@ const STATEMENT_PATCHES = [
            REFERENCES push_devices (id) ON DELETE SET NULL`,
       );
     },
+  },
+  {
+    name: "shop Admins may edit their own shop profile",
+    // V3 shop-location §5/§14/§19: the merchant owns their address, map pin
+    // and shop picture. Installs that predate this gave EDIT_SHOP to Super
+    // Admins alone, which left shopkeepers unable to fix their own location.
+    // Scoped by `requireShopScope`, so this is still only their own shops.
+    check: async (connection) => {
+      const [rows] = await connection.query(
+        `SELECT 1 FROM roles r
+           JOIN permissions p ON p.name = 'EDIT_SHOP'
+          WHERE r.name = 'ADMIN'
+            AND NOT EXISTS (SELECT 1 FROM role_permissions rp
+                             WHERE rp.role_id = r.id AND rp.permission_id = p.id)
+          LIMIT 1`,
+      );
+      return rows.length > 0;
+    },
+    sql: `INSERT IGNORE INTO role_permissions (role_id, permission_id)
+          SELECT r.id, p.id FROM roles r JOIN permissions p ON p.name = 'EDIT_SHOP'
+           WHERE r.name = 'ADMIN'`,
   },
   {
     name: 'analytics_events.service_id -> services FK',

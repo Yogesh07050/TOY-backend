@@ -167,6 +167,37 @@ const env = {
     maxDeviceFailures: int(process.env.PUSH_MAX_DEVICE_FAILURES, 5),
   },
 
+  /**
+   * Address -> coordinates for shop branches (§17).
+   *
+   * Distance search is useless without coordinates and merchants cannot type a
+   * lat/long, so the address is geocoded on save. The default provider is
+   * OpenStreetMap's Nominatim: no API key, but a published usage policy that
+   * wants an identifying User-Agent and at most one request a second - hence
+   * `userAgent` and `minIntervalMs`. Point `apiBase` at a self-hosted instance
+   * or a commercial provider's compatible endpoint to lift that limit.
+   *
+   * `enabled` false skips the lookup entirely; branches then save with whatever
+   * coordinates the caller supplied, which on a dev machine without outbound
+   * network access is exactly what is wanted.
+   */
+  geocoding: {
+    enabled: bool(process.env.GEOCODING_ENABLED, true),
+    provider: process.env.GEOCODING_PROVIDER || 'nominatim',
+    apiBase: (process.env.GEOCODING_API_BASE || 'https://nominatim.openstreetmap.org').replace(/\/$/, ''),
+    userAgent:
+      process.env.GEOCODING_USER_AGENT || `OffersOffer/1.0 (${process.env.APP_URL || 'http://localhost:4200'})`,
+    /** Per-request timeout, and the ceiling on a whole address cascade. */
+    requestTimeoutMs: int(process.env.GEOCODING_TIMEOUT_MS, 5000),
+    totalBudgetMs: int(process.env.GEOCODING_BUDGET_MS, 12000),
+    /** How many progressively coarser queries one address may cost. */
+    maxQueries: int(process.env.GEOCODING_MAX_QUERIES, 4),
+    minIntervalMs: int(process.env.GEOCODING_MIN_INTERVAL_MS, 1100),
+    /** Pending lookups after which new ones are skipped rather than queued. */
+    maxQueueDepth: int(process.env.GEOCODING_MAX_QUEUE_DEPTH, 8),
+    cacheSize: int(process.env.GEOCODING_CACHE_SIZE, 500),
+  },
+
   billing: {
     /** Days a failed renewal keeps its features before downgrade (§10). */
     graceDays: int(process.env.BILLING_GRACE_DAYS, 5),

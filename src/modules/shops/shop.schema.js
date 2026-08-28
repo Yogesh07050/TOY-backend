@@ -8,6 +8,40 @@ const latitude = z.coerce.number().min(-90).max(90).optional().nullable();
 const longitude = z.coerce.number().min(-180).max(180).optional().nullable();
 const optionalText = (max) => z.string().trim().max(max).optional().nullable();
 
+/**
+ * Opening hours (§3 optional, §13 per branch).
+ *
+ * A day is either the string 'closed' or up to three open/close windows, which
+ * is enough for the split shifts that are normal for Indian high-street shops.
+ * Anything not listed is simply unknown rather than closed - a merchant who
+ * fills in nothing has not declared they never open.
+ */
+const timeOfDay = z
+  .string()
+  .trim()
+  .regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'Use 24-hour HH:MM, e.g. 09:30');
+
+const openingHours = z
+  .record(
+    z.enum(['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']),
+    z.union([
+      z.literal('closed'),
+      z.array(z.object({ open: timeOfDay, close: timeOfDay })).max(3),
+    ]),
+  )
+  .optional()
+  .nullable();
+
+/**
+ * How the pin was chosen (§24). Recorded rather than inferred: a merchant who
+ * stood in their shop and pressed "use my current location" has given a better
+ * answer than the geocoder, and only they can say which happened.
+ */
+const locationSource = z
+  .enum(['ADDRESS_SEARCH', 'MAP_PIN', 'CURRENT_LOCATION', 'MANUAL'])
+  .optional()
+  .nullable();
+
 const categoryIds = z
   .union([z.string(), z.array(z.union([z.string(), z.number()])), z.number()])
   .transform((value) =>
@@ -34,12 +68,24 @@ const listShopsSchema = z.object({
 const branchBody = z.object({
   branchName: z.string().trim().min(2, 'Branch name is required').max(160),
   address: optionalText(500),
+  addressLine2: optionalText(255),
+  area: optionalText(160),
   city: z.string().trim().min(1, 'City is required').max(120),
   state: optionalText(120),
   country: optionalText(120),
   pincode: optionalText(20),
   latitude,
   longitude,
+  locationSource,
+  // Metres, as reported by the device. Never a reason to reject a save (§25).
+  locationAccuracy: z.coerce.number().min(0).max(100000).optional().nullable(),
+  placeId: optionalText(120),
+  // The merchant pressed "Confirm location" on the map (§8). Sent by the
+  // clients that show that step; its absence is not an error, because the
+  // publish gate in §18 is about the coordinates existing, not about which
+  // screen produced them.
+  locationConfirmed: z.coerce.boolean().optional(),
+  openingHours,
   contactNumber: optionalText(30),
   isPrimary: z.coerce.boolean().optional().default(false),
   status: z.enum(['active', 'inactive']).optional().default('active'),
@@ -54,14 +100,24 @@ const shopBody = z.object({
   email: z.string().trim().toLowerCase().email('Enter a valid email').max(190).optional().nullable().or(z.literal('')),
   websiteUrl: z.string().url().max(500).optional().nullable().or(z.literal('')),
   socialLinks: z.record(z.string().max(500)).optional().nullable(),
+  openingHours,
   status: z.enum(['active', 'inactive']).optional().default('active'),
   categoryIds,
-  // Convenience: creating a shop can create its first branch in one call (§16).
+  // Creating a shop creates its location in the same call (§16 + §4): a shop
+  // that is going live needs one, so asking for it on a second screen only
+  // creates shops that cannot be published.
   primaryBranch: branchBody.optional().nullable(),
 });
 
+/**
+ * Editing re-uses `primaryBranch`, which is what makes §19's "Shop Profile ->
+ * Edit Location -> Confirm -> Save" one form rather than a trip to the branch
+ * screen. On update it is an upsert: it edits the shop's primary branch, or
+ * creates one if the shop somehow has none.
+ */
 const updateShopSchema = shopBody.partial().extend({
   name: z.string().trim().min(2).max(160).optional(),
+  primaryBranch: branchBody.partial().optional().nullable(),
 });
 
 const memberBody = z.object({

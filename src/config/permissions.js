@@ -118,6 +118,13 @@ const SYSTEM_ROLES = {
       'EDIT_OFFER',
       'DELETE_OFFER',
       'VIEW_SHOP',
+      // V3 shop-location §5, §14 and §19 put the shop's own address, map pin
+      // and picture in the merchant's hands. Creating and deleting shops stay
+      // Super Admin (§16) - those are guarded by the global CREATE_SHOP and
+      // DELETE_SHOP - but a shopkeeper who cannot edit their own profile
+      // cannot move shop, correct their pin, or upload a photo of their
+      // storefront. `requireShopScope` keeps this to shops they belong to.
+      'EDIT_SHOP',
       'VIEW_SHOP_MEMBERS',
       'MANAGE_LOCATIONS',
       'VIEW_ANALYTICS',
