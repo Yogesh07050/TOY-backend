@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
 const { healthCheck, rawQuery } = require('../db/pool');
 const env = require('../config/env');
@@ -295,7 +296,13 @@ async function probeImageUpload() {
   const probe = (async () => {
     await fs.mkdir(env.storage.uploadDir, { recursive: true });
     // A real write, because a readable directory on a full disk still fails.
-    const path = `${env.storage.uploadDir}/.health-probe`;
+    //
+    // The filename is unique per probe. A fixed one looks harmless until two
+    // probes overlap - the dashboard polls every 30 seconds and an
+    // administrator can hit Re-check on top of that - and then one unlinks the
+    // file the other is about to unlink, the second `unlink` throws ENOENT, and
+    // a perfectly healthy disk is reported as "not writable" at random.
+    const path = `${env.storage.uploadDir}/.health-probe-${process.pid}-${crypto.randomUUID()}`;
     await fs.writeFile(path, 'ok');
     await fs.unlink(path);
     return true;
