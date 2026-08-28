@@ -26,6 +26,39 @@ function parseJson(value) {
   }
 }
 
+/**
+ * Settles the acquisition channel a save should store (Business §17, §32).
+ *
+ * Two rules, and both exist because this column is read by grouping rather
+ * than by lookup:
+ *
+ * Only a Super Admin may set it. It is sales attribution, not a shop detail -
+ * a merchant has no idea which campaign found them, and letting them write it
+ * would corrupt the very cohort comparison it exists to support. Anyone else's
+ * value is ignored rather than rejected, so a merchant's ordinary profile save
+ * still succeeds if their client echoes the field back.
+ *
+ * A new value is matched case-insensitively against the channels already in
+ * use, and the existing spelling wins. Free text plus GROUP BY is how you end
+ * up with "Referral", "referral" and "  Referral" as three separate rows on
+ * the retention chart, each with a third of the merchants.
+ */
+async function resolveAcquisitionChannel(payload, user, current = null) {
+  if (payload.acquisitionChannel === undefined) return current;
+  if (!user?.isSuperAdmin) return current;
+
+  const raw = (payload.acquisitionChannel ?? '').trim().replace(/\s+/g, ' ');
+  if (!raw) return null;
+
+  const existing = await query(
+    'SELECT DISTINCT acquisition_channel AS channel FROM shops WHERE acquisition_channel IS NOT NULL',
+  );
+  const match = existing.find(
+    (row) => row.channel.toLowerCase() === raw.toLowerCase(),
+  );
+  return match ? match.channel : raw.slice(0, 60);
+}
+
 function mapShop(row) {
   return {
     id: Number(row.id),
@@ -40,6 +73,7 @@ function mapShop(row) {
     socialLinks: parseJson(row.social_links),
     openingHours: parseJson(row.opening_hours),
     status: row.status,
+    acquisitionChannel: row.acquisition_channel ?? null,
     branchCount: row.branch_count === undefined ? undefined : Number(row.branch_count),
     activeOfferCount: row.active_offer_count === undefined ? undefined : Number(row.active_offer_count),
     followerCount: row.follower_count === undefined ? undefined : Number(row.follower_count),
@@ -514,11 +548,14 @@ async function create(payload, user) {
     );
   }
 
+  const acquisitionChannel = await resolveAcquisitionChannel(payload, user);
+
   const shopId = await transaction(async (connection) => {
     const [result] = await connection.execute(
       `INSERT INTO shops (name, slug, description, logo_url, cover_url, contact_number, email,
-                          website_url, social_links, opening_hours, status, created_by, updated_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                          website_url, social_links, opening_hours, status, acquisition_channel,
+                          created_by, updated_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         payload.name,
         slug,
@@ -531,6 +568,7 @@ async function create(payload, user) {
         payload.socialLinks ? JSON.stringify(payload.socialLinks) : null,
         payload.openingHours ? JSON.stringify(payload.openingHours) : null,
         payload.status ?? 'active',
+        acquisitionChannel,
         user.id,
         user.id,
       ],
@@ -645,11 +683,17 @@ async function update(shopId, payload, user) {
     );
   }
 
+  const acquisitionChannel = await resolveAcquisitionChannel(
+    payload,
+    user,
+    existing.acquisition_channel ?? null,
+  );
+
   await transaction(async (connection) => {
     await connection.execute(
       `UPDATE shops SET name = ?, slug = ?, description = ?, logo_url = ?, cover_url = ?,
               contact_number = ?, email = ?, website_url = ?, social_links = ?, opening_hours = ?,
-              status = ?, updated_by = ?
+              status = ?, acquisition_channel = ?, updated_by = ?
         WHERE id = ?`,
       [
         payload.name ?? existing.name,
@@ -663,6 +707,7 @@ async function update(shopId, payload, user) {
         socialLinks ? JSON.stringify(socialLinks) : null,
         openingHours ? JSON.stringify(openingHours) : null,
         nextStatus,
+        acquisitionChannel,
         user.id,
         shopId,
       ],

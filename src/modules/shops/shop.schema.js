@@ -102,6 +102,11 @@ const shopBody = z.object({
   socialLinks: z.record(z.string().max(500)).optional().nullable(),
   openingHours,
   status: z.enum(['active', 'inactive']).optional().default('active'),
+  // How this merchant came to the platform (Business §17, §32). Only a Super
+  // Admin's value is honoured - the service drops it for anyone else - but it
+  // is accepted here rather than rejected, so a merchant's own save does not
+  // fail merely because their form echoed a field back.
+  acquisitionChannel: optionalText(60),
   categoryIds,
   // Creating a shop creates its location in the same call (§16 + §4): a shop
   // that is going live needs one, so asking for it on a second screen only
