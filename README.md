@@ -11,12 +11,19 @@ notifications, reviews, analytics and audit logging.
 
 ## Requirements
 
-- Node.js 20.11+
+- Node.js 20.11+ — pinned to the 22 line in `.nvmrc`
 - MySQL 8.0+ (uses `JSON` columns, `CHECK` constraints and `DEFAULT` on `TEXT`)
+
+`sharp` ships a prebuilt binary per platform *and* Node major, and npm resolves
+it against whichever Node is running the install. Installing on an older Node
+therefore leaves a tree that looks fine until the first image upload, when
+`sharp` fails to load. Run `nvm use` before `npm install` and the problem
+cannot happen.
 
 ## Getting started
 
 ```bash
+nvm use                   # or: nvm install, if you have no Node 22 yet
 npm install
 cp .env.example .env      # then edit the DB credentials
 npm run db:migrate        # create the schema
