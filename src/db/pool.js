@@ -2,6 +2,9 @@
 
 const mysql = require('mysql2/promise');
 const env = require('../config/env');
+const logger = require('../utils/logger');
+const requestContext = require('../utils/requestContext');
+const { internalCodeFor } = require('../config/errorCodes');
 
 const pool = mysql.createPool({
   host: env.db.host,
@@ -21,9 +24,65 @@ const pool = mysql.createPool({
   decimalNumbers: true,
 });
 
+/**
+ * A sanitized identifier for a statement (§13).
+ *
+ * §13 asks for a "query name / operation" and a table, and is explicit that the
+ * full SQL should be avoided where it carries user data. Every statement in
+ * this codebase is parameterised, so the SQL text holds no values - but it is
+ * still long, multi-line and useless as a grouping key. `SELECT_OFFERS` is what
+ * makes "which query got slow this afternoon" a question a dashboard can
+ * answer; the statement itself is in the source, where it belongs.
+ */
+function queryLabel(sql) {
+  const flat = String(sql).replace(/\s+/g, ' ').trim();
+  const verb = /^(SELECT|INSERT|UPDATE|DELETE|REPLACE)/i.exec(flat)?.[1]?.toUpperCase() ?? 'QUERY';
+  // The first table named after FROM / INTO / UPDATE - the statement's subject.
+  // Subqueries name others; the outermost one is the one worth grouping on.
+  const table = /(?:FROM|INTO|UPDATE)\s+`?([a-z_][a-z0-9_]*)`?/i.exec(flat)?.[1] ?? 'unknown';
+  return { operation: `${verb}_${table.toUpperCase()}`, table };
+}
+
+/**
+ * Times one statement and reports it if it crosses the §13 threshold.
+ *
+ * A slow query is a WARN, not an error: it returned the right answer, just too
+ * late. The request id comes from the ambient context (§4), so a slow query and
+ * the slow request that contains it line up on one value without the caller
+ * passing anything.
+ *
+ * A *failed* statement is not logged here. It propagates to the error handler,
+ * which has the HTTP context and logs it once with its §8 code - logging it at
+ * both layers would double every database incident in the dashboard.
+ */
+async function timed(sql, run) {
+  const startedAt = process.hrtime.bigint();
+  try {
+    return await run();
+  } finally {
+    const durationMs = Math.round(Number(process.hrtime.bigint() - startedAt) / 1e6);
+    if (durationMs >= env.logging.slowQueryMs) {
+      const { operation, table } = queryLabel(sql);
+      logger.warn(
+        {
+          event: 'SLOW_QUERY',
+          request_id: requestContext.currentId(),
+          operation,
+          table,
+          duration_ms: durationMs,
+          threshold_ms: env.logging.slowQueryMs,
+          dependency: 'DATABASE',
+          category: 'DATABASE',
+        },
+        `${operation} took ${durationMs}ms`,
+      );
+    }
+  }
+}
+
 /** Run a query and return the rows. */
 async function query(sql, params = []) {
-  const [rows] = await pool.execute(sql, params);
+  const [rows] = await timed(sql, () => pool.execute(sql, params));
   return rows;
 }
 
@@ -35,7 +94,7 @@ async function queryOne(sql, params = []) {
 
 /** Run an INSERT/UPDATE/DELETE and return the raw result header. */
 async function execute(sql, params = []) {
-  const [result] = await pool.execute(sql, params);
+  const [result] = await timed(sql, () => pool.execute(sql, params));
   return result;
 }
 
@@ -45,20 +104,70 @@ async function execute(sql, params = []) {
  * every `?` placeholder, it just does not use the binary protocol.
  */
 async function rawQuery(sql, params = []) {
-  const [rows] = await pool.query(sql, params);
+  const [rows] = await timed(sql, () => pool.query(sql, params));
   return rows;
 }
 
-/** Run `fn` inside a transaction, rolling back on any throw. */
+let transactionCounter = 0;
+
+/**
+ * Run `fn` inside a transaction, rolling back on any throw.
+ *
+ * §14 wants the three transitions - started, committed, rolled back - for the
+ * operations that matter (claims, redemptions, payments, subscriptions,
+ * bookings). They are recorded here rather than at each of those call sites,
+ * which is both less code and more reliable: a transaction that nobody
+ * remembered to instrument is exactly the one that will roll back at 2am.
+ *
+ * Start and commit are DEBUG - in production the interesting line is the
+ * rollback, and a WARN for every successful commit would bury it. A rollback is
+ * WARN because it is usually deliberate (a business rule refused the write) and
+ * only sometimes a fault; the error itself, if there is one, is logged by the
+ * error handler with its code.
+ */
 async function transaction(fn) {
   const connection = await pool.getConnection();
+  const transactionId = `TXN-${(transactionCounter = (transactionCounter + 1) % 1000000)
+    .toString()
+    .padStart(6, '0')}`;
+  const requestId = requestContext.currentId();
+  const startedAt = process.hrtime.bigint();
+  const elapsed = () => Math.round(Number(process.hrtime.bigint() - startedAt) / 1e6);
+
   try {
     await connection.beginTransaction();
+    logger.debug(
+      { event: 'TRANSACTION_STARTED', request_id: requestId, transaction_id: transactionId },
+      `${transactionId} started`,
+    );
+
     const result = await fn(connection);
     await connection.commit();
+
+    logger.debug(
+      {
+        event: 'TRANSACTION_COMMITTED',
+        request_id: requestId,
+        transaction_id: transactionId,
+        duration_ms: elapsed(),
+      },
+      `${transactionId} committed`,
+    );
     return result;
   } catch (error) {
     await connection.rollback();
+    logger.warn(
+      {
+        event: 'TRANSACTION_ROLLED_BACK',
+        request_id: requestId,
+        transaction_id: transactionId,
+        duration_ms: elapsed(),
+        error_code: internalCodeFor(error, 'DB_TRANSACTION_FAILED'),
+        category: 'DATABASE',
+        err_message: error.message,
+      },
+      `${transactionId} rolled back`,
+    );
     throw error;
   } finally {
     connection.release();
@@ -70,4 +179,4 @@ async function healthCheck() {
   return rows[0]?.ok === 1;
 }
 
-module.exports = { pool, query, queryOne, execute, rawQuery, transaction, healthCheck };
+module.exports = { pool, query, queryOne, execute, rawQuery, transaction, healthCheck, queryLabel };

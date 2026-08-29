@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const { queryOne, execute, rawQuery } = require('../../db/pool');
 const env = require('../../config/env');
 const ApiError = require('../../utils/ApiError');
+const logger = require('../../utils/logger');
 const accessControl = require('../../services/accessControl');
 const analyticsEvents = require('../../services/analyticsEvents');
 
@@ -609,7 +610,17 @@ async function logVerification(req, entry) {
       ],
     );
   } catch (error) {
-    console.error('[claims] failed to log a %s verification: %s', entry.action, error.message);
+    logger.error(
+      {
+        event: 'CLAIM_VERIFICATION_LOG_FAILED',
+        error_code: 'DB_TRANSACTION_FAILED',
+        category: 'DATABASE',
+        dependency: 'DATABASE',
+        action: entry.action,
+        err_message: error.message,
+      },
+      'Could not record a claim verification attempt',
+    );
   }
 }
 

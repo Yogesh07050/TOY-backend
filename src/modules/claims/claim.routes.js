@@ -6,6 +6,7 @@ const { queryOne, execute, rawQuery } = require('../../db/pool');
 const ApiError = require('../../utils/ApiError');
 const validate = require('../../middleware/validate');
 const asyncHandler = require('../../utils/asyncHandler');
+const logger = require('../../utils/logger');
 const { authenticate } = require('../../middleware/auth');
 const analyticsEvents = require('../../services/analyticsEvents');
 const notifications = require('../../services/notifications');
@@ -127,7 +128,17 @@ router.post(
       // into a failed request.
       notifications
         .notifyOfferClaimed(claimId)
-        .catch((error) => console.error('[notifications] claim confirmation failed: %s', error.message));
+        .catch((error) => logger.error(
+        {
+          event: 'NOTIFICATION_SEND_FAILED',
+          error_code: 'NOTIFICATION_SEND_FAILED',
+          category: 'NOTIFICATION',
+          dependency: 'PUSH',
+          notification: 'CLAIM_CONFIRMED',
+          err_message: error.message,
+        },
+        'Notification fan-out failed',
+      ));
     }
 
     const row = await claims.findById(claimId);

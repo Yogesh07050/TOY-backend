@@ -5,6 +5,7 @@ const env = require('../../config/env');
 const plans = require('../../config/plans');
 const ApiError = require('../../utils/ApiError');
 const razorpay = require('../../services/razorpay');
+const logger = require('../../utils/logger');
 const subscriptions = require('../subscriptions/subscription.service');
 
 /**
@@ -387,7 +388,18 @@ async function cancelSubscription(shopId, user, note) {
     } catch (error) {
       // An already-cancelled or completed mandate is not a reason to refuse the
       // merchant's request - the local state is what governs entitlements.
-      console.error('[payments] gateway cancel failed for shop %d: %s', shopId, error.message);
+      logger.error(
+      {
+        event: 'PAYMENT_GATEWAY_CALL_FAILED',
+        error_code: 'GATEWAY_UNREACHABLE',
+        category: 'PAYMENT',
+        dependency: 'RAZORPAY',
+        operation: 'CANCEL_SUBSCRIPTION',
+        shop_id: String(shopId),
+        err_message: error.message,
+      },
+      'Gateway cancellation failed',
+    );
     }
   }
 

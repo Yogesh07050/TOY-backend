@@ -161,7 +161,10 @@ async function recordUsage({ shopId, userId, feature, planCode, meta, status, er
     );
   } catch (error) {
     // Losing a metering row must not lose the merchant their generation.
-    console.error('[ai] failed to record usage: %s', error.message);
+    logger.error(
+      { event: 'AI_USAGE_RECORD_FAILED', category: 'DATABASE', dependency: 'DATABASE', err_message: error.message },
+      'Could not record AI usage',
+    );
   }
 }
 
@@ -194,7 +197,10 @@ async function recordGeneration({
     );
     return Number(inserted.insertId);
   } catch (error) {
-    console.error('[ai] failed to record generation: %s', error.message);
+    logger.error(
+      { event: 'AI_GENERATION_RECORD_FAILED', category: 'DATABASE', dependency: 'DATABASE', err_message: error.message },
+      'Could not record an AI generation',
+    );
     return null;
   }
 }
@@ -238,10 +244,19 @@ function validateResult(resultSchema, data, feature) {
   const parsed = resultSchema.safeParse(data);
   if (parsed.success) return parsed.data;
 
-  console.error(
-    '[ai] %s returned an invalid document: %s',
-    feature,
-    parsed.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`).join('; '),
+  // §22: the feature, the failure and the shape of the problem - never the
+  // generated content itself, which carries merchant data the log has no need
+  // to retain.
+  logger.error(
+    {
+      event: 'AI_OUTPUT_INVALID',
+      error_code: 'INVALID_MODEL_OUTPUT',
+      category: 'AI',
+      dependency: 'AI',
+      ai_feature: feature,
+      issues: parsed.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`).slice(0, 10),
+    },
+    `${feature} returned an invalid document`,
   );
   throw new aiClient.AiServiceError('INVALID_MODEL_OUTPUT', 502);
 }
@@ -400,11 +415,30 @@ async function generateContent(payload, user, { regenerate = false } = {}) {
   // Independent re-check against the offer that will actually be published.
   const { sections, rejected } = guard.filterSections(result.sections, facts);
   if (!Object.keys(sections).length) {
-    console.error('[ai] every generated variant failed the fact check: %j', rejected.slice(0, 5));
+    logger.error(
+      {
+        event: 'AI_FACT_CHECK_REJECTED_ALL',
+        error_code: 'INVALID_MODEL_OUTPUT',
+        category: 'AI',
+        dependency: 'AI',
+        ai_feature: feature,
+        rejected_count: rejected.length,
+      },
+      'Every generated variant failed the fact check',
+    );
     throw new aiClient.AiServiceError('INVALID_MODEL_OUTPUT', 502);
   }
   if (rejected.length) {
-    console.warn('[ai] dropped %d unverifiable variant(s): %j', rejected.length, rejected.slice(0, 5));
+    logger.warn(
+      {
+        event: 'AI_FACT_CHECK_REJECTED_SOME',
+        category: 'AI',
+        dependency: 'AI',
+        ai_feature: feature,
+        rejected_count: rejected.length,
+      },
+      `Dropped ${rejected.length} unverifiable variant(s)`,
+    );
   }
 
   const skipped = payload.sections.filter(

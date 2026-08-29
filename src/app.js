@@ -4,7 +4,6 @@ const path = require('node:path');
 const express = require('express');
 const helmet = require('helmet');
 const cors = require('cors');
-const morgan = require('morgan');
 const compression = require('compression');
 const cookieParser = require('cookie-parser');
 
@@ -16,7 +15,11 @@ const mailer = require('./utils/mailer');
 const { apiLimiter } = require('./middleware/rateLimit');
 const cachePolicy = require('./middleware/cachePolicy');
 const requestId = require('./middleware/requestId');
+const httpLogger = require('./middleware/httpLogger');
 const { notFoundHandler, errorHandler } = require('./middleware/errorHandler');
+const csrfGuard = require('./middleware/csrf');
+const requestLimits = require('./middleware/requestLimits');
+const { isAllowedOrigin } = require('./config/origins');
 
 const app = express();
 
@@ -39,21 +42,14 @@ app.use(
   }),
 );
 
-/**
- * Any localhost origin is acceptable while developing. The dev server does not
- * always get the port it asks for - if 4200 is taken it moves to 4201 - and a
- * fixed allow list turns that into an unexplained login failure. Production is
- * unaffected: there, only CORS_ORIGINS is honoured.
- */
-const isLocalDevOrigin = (origin) =>
-  !env.isProduction && /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/.test(origin);
-
 app.use(
   cors({
     origin(origin, callback) {
       // Requests without an Origin header (curl, server-to-server) are allowed;
       // browsers always send one on POST, and those must be on the allow list.
-      if (!origin || env.corsOrigins.includes(origin) || isLocalDevOrigin(origin)) {
+      // `csrfGuard` below is what stops that allowance from covering a
+      // cookie-authenticated write.
+      if (!origin || isAllowedOrigin(origin)) {
         return callback(null, true);
       }
       // A disallowed origin is the caller's problem, not a server fault, so it
@@ -63,6 +59,10 @@ app.use(
     credentials: true,
   }),
 );
+
+// §31. Ahead of the body parsers, so an oversized request line is refused
+// before its body is read.
+app.use(requestLimits);
 
 app.use(compression());
 app.use(
@@ -79,12 +79,14 @@ app.use(
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 app.use(cookieParser());
 
-if (env.nodeEnv !== 'test') {
-  // The correlation id goes in the access log too, so "find me REQ-82917"
-  // works whether the request failed loudly or just behaved oddly (§57).
-  morgan.token('request-id', (req) => req.id ?? '-');
-  app.use(morgan(env.isProduction ? ':request-id :remote-addr :method :url :status :response-time ms' : 'dev'));
-}
+// §52. Immediately after the cookie parser, because that is what it reads, and
+// ahead of every route so no state-changing endpoint can be added outside it.
+app.use(csrfGuard);
+
+// Structured request logging (Logging §6, §10, §11). Replaces morgan: the
+// correlation id, the duration band and the endpoint pattern all have to be
+// queryable fields, and a formatted line is none of those.
+if (env.nodeEnv !== 'test') app.use(httpLogger);
 
 // Processed images. `immutable` is safe because filenames are content-unique.
 app.use(

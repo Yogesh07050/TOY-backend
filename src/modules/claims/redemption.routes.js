@@ -6,6 +6,7 @@ const { queryOne, execute, rawQuery } = require('../../db/pool');
 const ApiError = require('../../utils/ApiError');
 const validate = require('../../middleware/validate');
 const asyncHandler = require('../../utils/asyncHandler');
+const logger = require('../../utils/logger');
 const audit = require('../../utils/audit');
 const exporters = require('../../utils/exporters');
 const { authenticate } = require('../../middleware/auth');
@@ -273,7 +274,17 @@ router.post(
     const notify =
       kind === 'service_offer' ? notifications.notifyServiceOfferRedeemed : notifications.notifyOfferRedeemed;
     notify(Number(row.id)).catch((error) =>
-      console.error('[notifications] redemption notice failed: %s', error.message),
+      logger.error(
+        {
+          event: 'NOTIFICATION_SEND_FAILED',
+          error_code: 'NOTIFICATION_SEND_FAILED',
+          category: 'NOTIFICATION',
+          dependency: 'PUSH',
+          notification: 'REDEMPTION_CONFIRMED',
+          err_message: error.message,
+        },
+        'Notification fan-out failed',
+      ),
     );
 
     ok(res, claims.mapClaim(await claims.findById(row.id, kind), 'merchant', kind));

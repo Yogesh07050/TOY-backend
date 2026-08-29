@@ -324,6 +324,23 @@ const COLUMN_PATCHES = [
     sql: 'ALTER TABLE shops ADD COLUMN acquisition_channel VARCHAR(60) DEFAULT NULL AFTER status',
     after: ['ALTER TABLE shops ADD KEY idx_shops_channel (acquisition_channel)'],
   },
+  // ---- Logging: stable error codes and categories (Logging §8, §9) --------
+  // Existing installs recorded only `error_type` (the driver/class name), which
+  // changes when the implementation does. These two columns are the stable
+  // vocabulary the monitoring dashboard filters on (§28) and groups by (§30).
+  // Backfilled as NULL: a historical row's code cannot be reconstructed, and
+  // guessing one would put fabricated values in front of an investigation.
+  {
+    table: 'error_logs',
+    column: 'error_code',
+    sql: 'ALTER TABLE error_logs ADD COLUMN error_code VARCHAR(60) DEFAULT NULL AFTER error_type',
+    after: [
+      'ALTER TABLE error_logs ADD COLUMN category VARCHAR(40) DEFAULT NULL AFTER error_code',
+      'ALTER TABLE error_logs ADD KEY idx_error_code_time (error_code, created_at)',
+      'ALTER TABLE error_logs ADD KEY idx_error_category_time (category, created_at)',
+    ],
+  },
+
 ];
 
 /**

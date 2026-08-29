@@ -13,6 +13,9 @@ const featureOverrides = require('../modules/featureOverrides/featureOverride.se
 const claimService = require('../modules/claims/claim.service');
 const failureLog = require('../services/failureLog');
 const idempotency = require('../middleware/idempotency');
+const logger = require('../utils/logger');
+const env = require('../config/env');
+const { runJob } = require('./runner');
 
 /**
  * Background maintenance. Everything here is idempotent, so running a job twice
@@ -25,21 +28,19 @@ const jobs = [
     schedule: '*/5 * * * *',
     run: async () => {
       const { activated, expired } = await offerService.syncLifecycleStatuses();
-      if (activated || expired) {
-        console.log('[jobs] offer lifecycle: %d activated, %d expired', activated, expired);
-      }
 
       // Banners follow the same clock. Their customer-facing visibility is
       // computed live from the offer too, so a stale status can never leak an
       // expired offer onto the page - this just keeps the admin list honest.
       const banners = await bannerService.syncLifecycleStatuses();
-      if (banners.published || banners.expired) {
-        console.log(
-          '[jobs] banner lifecycle: %d published, %d expired',
-          banners.published,
-          banners.expired,
-        );
-      }
+
+      return {
+        processed: activated + expired + banners.published + banners.expired,
+        offers_activated: activated,
+        offers_expired: expired,
+        banners_published: banners.published,
+        banners_expired: banners.expired,
+      };
     },
   },
   {
@@ -49,10 +50,7 @@ const jobs = [
     // every attempt - so a late sweep can only make a list look stale, never
     // let an expired code through.
     schedule: '*/5 * * * *',
-    run: async () => {
-      const expired = await claimService.syncExpiredClaims();
-      if (expired) console.log('[jobs] claim expiry: %d expired', expired);
-    },
+    run: async () => ({ processed: await claimService.syncExpiredClaims() }),
   },
   {
     name: 'service-lifecycle',
@@ -61,15 +59,13 @@ const jobs = [
     run: async () => {
       const { activated, expired } = await serviceService.syncLifecycleStatuses();
       const offers = await serviceOfferService.syncLifecycleStatuses();
-      if (activated || expired || offers.activated || offers.expired) {
-        console.log(
-          '[jobs] service lifecycle: %d activated, %d expired (offers: %d activated, %d expired)',
-          activated,
-          expired,
-          offers.activated,
-          offers.expired,
-        );
-      }
+      return {
+        processed: activated + expired + offers.activated + offers.expired,
+        services_activated: activated,
+        services_expired: expired,
+        service_offers_activated: offers.activated,
+        service_offers_expired: offers.expired,
+      };
     },
   },
   {
@@ -82,9 +78,11 @@ const jobs = [
         notifications.notifyExpiringSaved('offer'),
         notifications.notifyExpiringSaved('service_offer'),
       ]);
-      if (offers || serviceOffers) {
-        console.log('[jobs] expiry reminders sent: %d offers, %d service offers', offers, serviceOffers);
-      }
+      return {
+        processed: offers + serviceOffers,
+        offer_reminders: offers,
+        service_offer_reminders: serviceOffers,
+      };
     },
   },
   {
@@ -95,10 +93,7 @@ const jobs = [
     // Expo discards receipts after 24 hours, so this has to run often enough
     // to catch them - and is a no-op when there is nothing pending.
     schedule: '*/15 * * * *',
-    run: async () => {
-      const checked = await notifications.syncPushReceipts();
-      if (checked) console.log('[jobs] push receipts reconciled: %d', checked);
-    },
+    run: async () => ({ processed: await notifications.syncPushReceipts() }),
   },
   {
     name: 'analytics-snapshots',
@@ -107,7 +102,7 @@ const jobs = [
     schedule: '20 0 * * *',
     run: async () => {
       const { day, rows } = await analyticsSnapshots.rebuildDay();
-      console.log('[jobs] analytics snapshot for %s: %d rows', day, rows);
+      return { processed: rows, snapshot_day: day };
     },
   },
   {
@@ -116,10 +111,7 @@ const jobs = [
     // downgrades whose paid period has ended (§10, §11, §12). Merchant data is
     // never deleted - only the plan changes.
     schedule: '0 2 * * *',
-    run: async () => {
-      const downgraded = await subscriptionService.sweepLapsed();
-      if (downgraded) console.log('[jobs] billing lifecycle: %d shops downgraded', downgraded);
-    },
+    run: async () => ({ processed: await subscriptionService.sweepLapsed() }),
   },
   {
     name: 'override-expiry',
@@ -127,10 +119,7 @@ const jobs = [
     // override stops granting its feature the moment its date passes, because
     // the resolver filters on the date. This writes the EXPIRED audit event.
     schedule: '10 2 * * *',
-    run: async () => {
-      const expired = await featureOverrides.expireLapsed();
-      if (expired) console.log('[jobs] feature overrides expired: %d', expired);
-    },
+    run: async () => ({ processed: await featureOverrides.expireLapsed() }),
   },
   {
     name: 'idempotency-sweep',
@@ -139,10 +128,7 @@ const jobs = [
     // leaves its key stuck `in_progress` and the merchant unable to retry at
     // all, which is worse than the duplicate the key was preventing.
     schedule: '*/5 * * * *',
-    run: async () => {
-      const released = await idempotency.releaseStale(15);
-      if (released) console.log('[jobs] idempotency: %d stale keys released', released);
-    },
+    run: async () => ({ processed: await idempotency.releaseStale(15) }),
   },
   {
     name: 'prune',
@@ -155,40 +141,60 @@ const jobs = [
       const [tokens, notices, failures, keys] = await Promise.all([
         authService.pruneExpiredTokens(),
         notifications.pruneOld(),
-        failureLog.pruneOlderThan(90),
+        // §35: retention is configurable rather than a literal, because "how
+        // long do we keep this?" is a policy question and policy changes.
+        failureLog.pruneOlderThan(env.logging.retentionDays),
         // A settled key is only useful while a client might still retry with
         // it; two days is far beyond any timeout worth honouring.
         idempotency.pruneCompleted(48),
       ]);
-      console.log(
-        '[jobs] pruned %d tokens, %d notifications, %d failure records and %d idempotency keys',
-        tokens,
-        notices,
-        failures,
-        keys,
-      );
+      return {
+        processed: tokens + notices + failures + keys,
+        tokens_pruned: tokens,
+        notifications_pruned: notices,
+        failure_records_pruned: failures,
+        idempotency_keys_pruned: keys,
+        retention_days: env.logging.retentionDays,
+      };
     },
   },
 ];
 
 function start() {
   for (const job of jobs) {
-    cron.schedule(job.schedule, () => {
-      job.run().catch((error) => console.error('[jobs] %s failed: %s', job.name, error.message));
-    });
+    // `runJob` owns the whole lifecycle including failure (§24), so nothing is
+    // attached here - a `.catch` would only ever see an error it already logged.
+    cron.schedule(job.schedule, () => void runJob(job));
   }
-  console.log('[jobs] scheduled: %s', jobs.map((job) => job.name).join(', '));
+  logger.info(
+    { event: 'JOBS_SCHEDULED', jobs: jobs.map((job) => job.name), count: jobs.length },
+    `Scheduled ${jobs.length} background jobs`,
+  );
 
-  // Bring statuses up to date immediately rather than waiting for the first tick.
-  offerService
-    .syncLifecycleStatuses()
-    .catch((error) => console.error('[jobs] initial lifecycle sync failed: %s', error.message));
-  serviceService
-    .syncLifecycleStatuses()
-    .catch((error) => console.error('[jobs] initial service lifecycle sync failed: %s', error.message));
-  serviceOfferService
-    .syncLifecycleStatuses()
-    .catch((error) => console.error('[jobs] initial service offer lifecycle sync failed: %s', error.message));
+  // Bring statuses up to date immediately rather than waiting for the first
+  // tick. Run through the same wrapper so a failure at boot is as visible as
+  // one at 03:00, and carries a job id somebody can search for.
+  void runJob({
+    name: 'initial-lifecycle-sync',
+    run: async () => {
+      const [offers, services, serviceOffers] = await Promise.all([
+        offerService.syncLifecycleStatuses(),
+        serviceService.syncLifecycleStatuses(),
+        serviceOfferService.syncLifecycleStatuses(),
+      ]);
+      return {
+        processed:
+          offers.activated + offers.expired + services.activated + services.expired +
+          serviceOffers.activated + serviceOffers.expired,
+        offers_activated: offers.activated,
+        offers_expired: offers.expired,
+        services_activated: services.activated,
+        services_expired: services.expired,
+        service_offers_activated: serviceOffers.activated,
+        service_offers_expired: serviceOffers.expired,
+      };
+    },
+  });
 }
 
 module.exports = { start, jobs };

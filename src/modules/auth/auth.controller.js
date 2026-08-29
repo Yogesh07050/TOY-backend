@@ -5,6 +5,9 @@ const audit = require('../../utils/audit');
 const { ok, created } = require('../../utils/respond');
 const env = require('../../config/env');
 const tokens = require('../../utils/tokens');
+const logger = require('../../utils/logger');
+const { maskEmail } = require('../../utils/mask');
+const deviceInfo = require('../../utils/device');
 
 /**
  * The refresh token is returned in the body (for non-browser clients) *and* set
@@ -56,21 +59,113 @@ exports.register = async (req, res) => {
   created(res, result);
 };
 
+/**
+ * Authentication event context (§18).
+ *
+ * §18 lists what a failed login must carry: timestamp, request id, an account
+ * reference where there is one, IP metadata, device/platform and the result.
+ * Timestamp and request id come from the logger; the rest is assembled here.
+ *
+ * The email is masked (§37). It has to be *something* - "a login failed" with
+ * no subject cannot be investigated, and cannot answer the customer who is on
+ * the phone saying they cannot get in - but a log of full addresses paired
+ * with failures is a credential-stuffing target list, so `t***@example.com` is
+ * the compromise: enough to confirm which account, not enough to enumerate.
+ *
+ * The password is never touched, in any form. Not its length, not a hash.
+ */
+function authContext(req, email) {
+  const device = deviceInfo.describe(req);
+  return {
+    account: email ? maskEmail(email) : undefined,
+    ip_address: device.ipAddress,
+    device_type: device.deviceType,
+    platform: device.platform,
+  };
+}
+
 exports.login = async (req, res) => {
-  const result = await service.login(req.body, req);
+  const context = authContext(req, req.body?.email);
+
+  let result;
+  try {
+    result = await service.login(req.body, req);
+  } catch (error) {
+    // §18: a failed login is its own event, at WARN. The generic 401 the error
+    // handler logs cannot say which account was targeted, and the *pattern* of
+    // failures per account is what §29's login-failure alert is built on.
+    (req.log ?? logger).warn(
+      {
+        ...context,
+        event: 'LOGIN_FAILED',
+        error_code: 'AUTH_INVALID_CREDENTIALS',
+        category: 'AUTHENTICATION',
+        result: 'FAILURE',
+        // Distinguishes "wrong credentials" from "account deactivated"; the
+        // customer is told neither, but support needs to know which it was.
+        reason: error.status === 403 ? 'ACCOUNT_DEACTIVATED' : 'INVALID_CREDENTIALS',
+      },
+      'Login failed',
+    );
+    throw error;
+  }
+
   setRefreshCookie(res, result.refreshToken);
+  // §50 lists login among the actions that must be auditable. The device the
+  // session was opened from is the detail an investigation actually needs.
+  req.user = { id: result.user.id };
+  await audit.record(req, {
+    action: 'LOGIN',
+    entityType: 'user',
+    entityId: result.user.id,
+    newValue: { email: result.user.email },
+  });
+  (req.log ?? logger).info(
+    { ...context, event: 'LOGIN_SUCCEEDED', user_id: String(result.user.id), result: 'SUCCESS' },
+    'Login succeeded',
+  );
   ok(res, result);
 };
 
 exports.refresh = async (req, res) => {
-  const result = await service.refresh(readRefreshToken(req), req);
+  let result;
+  try {
+    result = await service.refresh(readRefreshToken(req), req);
+  } catch (error) {
+    // §18. WARN rather than ERROR: the common cause is an expired session,
+    // which is the system working. The signal is in the rate, which is why it
+    // needs to be countable (§29).
+    (req.log ?? logger).warn(
+      {
+        ...authContext(req),
+        event: 'REFRESH_FAILED',
+        error_code: 'AUTH_REFRESH_FAILED',
+        category: 'AUTHENTICATION',
+        result: 'FAILURE',
+      },
+      'Token refresh failed',
+    );
+    throw error;
+  }
+
   setRefreshCookie(res, result.refreshToken);
+  (req.log ?? logger).debug(
+    { event: 'REFRESH_SUCCEEDED', user_id: String(result.user.id), result: 'SUCCESS' },
+    'Token refreshed',
+  );
   ok(res, result);
 };
 
 exports.logout = async (req, res) => {
-  await service.logout(readRefreshToken(req), req.user?.id);
+  // Captured before the token is spent - afterwards there is nothing left to
+  // identify who signed out, since `optionalAuth` leaves `req.user` unset for a
+  // client that sent only its refresh cookie.
+  const userId = req.user?.id ?? null;
+  await service.logout(readRefreshToken(req), userId);
   clearRefreshCookie(res);
+  // §50. An unauthenticated logout - an already-expired access token, or a
+  // cookie for a session that is gone - is a no-op and not worth a row.
+  if (userId) await audit.record(req, { action: 'LOGOUT', entityType: 'user', entityId: userId });
   ok(res, { message: 'Signed out' });
 };
 

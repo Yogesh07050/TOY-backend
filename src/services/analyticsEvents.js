@@ -1,6 +1,7 @@
 'use strict';
 
 const { execute, queryOne } = require('../db/pool');
+const logger = require('../utils/logger');
 
 /**
  * Analytics event tracking (V3 §28).
@@ -165,7 +166,16 @@ async function record(eventType, payload = {}) {
       ],
     );
   } catch (error) {
-    console.error('[analytics] %s event dropped: %s', eventType, error.message);
+    logger.warn(
+      {
+        event: 'ANALYTICS_EVENT_DROPPED',
+        category: 'DATABASE',
+        dependency: 'DATABASE',
+        analytics_event: eventType,
+        err_message: error.message,
+      },
+      'Analytics event dropped',
+    );
   }
 }
 
@@ -190,7 +200,15 @@ async function touchShopCustomer(shopId, userId, kind = 'visit') {
     // mysql2 reports affectedRows = 1 for an insert and 2 for an update.
     return { isNew: result.affectedRows === 1 };
   } catch (error) {
-    console.error('[analytics] shop customer touch failed: %s', error.message);
+    logger.warn(
+      {
+        event: 'ANALYTICS_SHOP_CUSTOMER_TOUCH_FAILED',
+        category: 'DATABASE',
+        dependency: 'DATABASE',
+        err_message: error.message,
+      },
+      'Could not record a shop customer touch',
+    );
     return { isNew: false };
   }
 }

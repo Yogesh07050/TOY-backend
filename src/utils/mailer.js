@@ -4,6 +4,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const nodemailer = require('nodemailer');
 const env = require('../config/env');
+const logger = require('./logger');
+const { maskEmail } = require('./mask');
 
 /**
  * Outbound email.
@@ -54,7 +56,10 @@ function writeToOutbox(message) {
     );
     return file;
   } catch (error) {
-    console.error('[mail] could not write to the outbox: %s', error.message);
+    logger.error(
+      { event: 'MAIL_OUTBOX_WRITE_FAILED', category: 'STORAGE', err_message: error.message },
+      'Could not write to the mail outbox',
+    );
     return null;
   }
 }
@@ -68,15 +73,21 @@ async function send({ to, subject, text, html }) {
     const file = writeToOutbox({ to, subject, text, html });
     const link = firstLink(text);
 
-    console.warn(
-      '\n[mail] SMTP is not configured - "%s" for %s was NOT sent.\n' +
-        '       Saved to: %s\n' +
-        (link ? '       Link:     %s\n' : '%s') +
-        '       Set SMTP_HOST and friends in .env to deliver mail for real.\n',
-      subject,
-      to,
-      file ?? '(outbox unavailable)',
-      link ?? '',
+    // §37: subject and outbox path, recipient masked. `link` carries a
+    // single-use verification or reset token, so it is kept for the developer
+    // running without SMTP and never written to a shipped log line.
+    logger.warn(
+      {
+        event: 'MAIL_NOT_SENT',
+        dependency: 'EMAIL',
+        category: 'NOTIFICATION',
+        reason: 'SMTP_NOT_CONFIGURED',
+        subject,
+        recipient: maskEmail(to),
+        outbox_file: file ?? null,
+        ...(env.isProduction || !link ? {} : { dev_link: link }),
+      },
+      `SMTP is not configured - "${subject}" was saved to the outbox instead of being sent`,
     );
     return { delivered: false, transport: 'outbox' };
   }
@@ -92,7 +103,19 @@ async function send({ to, subject, text, html }) {
     });
     return { delivered: true, transport: 'smtp' };
   } catch (error) {
-    console.error('[mail] failed to send "%s" to %s: %s', subject, to, error.message);
+    // §37: the subject is logged, the recipient is masked, the body never is.
+    logger.error(
+      {
+        event: 'MAIL_SEND_FAILED',
+        error_code: 'NOTIFICATION_SEND_FAILED',
+        category: 'NOTIFICATION',
+        dependency: 'EMAIL',
+        subject,
+        recipient: maskEmail(to),
+        err_message: error.message,
+      },
+      'Could not send email',
+    );
     return { delivered: false, transport: 'smtp', error: error.message };
   }
 }
@@ -103,25 +126,35 @@ async function send({ to, subject, text, html }) {
  */
 async function verifyTransport() {
   if (!isConfigured) {
-    console.warn(
-      '[mail] SMTP_HOST is empty - verification and password-reset emails will be written to\n' +
-        '       %s instead of being sent. See .env.example to configure delivery.',
-      OUTBOX_DIR,
+    logger.warn(
+      { event: 'MAIL_TRANSPORT_NOT_CONFIGURED', dependency: 'EMAIL', outbox_dir: OUTBOX_DIR },
+      'SMTP_HOST is empty - verification and password-reset emails will be written to the outbox. See .env.example.',
     );
     return false;
   }
 
   try {
     await getTransporter().verify();
-    console.log('[mail] SMTP ready at %s:%d', env.mail.host, env.mail.port);
+    logger.info(
+      { event: 'MAIL_TRANSPORT_READY', dependency: 'EMAIL', smtp_host: env.mail.host, smtp_port: env.mail.port },
+      `SMTP ready at ${env.mail.host}:${env.mail.port}`,
+    );
     return true;
   } catch (error) {
-    console.error(
-      '[mail] SMTP at %s:%d is NOT working: %s\n' +
-        '       Emails will fail until this is fixed.',
-      env.mail.host,
-      env.mail.port,
-      error.message,
+    // §7 FATAL is for the process being unable to run; mail is degraded, not
+    // dead - password resets fail, everything else keeps working. ERROR.
+    logger.error(
+      {
+        event: 'MAIL_TRANSPORT_UNAVAILABLE',
+        error_code: 'NOTIFICATION_SEND_FAILED',
+        category: 'NOTIFICATION',
+        dependency: 'EMAIL',
+        // Host and port only. §37: never the SMTP password.
+        smtp_host: env.mail.host,
+        smtp_port: env.mail.port,
+        err_message: error.message,
+      },
+      `SMTP at ${env.mail.host}:${env.mail.port} is not working; emails will fail until it is fixed`,
     );
     return false;
   }

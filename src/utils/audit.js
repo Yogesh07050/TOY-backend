@@ -1,6 +1,7 @@
 'use strict';
 
 const { execute } = require('../db/pool');
+const logger = require('./logger');
 
 /**
  * Records an administrative action (§28). Never throws into the request path -
@@ -31,7 +32,20 @@ async function record(req, { action, entityType, entityId = null, oldValue = nul
       ],
     );
   } catch (error) {
-    console.error('[audit] failed to record %s on %s: %s', action, entityType, error.message);
+    // An audit gap is a compliance problem, not a nuisance - logged at ERROR
+    // so it is visible even though the user's action itself succeeded.
+    logger.error(
+      {
+        event: 'AUDIT_WRITE_FAILED',
+        error_code: 'DB_TRANSACTION_FAILED',
+        category: 'DATABASE',
+        dependency: 'DATABASE',
+        audit_action: action,
+        entity_type: entityType,
+        err_message: error.message,
+      },
+      'Could not record an audit entry',
+    );
   }
 }
 

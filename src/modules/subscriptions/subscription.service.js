@@ -113,6 +113,37 @@ async function planKeyForShop(shopId) {
 }
 
 /**
+ * The per-period usage counters that gate a create, and the query behind each.
+ *
+ * Kept as a map rather than inlined into `usageForShop` so the same count can
+ * be re-run on a transaction's own connection - which is what stops two
+ * simultaneous creates from both passing a one-per-month limit (§24).
+ */
+const MONTHLY_USAGE_SQL = {
+  offersThisMonth: `SELECT COUNT(*) AS count FROM offers
+                     WHERE shop_id = ? AND status <> 'draft' AND created_at >= ? AND created_at < ?`,
+  servicesThisMonth: `SELECT COUNT(*) AS count FROM services
+                       WHERE shop_id = ? AND status <> 'draft' AND created_at >= ? AND created_at < ?`,
+};
+
+/**
+ * One monthly usage counter, read on a caller-supplied connection.
+ *
+ * `usageForShop` reads through the pool, which is right for a dashboard but
+ * wrong for a limit check: a count taken on another connection cannot see the
+ * uncommitted row of the transaction it is meant to be guarding. Callers pass
+ * their own transaction connection here so the count and the insert it gates
+ * are the same unit of work (§24).
+ */
+async function countMonthlyUsage(connection, shopId, usageKey, period = currentPeriod()) {
+  const sql = MONTHLY_USAGE_SQL[usageKey];
+  if (!sql) throw new Error(`No monthly usage query defined for "${usageKey}"`);
+  const [start, end] = periodBounds(period);
+  const [rows] = await connection.execute(sql, [shopId, start, end]);
+  return Number(rows[0]?.count ?? 0);
+}
+
+/**
  * Live usage against the plan limits.
  *
  * Offers, branches and categories are counted from the source tables rather
@@ -668,6 +699,7 @@ module.exports = {
   planKeyForShop,
   planKeysForShops,
   usageForShop,
+  countMonthlyUsage,
   recordUsage,
   entitlements,
   isEntitled,

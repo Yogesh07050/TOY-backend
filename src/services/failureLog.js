@@ -2,6 +2,9 @@
 
 const { execute, rawQuery } = require('../db/pool');
 const { ALERT_RULES } = require('../config/businessMetrics');
+const logger = require('../utils/logger');
+const endpointFor = require('../utils/endpoint');
+const { internalCodeFor, categoryFor } = require('../config/errorCodes');
 
 /**
  * Internal failure logging (§56) and the spike detection built on it (§59).
@@ -68,22 +71,6 @@ function dependencyFor(error, req) {
   return null;
 }
 
-/**
- * The route pattern rather than the concrete URL: `/offers/:id`, not
- * `/offers/8821`. Without this, a thousand failures on one broken endpoint
- * scatter into a thousand distinct rows and no spike is ever visible.
- */
-function endpointFor(req) {
-  const base = req.baseUrl ?? '';
-  const route = req.route?.path;
-  if (route) return `${base}${route === '/' ? '' : route}`.slice(0, 255) || '/';
-
-  // No matched route (a 404, or a failure in middleware before the router).
-  // Digits are the only thing worth generalising; slugs are low-cardinality
-  // enough to leave alone.
-  return (req.originalUrl ?? '/').split('?')[0].replace(/\/\d+/g, '/:id').slice(0, 255);
-}
-
 /** The shop this request concerned, where the route made that explicit. */
 function shopIdFor(req) {
   const candidate =
@@ -111,11 +98,15 @@ const truncate = (value, length) =>
  */
 async function record(error, req, apiError) {
   try {
+    // §8, §9. Derived here rather than passed in, so a row is categorised the
+    // same way whoever writes it - the error handler, a job, a future caller.
+    const errorCode = internalCodeFor(error, apiError.code);
+
     await execute(
       `INSERT INTO error_logs
-         (request_id, user_id, shop_id, method, endpoint, error_type, http_status,
-          dependency, message, platform, app_version)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (request_id, user_id, shop_id, method, endpoint, error_type, error_code,
+          category, http_status, dependency, message, platform, app_version)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         truncate(req.id ?? 'REQ-UNKNOWN', 40),
         req.user?.id ?? null,
@@ -123,6 +114,8 @@ async function record(error, req, apiError) {
         truncate(req.method, 10),
         endpointFor(req),
         truncate(error?.name || error?.code || 'Error', 80),
+        truncate(errorCode, 60),
+        truncate(categoryFor(errorCode), 40),
         apiError.status,
         dependencyFor(error, req),
         // The message only. A stack belongs in the process log, where it is
@@ -134,7 +127,10 @@ async function record(error, req, apiError) {
     );
   } catch (loggingError) {
     // The one place a swallow is mandatory: this runs inside the error handler.
-    console.error('[failure-log] could not record failure: %s', loggingError.message);
+    logger.error(
+      { event: 'FAILURE_LOG_WRITE_FAILED', request_id: req?.id, err_message: loggingError.message },
+      'Could not record failure',
+    );
   }
 }
 
@@ -199,8 +195,8 @@ async function topFailingEndpoints({ windowMinutes = 60, limit = 10 } = {}) {
 /** One request's failure, for a support lookup by reference (§57). */
 async function findByRequestId(requestId) {
   const rows = await rawQuery(
-    `SELECT id, request_id, user_id, shop_id, method, endpoint, error_type, http_status,
-            dependency, message, platform, app_version, created_at
+    `SELECT id, request_id, user_id, shop_id, method, endpoint, error_type, error_code,
+            category, http_status, dependency, message, platform, app_version, created_at
        FROM error_logs WHERE request_id = ? ORDER BY created_at DESC LIMIT 20`,
     [requestId],
   );
@@ -212,6 +208,8 @@ async function findByRequestId(requestId) {
     method: row.method,
     endpoint: row.endpoint,
     errorType: row.error_type,
+    errorCode: row.error_code,
+    category: row.category,
     httpStatus: Number(row.http_status),
     dependency: row.dependency,
     message: row.message,

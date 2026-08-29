@@ -4,6 +4,9 @@ const multer = require('multer');
 const ApiError = require('../utils/ApiError');
 const env = require('../config/env');
 const failureLog = require('../services/failureLog');
+const logger = require('../utils/logger');
+const { internalCodeFor, categoryFor } = require('../config/errorCodes');
+const endpointFor = require('../utils/endpoint');
 
 const notFoundHandler = (req, _res, next) => {
   next(ApiError.notFound(`Route ${req.method} ${req.originalUrl} not found`));
@@ -64,13 +67,46 @@ function translate(error) {
 function errorHandler(error, req, res, _next) {
   const apiError = translate(error) || ApiError.internal();
 
+  /**
+   * The developer's half of §3: everything the response is not allowed to say.
+   *
+   * `error_code` is the specific internal one (`DB_QUERY_TIMEOUT`), not the
+   * generic code the caller receives - that split is what lets §28 filter by
+   * failure mode while §3 keeps the customer's message empty of detail. The
+   * stack goes here and only here; §12 keeps it out of the retained
+   * `error_logs` table, where it would sit next to a user id for ninety days.
+   *
+   * Server faults are ERROR. Everything else is a refusal the system issued on
+   * purpose - a validation failure, a wrong password, a plan limit - and
+   * logging those at ERROR is how an error dashboard becomes unreadable. They
+   * are kept at DEBUG so the trace for one request is still complete when
+   * somebody goes looking for it by reference.
+   */
+  const internalCode = internalCodeFor(error, apiError.code);
+  const log = req.log ?? logger.forRequest(req);
+  const fields = {
+    event: 'REQUEST_FAILED',
+    endpoint: endpointFor(req),
+    http_method: req.method,
+    status_code: apiError.status,
+    error_code: internalCode,
+    category: categoryFor(internalCode),
+    dependency: failureLog.dependencyFor(error, req),
+  };
+
   if (apiError.status >= 500) {
-    console.error(
-      '[error] %s %s %s -> %s',
-      req.id ?? '-',
-      req.method,
-      req.originalUrl,
-      error.stack || error.message,
+    log.error({ ...fields, stack: error.stack, err_message: error.message }, apiError.message);
+  } else {
+    log.debug(fields, apiError.message);
+  }
+
+  // §19: an authorization refusal is a security signal, not just a 403. Logged
+  // at WARN with the resource and action attached so a merchant probing another
+  // shop's data is visible without reading every debug line.
+  if (apiError.status === 403 || apiError.status === 401) {
+    log.warn(
+      { ...fields, event: 'AUTHORIZATION_DENIED', result: 'DENIED' },
+      `${apiError.status === 401 ? 'Unauthenticated' : 'Unauthorized'} ${req.method} ${fields.endpoint}`,
     );
   }
 

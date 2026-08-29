@@ -5,6 +5,7 @@ const { z } = require('zod');
 const asyncHandler = require('../../utils/asyncHandler');
 const validate = require('../../middleware/validate');
 const { optionalAuth } = require('../../middleware/auth');
+const { searchLimiter } = require('../../middleware/rateLimit');
 const { ok } = require('../../utils/respond');
 const { query } = require('../../db/pool');
 const offerDiscovery = require('../../services/offerDiscovery');
@@ -50,6 +51,9 @@ const wanted = (type) => {
 router.get(
   '/',
   optionalAuth,
+  // §56. After `optionalAuth` so a signed-in merchant is limited as a user
+  // rather than sharing their office's IP budget with every colleague.
+  searchLimiter,
   validate({ query: searchQuery }),
   asyncHandler(async (req, res) => {
     const { q, limit, latitude, longitude, city } = req.query;

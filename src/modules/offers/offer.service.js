@@ -2,6 +2,7 @@
 
 const { query, queryOne, execute, rawQuery, transaction } = require('../../db/pool');
 const ApiError = require('../../utils/ApiError');
+const logger = require('../../utils/logger');
 const geo = require('../../utils/geo');
 const { limitOffset } = require('../../utils/pagination');
 const accessControl = require('../../services/accessControl');
@@ -579,20 +580,39 @@ async function assertPublishingAllowed(shopId, payload, { isNew }) {
     await entitlements.assertFeature(shopId, FEATURES.OFFER_SCHEDULING);
   }
 
-  if (isNew && payload.status !== 'draft') {
+  const countsAgainstAllowance = isNew && payload.status !== 'draft';
+  if (countsAgainstAllowance) {
+    // Fails fast on the common case, and is the only check an update needs.
+    // A create re-runs it inside its transaction, where it is race-free (§24).
     await entitlements.assertUsageWithinLimit(shopId, 'offersPerMonth', 'offersThisMonth');
   }
+
+  // Resolved out here so the transaction never has to ask the pool for a
+  // second connection while holding one - see `assertUsageWithinLimitLocked`.
+  return { countsAgainstAllowance, resolved: countsAgainstAllowance ? await entitlements.resolve(shopId) : null };
 }
 
 async function create(payload, user) {
   const shop = await queryOne('SELECT id, name, status FROM shops WHERE id = ?', [payload.shopId]);
   if (!shop) throw ApiError.badRequest('Shop not found');
 
-  await assertPublishingAllowed(payload.shopId, payload, { isNew: true });
+  const allowance = await assertPublishingAllowed(payload.shopId, payload, { isNew: true });
 
   const status = resolveStatus(payload.status, payload.startDate, payload.endDate);
 
   const offerId = await transaction(async (connection) => {
+    // §24: the monthly allowance is re-checked here, under a lock, because the
+    // check above raced - two simultaneous posts both saw the same free slot.
+    if (allowance.countsAgainstAllowance) {
+      await entitlements.assertUsageWithinLimitLocked(
+        connection,
+        payload.shopId,
+        'offersPerMonth',
+        'offersThisMonth',
+        allowance.resolved,
+      );
+    }
+
     await assertBranchesBelongToShop(connection, payload.shopId, payload.branchIds);
 
     const [result] = await connection.execute(
@@ -670,7 +690,17 @@ async function create(payload, user) {
     // Fan-out runs after the transaction so a notification failure cannot roll
     // back a published offer.
     notifications.notifyNewOffer(offerId).catch((error) =>
-      console.error('[notifications] new offer fan-out failed: %s', error.message),
+      logger.error(
+        {
+          event: 'NOTIFICATION_SEND_FAILED',
+          error_code: 'NOTIFICATION_SEND_FAILED',
+          category: 'NOTIFICATION',
+          dependency: 'PUSH',
+          notification: 'NEW_OFFER',
+          err_message: error.message,
+        },
+        'Notification fan-out failed',
+      ),
     );
   }
 
@@ -762,7 +792,17 @@ async function update(offerId, payload, user, previous) {
   });
 
   notifications.notifyOfferUpdated(offerId).catch((error) =>
-    console.error('[notifications] offer update fan-out failed: %s', error.message),
+    logger.error(
+        {
+          event: 'NOTIFICATION_SEND_FAILED',
+          error_code: 'NOTIFICATION_SEND_FAILED',
+          category: 'NOTIFICATION',
+          dependency: 'PUSH',
+          notification: 'OFFER_UPDATED',
+          err_message: error.message,
+        },
+        'Notification fan-out failed',
+      ),
   );
 
   return getById(offerId, user, { forManagement: true });

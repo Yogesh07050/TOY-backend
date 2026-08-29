@@ -3,6 +3,7 @@
 const crypto = require('node:crypto');
 const { execute, queryOne } = require('../db/pool');
 const ApiError = require('../utils/ApiError');
+const logger = require('../utils/logger');
 
 /**
  * Duplicate action protection (§50, §51).
@@ -165,7 +166,18 @@ function captureResponse(res, { key, userId }) {
     // Never let bookkeeping delay or break the response the caller is waiting
     // on. A lost record costs a duplicate on retry; a thrown error here costs
     // the response itself.
-    settle.catch((error) => console.error('[idempotency] could not settle %s: %s', key, error.message));
+    settle.catch((error) =>
+      logger.error(
+        {
+          event: 'IDEMPOTENCY_SETTLE_FAILED',
+          error_code: 'DB_TRANSACTION_FAILED',
+          category: 'DATABASE',
+          dependency: 'DATABASE',
+          err_message: error.message,
+        },
+        'Could not settle an idempotency key',
+      ),
+    );
 
     return originalJson(body);
   };

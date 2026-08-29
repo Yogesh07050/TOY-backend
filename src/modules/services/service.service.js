@@ -2,6 +2,7 @@
 
 const { query, queryOne, execute, rawQuery, transaction } = require('../../db/pool');
 const ApiError = require('../../utils/ApiError');
+const logger = require('../../utils/logger');
 const geo = require('../../utils/geo');
 const { limitOffset } = require('../../utils/pagination');
 const accessControl = require('../../services/accessControl');
@@ -517,9 +518,15 @@ async function assertPublishingAllowed(shopId, payload, { isNew }) {
     await entitlements.assertFeature(shopId, FEATURES.SERVICE_SCHEDULING);
   }
 
-  if (isNew && payload.status !== 'draft') {
+  const countsAgainstAllowance = isNew && payload.status !== 'draft';
+  if (countsAgainstAllowance) {
+    // Fails fast; `create` re-checks inside its transaction where it is
+    // race-free (§24).
     await entitlements.assertUsageWithinLimit(shopId, 'servicesPerMonth', 'servicesThisMonth');
   }
+
+  // Resolved outside any transaction - see `assertUsageWithinLimitLocked`.
+  return { countsAgainstAllowance, resolved: countsAgainstAllowance ? await entitlements.resolve(shopId) : null };
 }
 
 async function insertImagesAndLocations(connection, serviceId, payload) {
@@ -543,11 +550,22 @@ async function create(payload, user) {
   const shop = await queryOne('SELECT id, name, status FROM shops WHERE id = ?', [payload.shopId]);
   if (!shop) throw ApiError.badRequest('Shop not found');
 
-  await assertPublishingAllowed(payload.shopId, payload, { isNew: true });
+  const allowance = await assertPublishingAllowed(payload.shopId, payload, { isNew: true });
 
   const status = resolveStatus(payload.status, payload.startDate ?? null, payload.endDate ?? null);
 
   const serviceId = await transaction(async (connection) => {
+    // §24: re-checked under a lock, because the check above raced.
+    if (allowance.countsAgainstAllowance) {
+      await entitlements.assertUsageWithinLimitLocked(
+        connection,
+        payload.shopId,
+        'servicesPerMonth',
+        'servicesThisMonth',
+        allowance.resolved,
+      );
+    }
+
     await assertBranchesBelongToShop(connection, payload.shopId, payload.branchIds);
 
     const [result] = await connection.execute(
@@ -830,7 +848,17 @@ async function createBooking(serviceId, payload, user) {
   // either way, and a push outage must not fail the request that made it.
   notifications
     .notifyBooking(result.insertId, 'BOOKING_CREATED')
-    .catch((error) => console.error('[notifications] booking confirmation failed: %s', error.message));
+    .catch((error) => logger.error(
+        {
+          event: 'NOTIFICATION_SEND_FAILED',
+          error_code: 'NOTIFICATION_SEND_FAILED',
+          category: 'NOTIFICATION',
+          dependency: 'PUSH',
+          notification: 'BOOKING_CONFIRMED',
+          err_message: error.message,
+        },
+        'Notification fan-out failed',
+      ));
 
   return mapBooking(await queryOne('SELECT * FROM service_bookings WHERE id = ?', [result.insertId]));
 }
@@ -860,7 +888,17 @@ async function updateBookingStatus(bookingId, status, user) {
   if (status !== booking.status) {
     notifications
       .notifyBookingStatusChanged(bookingId, status)
-      .catch((error) => console.error('[notifications] booking update failed: %s', error.message));
+      .catch((error) => logger.error(
+        {
+          event: 'NOTIFICATION_SEND_FAILED',
+          error_code: 'NOTIFICATION_SEND_FAILED',
+          category: 'NOTIFICATION',
+          dependency: 'PUSH',
+          notification: 'BOOKING_UPDATED',
+          err_message: error.message,
+        },
+        'Notification fan-out failed',
+      ));
   }
 
   return mapBooking(await queryOne('SELECT * FROM service_bookings WHERE id = ?', [bookingId]));

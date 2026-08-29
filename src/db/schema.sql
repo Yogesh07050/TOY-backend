@@ -1506,6 +1506,12 @@ CREATE TABLE IF NOT EXISTS error_logs (
   -- failures on one endpoint group instead of scattering across ids.
   endpoint     VARCHAR(255)    NOT NULL,
   error_type   VARCHAR(80)     NOT NULL,
+  -- The stable application code (Logging §8) and its category (§9):
+  -- DB_QUERY_TIMEOUT / DATABASE, not the driver's ECONNREFUSED. These are what
+  -- the monitoring dashboard filters and groups on (§28, §30), so they must
+  -- survive a change of driver, ORM or error message.
+  error_code   VARCHAR(60)             DEFAULT NULL,
+  category     VARCHAR(40)             DEFAULT NULL,
   http_status  SMALLINT UNSIGNED NOT NULL,
   -- Which dependency was blamed: DATABASE, RAZORPAY, PUSH, STORAGE, GEOCODING,
   -- EMAIL, AI or NULL for a fault of our own.
@@ -1521,6 +1527,9 @@ CREATE TABLE IF NOT EXISTS error_logs (
   KEY idx_error_dependency_time (dependency, created_at),
   KEY idx_error_time (created_at),
   KEY idx_error_endpoint (endpoint, created_at),
+  -- §30's grouping read: "how many DB_CONNECTION_FAILED in the last 30 min".
+  KEY idx_error_code_time (error_code, created_at),
+  KEY idx_error_category_time (category, created_at),
   CONSTRAINT fk_error_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE SET NULL,
   CONSTRAINT fk_error_shop FOREIGN KEY (shop_id) REFERENCES shops (id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

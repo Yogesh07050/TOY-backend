@@ -37,12 +37,55 @@ const authLimiter = rateLimit({
   message: message('Too many authentication attempts. Try again in 15 minutes.'),
 });
 
+/**
+ * Refresh-token exchange (§9, §51).
+ *
+ * Separate from `authLimiter` because the two protect different things and a
+ * shared counter would make each one weaker: a burst of failed logins must not
+ * cost a legitimate user the refresh their app is about to need, and vice
+ * versa.
+ *
+ * `skipSuccessfulRequests` is what makes the limit safe to set this low. A
+ * working client refreshes once per access-token lifetime, and those calls
+ * succeed and are never counted. What is counted is failures - a token that is
+ * expired, revoked, replayed or guessed - and a client producing thirty of
+ * those in fifteen minutes is not a client that is going to recover by trying
+ * again. Keyed by IP: the caller has no valid session yet, so there is no user
+ * to key by.
+ */
+const refreshLimiter = rateLimit({
+  ...base,
+  windowMs: 15 * 60 * 1000,
+  limit: 30,
+  skipSuccessfulRequests: true,
+  message: message('Too many refresh attempts. Please sign in again.'),
+});
+
 /** Limiter for endpoints that trigger outbound email. */
 const emailLimiter = rateLimit({
   ...base,
   windowMs: 60 * 60 * 1000,
   limit: 5,
   message: message('Too many email requests. Try again in an hour.'),
+});
+
+/**
+ * Search and the discovery rails (§9 moderate limits, §56).
+ *
+ * A search is the most expensive read the public API serves - four LIKE-driven
+ * listings across offers, services, shops and categories, each with distance
+ * maths and a count - and it is reachable without a login, so §57 counts it
+ * among the operations that need their own ceiling rather than the general
+ * one. Set high enough that typing in a search box (which the client debounces)
+ * never reaches it, and low enough that scraping the catalogue through it is
+ * not practical.
+ */
+const searchLimiter = rateLimit({
+  ...base,
+  windowMs: 60 * 1000,
+  limit: 60,
+  keyGenerator: (req) => (req.user?.id ? `user:${req.user.id}` : req.ip),
+  message: message('Too many searches. Please wait a moment and try again.'),
 });
 
 /** Limiter for uploads. */
@@ -89,4 +132,4 @@ const claimVerifyLimiter = rateLimit({
   message: message('Too many unsuccessful attempts. Please try again later.'),
 });
 
-module.exports = { apiLimiter, authLimiter, emailLimiter, uploadLimiter, aiLimiter, claimVerifyLimiter };
+module.exports = { apiLimiter, authLimiter, refreshLimiter, emailLimiter, searchLimiter, uploadLimiter, aiLimiter, claimVerifyLimiter };

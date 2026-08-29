@@ -2,6 +2,7 @@
 
 const { query, queryOne, execute, rawQuery } = require('../db/pool');
 const env = require('../config/env');
+const logger = require('../utils/logger');
 const mailer = require('../utils/mailer');
 const geo = require('../utils/geo');
 const push = require('./push');
@@ -167,7 +168,20 @@ async function dispatch(recipients, { type, title, message, entityType, entityId
   // offer publish for the caller upstream.
   const pushable = allowed.filter((recipient) => byUser.get(recipient.id)?.push_enabled !== 0);
   await fanOutPush(result, allowed.length, pushable, { type, title, message, deepLink: destination, entityType, entityId })
-    .catch((error) => console.error('[push] fan-out failed for %s: %s', type, error.message));
+    .catch((error) =>
+      logger.error(
+        {
+          event: 'NOTIFICATION_SEND_FAILED',
+          error_code: 'NOTIFICATION_SEND_FAILED',
+          category: 'NOTIFICATION',
+          dependency: 'PUSH',
+          notification: type,
+          recipients: pushable.length,
+          err_message: error.message,
+        },
+        'Push fan-out failed',
+      ),
+    );
 
   return allowed.length;
 }
@@ -921,7 +935,12 @@ async function pruneOld() {
     execute('DELETE FROM notifications WHERE is_read = 1 AND created_at < DATE_SUB(NOW(), INTERVAL 60 DAY)'),
     execute('DELETE FROM push_tickets WHERE sent_at < DATE_SUB(NOW(), INTERVAL 30 DAY)'),
   ]);
-  if (tickets.affectedRows) console.log('[notifications] pruned %d push tickets', tickets.affectedRows);
+  if (tickets.affectedRows) {
+    logger.debug(
+      { event: 'PUSH_TICKETS_PRUNED', records_processed: tickets.affectedRows },
+      `Pruned ${tickets.affectedRows} push tickets`,
+    );
+  }
   return notifications.affectedRows;
 }
 

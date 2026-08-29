@@ -1,6 +1,7 @@
 'use strict';
 
 const env = require('../config/env');
+const logger = require('../utils/logger');
 
 /**
  * Push transport (Push §37).
@@ -106,7 +107,22 @@ async function send(messages) {
     } catch (error) {
       // Network/timeout: the whole batch is unsent. Recorded per message so the
       // ticket rows still line up with the devices they were meant for.
-      console.error('[push] send failed: %s', error.message);
+      // §21: the provider is unreachable, not the message invalid. Logged
+      // once per batch rather than per device - a thousand identical lines is
+      // what §30 exists to prevent.
+      logger.error(
+        {
+          event: 'NOTIFICATION_SEND_FAILED',
+          error_code: 'FIREBASE_UNAVAILABLE',
+          category: 'NOTIFICATION',
+          dependency: 'PUSH',
+          provider: env.push.transport,
+          reason: 'PROVIDER_UNREACHABLE',
+          batch_size: batch.length,
+          err_message: error.message,
+        },
+        'Push batch could not be delivered to the provider',
+      );
       for (let index = 0; index < batch.length; index += 1) {
         results.push({ ok: false, ticketId: null, error: 'TransportUnavailable' });
       }
@@ -145,7 +161,17 @@ async function getReceipts(ticketIds) {
     } catch (error) {
       // Leave this batch unresolved - the sweep will pick it up next run,
       // until the ticket ages past Expo's 24-hour retention.
-      console.error('[push] receipt lookup failed: %s', error.message);
+      logger.warn(
+        {
+          event: 'NOTIFICATION_RECEIPT_LOOKUP_FAILED',
+          error_code: 'FIREBASE_UNAVAILABLE',
+          category: 'NOTIFICATION',
+          dependency: 'PUSH',
+          provider: env.push.transport,
+          err_message: error.message,
+        },
+        'Push receipt lookup failed; will retry next sweep',
+      );
     }
   }
 

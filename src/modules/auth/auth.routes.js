@@ -6,7 +6,7 @@ const schema = require('./auth.schema');
 const validate = require('../../middleware/validate');
 const asyncHandler = require('../../utils/asyncHandler');
 const { authenticate, optionalAuth } = require('../../middleware/auth');
-const { authLimiter, emailLimiter } = require('../../middleware/rateLimit');
+const { authLimiter, refreshLimiter, emailLimiter } = require('../../middleware/rateLimit');
 
 const router = express.Router();
 
@@ -19,7 +19,12 @@ router.post(
 
 router.post('/login', authLimiter, validate({ body: schema.loginSchema }), asyncHandler(controller.login));
 
-router.post('/refresh-token', validate({ body: schema.refreshSchema }), asyncHandler(controller.refresh));
+router.post(
+  '/refresh-token',
+  refreshLimiter,
+  validate({ body: schema.refreshSchema }),
+  asyncHandler(controller.refresh),
+);
 
 router.post('/logout', optionalAuth, asyncHandler(controller.logout));
 

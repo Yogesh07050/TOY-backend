@@ -35,6 +35,40 @@ const env = {
    */
   appScheme: process.env.MOBILE_APP_SCHEME || 'offersapp',
 
+  /**
+   * Structured logging (Logging §6, §7, §11, §34, §40).
+   *
+   * `level` defaults per environment rather than to one value: §7 is explicit
+   * that verbose DEBUG must not be on in production by default, and equally a
+   * developer should not have to opt in to seeing their own debug lines.
+   *
+   * `version` and `deploymentId` are what make "did this start after the last
+   * release?" answerable (§40). They come from the environment because only the
+   * thing that performed the deploy knows them; `version` falls back to
+   * package.json, which is right for a local run and honest in production
+   * (it names the code, just not the build).
+   */
+  logging: {
+    service: process.env.LOG_SERVICE_NAME || 'offers-api',
+    level: process.env.LOG_LEVEL || (isProduction ? 'info' : 'debug'),
+    /** Human-readable output for a terminal; JSON lines everywhere else. */
+    pretty: bool(process.env.LOG_PRETTY, !isProduction),
+    version: process.env.APP_VERSION || require('../../package.json').version,
+    deploymentId: process.env.DEPLOYMENT_ID || null,
+    /**
+     * Request duration bands (§11). A slow request is not an error - it is
+     * logged at WARN so it shows up in a performance review without paging
+     * anyone, and the thresholds are configurable because the right numbers
+     * depend on hardware we do not control.
+     */
+    slowRequestMs: int(process.env.LOG_SLOW_REQUEST_MS, 500),
+    verySlowRequestMs: int(process.env.LOG_VERY_SLOW_REQUEST_MS, 2000),
+    /** The same idea one layer down, for individual queries (§13). */
+    slowQueryMs: int(process.env.LOG_SLOW_QUERY_MS, 1000),
+    /** §35. Application failure rows are pruned past this age. */
+    retentionDays: int(process.env.LOG_RETENTION_DAYS, 90),
+  },
+
   db: {
     host: process.env.DB_HOST || '127.0.0.1',
     port: int(process.env.DB_PORT, 3306),

@@ -9,6 +9,8 @@ const mailer = require('../../utils/mailer');
 const access = require('../../services/accessControl');
 const analyticsEvents = require('../../services/analyticsEvents');
 const deviceInfo = require('../../utils/device');
+const logger = require('../../utils/logger');
+const requestContext = require('../../utils/requestContext');
 
 const VERIFY_TTL_MS = 24 * 60 * 60 * 1000;
 const RESET_TTL_MS = 60 * 60 * 1000;
@@ -232,7 +234,34 @@ async function refresh(refreshToken, req) {
     // token was valid when it was retired, so it is the only one that points
     // at a leak rather than an ordinary logout.
     if (stored.revoked_reason === 'rotated') {
-      await revokeFamily(stored.family_id, 'reuse_detected');
+      const revoked = await revokeFamily(stored.family_id, 'reuse_detected');
+      /**
+       * §18's "suspicious authentication activity", and the clearest such
+       * signal this system produces.
+       *
+       * A refresh token that was already rotated away has been presented by
+       * someone - and the legitimate client would be holding the newest one.
+       * That means a copy leaked. It is logged at ERROR, above every other
+       * authentication event, because unlike an expired session or a wrong
+       * password this is never routine and always warrants a look.
+       *
+       * The token is not logged, in any form (§18, §37). The family id is what
+       * identifies the session, and it is ours rather than a credential.
+       */
+      logger.error(
+        {
+          event: 'REFRESH_TOKEN_REUSE_DETECTED',
+          error_code: 'AUTH_REFRESH_FAILED',
+          category: 'AUTHENTICATION',
+          request_id: requestContext.currentId(),
+          user_id: String(stored.user_id),
+          family_id: stored.family_id,
+          sessions_revoked: revoked,
+          ip_address: deviceInfo.describe(req).ipAddress,
+          result: 'SESSION_FAMILY_REVOKED',
+        },
+        'Refresh token reuse detected; the whole session family was revoked',
+      );
     }
     throw ApiError.unauthorized('Refresh token is no longer valid');
   }

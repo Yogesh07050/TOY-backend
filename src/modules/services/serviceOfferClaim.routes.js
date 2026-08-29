@@ -6,6 +6,7 @@ const { queryOne, execute, rawQuery } = require('../../db/pool');
 const ApiError = require('../../utils/ApiError');
 const validate = require('../../middleware/validate');
 const asyncHandler = require('../../utils/asyncHandler');
+const logger = require('../../utils/logger');
 const { authenticate } = require('../../middleware/auth');
 const analyticsEvents = require('../../services/analyticsEvents');
 const notifications = require('../../services/notifications');
@@ -124,7 +125,17 @@ router.post(
       notifications
         .notifyServiceOfferClaimed(claimId)
         .catch((error) =>
-          console.error('[notifications] service claim confirmation failed: %s', error.message),
+          logger.error(
+        {
+          event: 'NOTIFICATION_SEND_FAILED',
+          error_code: 'NOTIFICATION_SEND_FAILED',
+          category: 'NOTIFICATION',
+          dependency: 'PUSH',
+          notification: 'SERVICE_CLAIM_CONFIRMED',
+          err_message: error.message,
+        },
+        'Notification fan-out failed',
+      ),
         );
     }
 

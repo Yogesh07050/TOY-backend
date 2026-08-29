@@ -142,6 +142,16 @@ function allowanceText(limitKey, limit) {
   return `${limit} ${label.many}`;
 }
 
+/** The refusal for a limit that has already been reached. */
+function limitRefusal(limitKey, limit, current, resolved) {
+  const required = plans.minimumPlanForLimit(limitKey, current + 1);
+  return upgradeRequired(
+    `Your ${resolved.plan.name} plan includes ${allowanceText(limitKey, limit)}. Upgrade to ${required.name} for more.`,
+    required,
+    { limit, used: current, limitKey, currentPlan: resolved.planKey },
+  );
+}
+
 /**
  * Throws when adding one more of `limitKey` would exceed the effective limit.
  * `current` is the count as it stands; the check is for `current + 1`.
@@ -150,19 +160,43 @@ async function assertWithinLimit(shopId, limitKey, current) {
   const resolved = await resolve(shopId);
   const limit = resolved.limits[limitKey];
   if (limit === null || current < limit) return;
-
-  const required = plans.minimumPlanForLimit(limitKey, current + 1);
-  throw upgradeRequired(
-    `Your ${resolved.plan.name} plan includes ${allowanceText(limitKey, limit)}. Upgrade to ${required.name} for more.`,
-    required,
-    { limit, used: current, limitKey, currentPlan: resolved.planKey },
-  );
+  throw limitRefusal(limitKey, limit, current, resolved);
 }
 
 /** Reads the live usage, then checks a limit against it. */
 async function assertUsageWithinLimit(shopId, limitKey, usageKey) {
   const usage = await subscriptions.usageForShop(shopId);
   await assertWithinLimit(shopId, limitKey, usage[usageKey]);
+}
+
+/**
+ * The authoritative half of a monthly usage check (§24).
+ *
+ * `assertUsageWithinLimit` counts before the write it guards and on a different
+ * connection, so two creates posted at the same moment both read "0 used" and
+ * both go through - which is exactly the bypass §24 names. This re-counts on
+ * the transaction's own connection, behind `SELECT ... FOR UPDATE` on the shop
+ * row: the second request blocks until the first commits or rolls back, and
+ * then counts a row that actually exists.
+ *
+ * `resolved` is supplied by the caller and must have been resolved *before* the
+ * transaction opened. Resolving it here would ask the pool for a second
+ * connection while this one is held, and with enough concurrent creates every
+ * pooled connection ends up inside a transaction waiting for a connection that
+ * will never come free.
+ */
+async function assertUsageWithinLimitLocked(connection, shopId, limitKey, usageKey, resolved) {
+  const limit = resolved.limits[limitKey];
+  if (limit === null) return;
+
+  // The lock is on the shop, not the offers: there is no row to lock for an
+  // offer that does not exist yet, so the shop is what serialises its creates.
+  // Held until commit, and only ever contended by that one shop's own writes.
+  await connection.execute('SELECT id FROM shops WHERE id = ? FOR UPDATE', [shopId]);
+
+  const current = await subscriptions.countMonthlyUsage(connection, shopId, usageKey);
+  if (current < limit) return;
+  throw limitRefusal(limitKey, limit, current, resolved);
 }
 
 /** Shop ids among `shopIds` entitled to `feature`, by plan or by override. */
@@ -189,6 +223,7 @@ module.exports = {
   hasFeature,
   assertWithinLimit,
   assertUsageWithinLimit,
+  assertUsageWithinLimitLocked,
   allowanceText,
   filterShopsWithFeature,
 };

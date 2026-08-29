@@ -2,6 +2,7 @@
 
 const { query, queryOne, execute, rawQuery } = require('../../db/pool');
 const ApiError = require('../../utils/ApiError');
+const logger = require('../../utils/logger');
 const catalogue = require('../../config/featureCatalogue');
 const plans = require('../../config/plans');
 const notifications = require('../../services/notifications');
@@ -319,7 +320,17 @@ async function notifyShop(shopId, featureKey, override, action) {
           ).toDateString()}.`,
     });
   } catch (error) {
-    console.error('[overrides] notification failed for shop %d: %s', shopId, error.message);
+    logger.error(
+        {
+          event: 'NOTIFICATION_SEND_FAILED',
+          error_code: 'NOTIFICATION_SEND_FAILED',
+          category: 'NOTIFICATION',
+          dependency: 'PUSH',
+          notification: 'FEATURE_OVERRIDE',
+          err_message: error.message,
+        },
+        'Notification fan-out failed',
+      );
   }
 }
 
