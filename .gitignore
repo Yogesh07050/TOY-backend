@@ -2,6 +2,8 @@ node_modules/
 .env
 .env.*
 !.env.example
+# Per-environment templates are committed; the real files they describe are not.
+!.env.*.example
 /uploads/
 *.log
 .DS_Store
