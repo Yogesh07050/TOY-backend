@@ -1,7 +1,8 @@
 """Runtime configuration for the AI service.
 
-Environment is read from every ``.env`` between the repository root and this
-service, loaded outermost first so the closest file wins:
+Outside production, environment is read from every ``.env`` between the
+repository root and this service, loaded outermost first so the closest file
+wins:
 
     OTY/.env  ->  TOY-backend/.env  ->  TOY-backend/TOY-ai-backend/.env  ->  real env
 
@@ -14,6 +15,14 @@ wherever it is nested. Two things fall out of it for free:
     this directory is expected to hold it.
   * ``AI_SERVICE_TOKEN`` set in ``TOY-backend/.env`` is picked up here too, so
     the shared secret cannot drift between the API and this service.
+
+**Production does not walk.** Convenient inheritance in development is
+environment bleed in production: a service started with ``AI_ENV=production``
+on a machine that happens to have a developer's ``TOY-backend/.env`` above it
+would silently adopt their shared secret and their CORS origins. So production
+reads ``.env.production`` in this directory and nothing else - and is expected
+to have no file at all, with configuration injected as real environment
+variables from a secrets manager.
 """
 
 from __future__ import annotations
@@ -29,9 +38,20 @@ SERVICE_DIR = Path(__file__).resolve().parent.parent
 #: How far up to look for enclosing .env files.
 _MAX_DEPTH = 4
 
+#: Read from the real process environment, before any file is loaded - which is
+#: the only way it can decide *which* files to load. A value set inside a .env
+#: cannot be trusted to answer "am I production?", because that is the question
+#: being asked in order to choose the file.
+ENV_NAME = (os.getenv("AI_ENV") or "development").strip().lower()
+IS_PRODUCTION = ENV_NAME == "production"
+
 
 def _env_files() -> list[Path]:
-    """Enclosing .env paths, outermost first."""
+    """Env file paths to load, outermost first."""
+    if IS_PRODUCTION:
+        # This service's own production file, and never an enclosing one.
+        return [SERVICE_DIR / ".env.production"]
+
     candidates: list[Path] = []
     directory = SERVICE_DIR
     for _ in range(_MAX_DEPTH):
@@ -135,3 +155,62 @@ class Settings:
 
 
 settings = Settings()
+
+
+def _assert_production_config(config: Settings) -> None:
+    """Refuse to start production with development configuration.
+
+    The mirror of the Node API's own startup guard, and here for the same
+    reason: this service holds the provider API keys, so a production process
+    that quietly came up with a developer's shared secret is both an open
+    endpoint and a billable one.
+
+    Every problem is collected rather than raised one at a time - an operator
+    fixing a deployment should learn about all of them in a single attempt.
+    """
+    if not IS_PRODUCTION:
+        return
+
+    problems: list[str] = []
+
+    if config.service_token == "change-me-ai-service-token":
+        problems.append(
+            "AI_SERVICE_TOKEN is still the shipped placeholder. The Node API "
+            "presents this as x-ai-service-token; a known value makes the "
+            "service callable by anyone who can reach it."
+        )
+    elif not config.service_token:
+        problems.append(
+            "AI_SERVICE_TOKEN is empty, so every request is accepted without "
+            "authentication."
+        )
+
+    if not config.is_configured:
+        problems.append(
+            f"No API key for the selected provider ({config.provider_name}). "
+            "Every generation request would fail."
+        )
+
+    # The only caller is the Node API over a private network. A wildcard, or a
+    # localhost origin left over from development, is not a production value.
+    if "*" in config.cors_origins:
+        problems.append("AI_CORS_ORIGINS contains '*'. Name the API origin explicitly.")
+    localhost = [o for o in config.cors_origins if "localhost" in o or "127.0.0.1" in o]
+    if localhost:
+        problems.append(
+            f"AI_CORS_ORIGINS still contains development origins: {', '.join(localhost)}"
+        )
+
+    if not problems:
+        return
+
+    raise RuntimeError(
+        "\n".join(
+            ["", "AI SERVICE STARTUP FAILED", "", "Production configuration is invalid:", ""]
+            + [f"  - {problem}" for problem in problems]
+            + ["", "Refusing to start.", ""]
+        )
+    )
+
+
+_assert_production_config(settings)

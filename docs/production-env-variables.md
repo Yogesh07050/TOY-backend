@@ -12,6 +12,18 @@ a ticket, or a chat message.
 Production reads `.env.production` and never the generic `.env`. A production
 process cannot inherit a developer's database or their test payment keys.
 
+## Deployment shape
+
+One origin, `https://offersoffer.in`. Nginx serves the Angular build and
+forwards `/api` and `/uploads` to this process — the same arrangement
+`proxy.conf.json` creates in development, so production is not a different
+shape from the one the app is developed against.
+
+That choice is why several values below are what they are: the web app needs no
+absolute API URL, the refresh cookie is `SameSite=lax` rather than a cross-site
+`none`, and CORS only ever has to answer the mobile app (which sends no `Origin`
+header) rather than the browser.
+
 **Legend** — **Required**: startup fails or the feature is broken without it.
 **Recommended**: has a default, but the default is wrong for production.
 **Optional**: the default is fine; set it only to tune.
@@ -46,9 +58,9 @@ The startup guard also rejects a `DB_NAME` containing `dev`, `staging`, `test`,
 |---|---|---|---|
 | `PORT` | Recommended | `3000` | |
 | `API_PREFIX` | Optional | `/api` | Changing it breaks published client URLs. |
-| `CORS_ORIGINS` | **Required** | `http://localhost:4200` | Comma-separated production web origins. The localhost default allows nothing useful in production. |
-| `PUBLIC_API_URL` | **Required** | `http://localhost:3000` | Public HTTPS base. Uploaded-image URLs are built from it, so a wrong value produces broken images. |
-| `APP_URL` | **Required** | `http://localhost:4200` | Public web app base. Email verification and password-reset links are built from it — wrong here means every reset link points at localhost. |
+| `CORS_ORIGINS` | **Required** | `http://localhost:4200` | `https://offersoffer.in,https://www.offersoffer.in`. The localhost default allows nothing useful in production. |
+| `PUBLIC_API_URL` | **Required** | `http://localhost:3000` | `https://offersoffer.in`. Uploaded-image URLs are built from it, so a wrong value produces images that 404 for every customer. |
+| `APP_URL` | **Required** | `http://localhost:4200` | `https://offersoffer.in`. Email verification and password-reset links are built from it — wrong here means every reset link points at localhost. |
 | `MOBILE_APP_SCHEME` | Recommended | `offersapp` | Must match `expo.scheme` in the mobile app, or notification deep links open nothing. |
 
 ## 3. Authentication
@@ -67,11 +79,18 @@ The startup guard also rejects a `DB_NAME` containing `dev`, `staging`, `test`,
 Defaults are already correct for the common production shape (API and web app
 on different domains). Only change them if that is not your shape.
 
+The deployment is same-origin — nginx serves the web app and forwards `/api`
+to this process — so the refresh cookie is not a cross-site cookie and should
+not be configured as one.
+
 | Variable | Status | Prod default | Notes |
 |---|---|---|---|
-| `REFRESH_COOKIE_SAMESITE` | Optional | `none` | `none` for a separate API domain; `lax` if same-site. |
-| `REFRESH_COOKIE_SECURE` | Optional | `true` | Never `false` in production. `SameSite=none` requires it. |
+| `REFRESH_COOKIE_SAMESITE` | **Recommended** | `none` | Set to `lax`. The default suits a separate API domain; on one origin `lax` is stronger — the browser will not attach the cookie to a request another site initiated at all. |
+| `REFRESH_COOKIE_SECURE` | Optional | `true` | Never `false` in production. |
 | `REFRESH_COOKIE_DOMAIN` | Optional | empty | Set only to share the cookie across subdomains. |
+
+If the API ever moves to `api.offersoffer.in`, both must change together:
+`SameSite=none` requires `Secure`, or browsers drop the cookie silently.
 
 ## 4. Seed data
 
