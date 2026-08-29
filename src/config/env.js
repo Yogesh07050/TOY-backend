@@ -3,7 +3,32 @@
 const path = require('node:path');
 const dotenv = require('dotenv');
 
-dotenv.config({ path: path.resolve(__dirname, '../../.env') });
+/**
+ * Environment file loading (Database §5, §13).
+ *
+ * §5 asks for `.env.development` / `.env.staging` / `.env.production`, and §13
+ * closes with the reason: "Never allow a production application to accidentally
+ * load development credentials." Loading a single `.env` does exactly that -
+ * start the app with NODE_ENV=production on a machine that has a developer's
+ * `.env` and it connects, confidently, to their laptop's database with their
+ * test Razorpay keys.
+ *
+ * So the environment-specific file is loaded first and wins (dotenv never
+ * overwrites a variable that is already set), and the generic `.env` is loaded
+ * afterwards as a fallback for *non-production* environments only.
+ *
+ * Production is deliberately left able to run with no file at all. Injecting
+ * configuration as real environment variables - from a secrets manager, a
+ * systemd unit, a container runtime - is the better practice §12 points at, and
+ * requiring a file on disk would push deployments away from it.
+ */
+const NODE_ENV = process.env.NODE_ENV || 'development';
+const envFile = (name) => path.resolve(__dirname, '../../', name);
+
+dotenv.config({ path: envFile(`.env.${NODE_ENV}`) });
+if (NODE_ENV !== 'production') {
+  dotenv.config({ path: envFile('.env') });
+}
 
 const bool = (value, fallback = false) => {
   if (value === undefined || value === '') return fallback;
@@ -18,10 +43,13 @@ const int = (value, fallback) => {
 const list = (value, fallback = []) =>
   value ? String(value).split(',').map((v) => v.trim()).filter(Boolean) : fallback;
 
-const isProduction = (process.env.NODE_ENV || 'development') === 'production';
+const isProduction = NODE_ENV === 'production';
+
+const DEFAULT_SEED_EMAIL = 'superadmin@offers.app';
+const DEFAULT_SEED_PASSWORD = 'SuperAdmin@123';
 
 const env = {
-  nodeEnv: process.env.NODE_ENV || 'development',
+  nodeEnv: NODE_ENV,
   isProduction,
   port: int(process.env.PORT, 3000),
   apiPrefix: process.env.API_PREFIX || '/api',
@@ -240,12 +268,31 @@ const env = {
     invoicePrefix: process.env.BILLING_INVOICE_PREFIX || 'INV',
   },
 
+  /**
+   * `DEFAULT_SEED_*` are exported alongside the resolved values so the seed
+   * script can refuse *these particular strings* in production, rather than
+   * only checking that the variables are set. A dev `.env` sets them both, so
+   * a presence check passes while still installing the credentials that are
+   * printed in the README (§6, §29).
+   */
   seed: {
-    superAdminEmail: process.env.SEED_SUPERADMIN_EMAIL || 'superadmin@offers.app',
-    superAdminPassword: process.env.SEED_SUPERADMIN_PASSWORD || 'SuperAdmin@123',
+    superAdminEmail: process.env.SEED_SUPERADMIN_EMAIL || DEFAULT_SEED_EMAIL,
+    superAdminPassword: process.env.SEED_SUPERADMIN_PASSWORD || DEFAULT_SEED_PASSWORD,
     demoData: bool(process.env.SEED_DEMO_DATA, true),
+    defaults: { email: DEFAULT_SEED_EMAIL, password: DEFAULT_SEED_PASSWORD },
   },
 };
+
+/**
+ * Production database separation (Database §14, §15).
+ *
+ * Placed in `env.js` rather than in `server.js` on purpose: `migrate.js` and
+ * `seed.js` load this module too, so the same guard covers the two commands
+ * most capable of doing irreversible damage to the wrong database. A migration
+ * run against staging while `NODE_ENV=production` is exactly the mix-up §15
+ * exists to prevent.
+ */
+require('./productionGuard').assertProductionConfig(env);
 
 // Refuse to boot production with the shipped placeholder secrets.
 if (env.isProduction) {

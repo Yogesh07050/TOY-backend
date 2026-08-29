@@ -168,6 +168,53 @@ async function ensureUser({ name, email, plainPassword, roles = [], verified = t
   return user;
 }
 
+/**
+ * The first Super Admin.
+ *
+ * This one account is genuinely "required system seed data" (Database §6, §29)
+ * rather than a developer account: there is no way to create the first
+ * administrator through the application, so without it a fresh production
+ * database cannot be administered at all.
+ *
+ * The default credentials are another matter. `SEED_SUPERADMIN_PASSWORD`
+ * falls back to a value that is printed in the README, committed in
+ * `.env.example` and identical on every install - fine for a laptop, and an
+ * open door on a public production database. Seeding is refused rather than
+ * warned about, because a warning scrolls past and the account stays.
+ */
+/**
+ * Refuses a production seed that would create a well-known administrator.
+ *
+ * Checked before the first statement rather than at the point of use: a seed
+ * that aborts halfway leaves a production database with permissions and roles
+ * but no administrator, which is a worse state to be in than not having
+ * started. Nothing here touches the database, so it costs nothing to run first.
+ */
+function assertProductionSeedIsSafe() {
+  if (!env.isProduction) return;
+
+  // Compared against the shipped values, not merely checked for presence: a
+  // developer's `.env` sets both, so "is it set?" passes while still seeding
+  // the credentials printed in the README.
+  const problems = [];
+  if (env.seed.superAdminPassword === env.seed.defaults.password) {
+    problems.push('SEED_SUPERADMIN_PASSWORD is still the shipped default, which is public');
+  }
+  if (env.seed.superAdminEmail === env.seed.defaults.email) {
+    problems.push('SEED_SUPERADMIN_EMAIL is still the shipped default');
+  }
+  if (env.seed.demoData) {
+    problems.push('SEED_DEMO_DATA is enabled, which would write demo shops and offers (§6, §29)');
+  }
+  if (!problems.length) return;
+
+  throw new Error(
+    `Refusing to seed a production database:\n  - ${problems.join('\n  - ')}\n` +
+      'Set them explicitly. Generate a password with:\n' +
+      '  node -e "console.log(require(\'crypto\').randomBytes(18).toString(\'base64url\'))"',
+  );
+}
+
 async function seedSuperAdmin() {
   const user = await ensureUser({
     name: 'Super Admin',
@@ -717,6 +764,7 @@ async function seedCampaign() {
 }
 
 async function main() {
+  assertProductionSeedIsSafe();
   console.log('Seeding %s ...', env.db.database);
   await seedPermissions();
   await seedRoles();
@@ -732,8 +780,12 @@ async function main() {
   }
 
   // ---- V3 ----
-  await seedSubscriptions();
+  // Gated with the rest of the demo data: it attaches plans to the demo shops
+  // by slug, so without them it writes nothing - but it still announced
+  // "subscriptions: Zara=PREMIUM, ...", which reads like real seeded state on
+  // the one run where you are checking exactly that (§41).
   if (env.seed.demoData) {
+    await seedSubscriptions();
     await seedAnalyticsHistory();
     await seedCampaign();
   }
