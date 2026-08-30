@@ -9,7 +9,7 @@ wins:
 Walking up rather than hardcoding a depth means the service keeps working
 wherever it is nested. Two things fall out of it for free:
 
-  * ``GEMINI_API_KEY`` is read from this service's own ``.env``. Provider keys
+  * ``GROQ_API_KEY`` is read from this service's own ``.env``. Provider keys
     live here and nowhere else, because this is the only process that calls a
     provider. An enclosing ``.env`` may still supply it, but nothing outside
     this directory is expected to hold it.
@@ -112,12 +112,28 @@ class Settings:
     )
     service_token: str = field(default_factory=lambda: _str("AI_SERVICE_TOKEN"))
 
-    #: The switch TOY.md asks for. True -> Gemini, False -> OpenAI.
-    use_gemini: bool = field(default_factory=lambda: _bool("USE_GEMINI", True))
+    #: The switch TOY.md asks for. True -> Groq, False -> OpenAI.
+    use_groq: bool = field(default_factory=lambda: _bool("USE_GROQ", True))
+
+    #: Escape hatch: name a provider outright and the boolean is ignored. This
+    #: is the only way to select Gemini, which is no longer on the switch.
+    provider_override: str = field(default_factory=lambda: _str("AI_PROVIDER"))
+
+    groq_api_key: str = field(default_factory=lambda: _str("GROQ_API_KEY"))
+    # Free-tier friendly and honours JSON response_format, which §28 relies on.
+    # Groq retires models fairly often, so confirm a name against
+    # GET /openai/v1/models before pinning it here.
+    groq_model: str = field(default_factory=lambda: _str("GROQ_MODEL", "openai/gpt-oss-120b"))
+    groq_base_url: str = field(
+        default_factory=lambda: _str("GROQ_BASE_URL", "https://api.groq.com").rstrip("/")
+    )
+    #: "low" | "medium" | "high", or empty for a model that is not a reasoner.
+    groq_reasoning_effort: str = field(
+        default_factory=lambda: _str("GROQ_REASONING_EFFORT", "low")
+    )
 
     gemini_api_key: str = field(default_factory=lambda: _str("GEMINI_API_KEY"))
-    # The "-latest" aliases keep working when a dated model is retired, and the
-    # flash-lite tier is the small, free-tier-friendly one TOY.md asks for.
+    # The "-latest" aliases keep working when a dated model is retired.
     gemini_model: str = field(
         default_factory=lambda: _str("GEMINI_MODEL", "gemini-flash-lite-latest")
     )
@@ -142,16 +158,39 @@ class Settings:
 
     @property
     def provider_name(self) -> str:
-        return "gemini" if self.use_gemini else "openai"
+        if self.provider_override:
+            return self.provider_override.lower()
+        return "groq" if self.use_groq else "openai"
+
+    @property
+    def provider_keys(self) -> dict[str, str]:
+        return {
+            "groq": self.groq_api_key,
+            "openai": self.openai_api_key,
+            "gemini": self.gemini_api_key,
+        }
+
+    @property
+    def provider_models(self) -> dict[str, str]:
+        return {
+            "groq": self.groq_model,
+            "openai": self.openai_model,
+            "gemini": self.gemini_model,
+        }
+
+    @property
+    def api_key_env_var(self) -> str:
+        """The variable to name when the selected provider has no key."""
+        return f"{self.provider_name.upper()}_API_KEY"
 
     @property
     def active_model(self) -> str:
-        return self.gemini_model if self.use_gemini else self.openai_model
+        return self.provider_models.get(self.provider_name, "unknown")
 
     @property
     def is_configured(self) -> bool:
         """Whether the *selected* provider has a usable key."""
-        return bool(self.gemini_api_key if self.use_gemini else self.openai_api_key)
+        return bool(self.provider_keys.get(self.provider_name))
 
 
 settings = Settings()

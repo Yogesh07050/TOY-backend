@@ -472,7 +472,7 @@ ones that would otherwise be untrue: zero amount, `payment_status` of
 `not_required`, and a history row naming the Super Admin and their reason.
 
 **The AI itself lives in `TOY-ai-backend/`** (Python / FastAPI, nested inside
-this project), which is the only process holding a Gemini or OpenAI key. This API is what makes it safe to call:
+this project), which is the only process holding a Groq or OpenAI key. This API is what makes it safe to call:
 
 ```
 authorise the shop → check the plan → gather only that shop's data →

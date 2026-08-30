@@ -28,8 +28,9 @@ async def health() -> dict:
         "provider": settings.provider_name,
         "model": settings.active_model,
         "providerConfigured": settings.is_configured,
-        "geminiKeyPresent": bool(settings.gemini_api_key),
-        "openaiKeyPresent": bool(settings.openai_api_key),
+        "keysPresent": {
+            name: bool(key) for name, key in settings.provider_keys.items()
+        },
     }
 
 
@@ -46,7 +47,10 @@ async def ping_provider(
             user="Respond now.",
             provider=engine,
             temperature=0,
-            max_output_tokens=32,
+            # Not 32: a reasoning model spends this budget thinking before it
+            # writes anything, and a truncated object fails the provider's own
+            # JSON check - which would read here as a broken key.
+            max_output_tokens=256,
         )
     except AIProviderError as error:
         return {

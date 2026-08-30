@@ -9,7 +9,7 @@ const ApiError = require('../utils/ApiError');
  * The only way this API talks to the Python AI service (§29).
  *
  * Provider keys live in that service, so nothing here knows or cares whether
- * the answer came from Gemini or OpenAI. Failures are translated into the
+ * the answer came from Groq or OpenAI. Failures are translated into the
  * merchant-facing wording from §36/§37 - the underlying provider message is
  * logged, never returned.
  */
