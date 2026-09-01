@@ -56,6 +56,10 @@ router.use('/ai', require('./modules/ai/ai.routes'));
 // router requires Super Admin on every route it owns.
 router.use('/business', require('./modules/business/business.routes'));
 
+// Support tickets, About/Privacy contact details, and content reports. Not
+// versioned with a release: it is the desk the whole platform points at.
+router.use('/support', require('./modules/support/support.routes'));
+
 // ---- V4: Services ----
 router.use('/services', require('./modules/services/service.routes'));
 router.use('/service-offer-claims', require('./modules/services/serviceOfferClaim.routes'));

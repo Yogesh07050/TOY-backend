@@ -132,4 +132,20 @@ const claimVerifyLimiter = rateLimit({
   message: message('Too many unsuccessful attempts. Please try again later.'),
 });
 
-module.exports = { apiLimiter, authLimiter, refreshLimiter, emailLimiter, searchLimiter, uploadLimiter, aiLimiter, claimVerifyLimiter };
+/**
+ * Raising a support request.
+ *
+ * The endpoint is open to guests and sends mail, so it has the two properties
+ * that make an endpoint worth flooding. Keyed by user where there is one and by
+ * IP otherwise, and set at a number a frustrated person filing the same problem
+ * three times will never reach - the limit is for a script, not for them.
+ */
+const supportLimiter = rateLimit({
+  ...base,
+  windowMs: 60 * 60 * 1000,
+  limit: 10,
+  keyGenerator: (req) => (req.user?.id ? `user:${req.user.id}` : req.ip),
+  message: message('You have raised several requests recently. Please wait a little before sending another.'),
+});
+
+module.exports = { apiLimiter, authLimiter, refreshLimiter, emailLimiter, searchLimiter, uploadLimiter, aiLimiter, claimVerifyLimiter, supportLimiter };

@@ -23,6 +23,10 @@ const FOLDERS = {
   banners: { folder: 'banners', variant: 'banner' },
   avatars: { folder: 'avatars', variant: 'avatar' },
   services: { folder: 'services', variant: 'offer' },
+  // Screenshots attached to a support request. `offer` dimensions because a
+  // screenshot is landscape and the point of it is that the text is readable -
+  // shrinking it to a logo would throw away the only thing it contains.
+  support: { folder: 'support', variant: 'offer' },
 };
 
 const typeParam = z.object({ type: z.enum(Object.keys(FOLDERS)) });
@@ -37,9 +41,10 @@ router.post(
   '/:type',
   validate({ params: typeParam }),
   (req, _res, next) => {
-    // Anyone signed in may replace their own avatar; the other buckets require
-    // one of the permissions that lets a user author the content they belong to.
-    if (req.params.type === 'avatars') return next();
+    // Anyone signed in may replace their own avatar or attach a screenshot to
+    // their own support request; the other buckets require one of the
+    // permissions that lets a user author the content they belong to.
+    if (req.params.type === 'avatars' || req.params.type === 'support') return next();
     const allowed = [
       'CREATE_OFFER',
       'EDIT_OFFER',

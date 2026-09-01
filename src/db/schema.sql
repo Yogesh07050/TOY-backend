@@ -1570,3 +1570,93 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
   UNIQUE KEY uq_idempotency (idempotency_key, user_id),
   KEY idx_idempotency_created (created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------
+-- Support tickets.
+--
+-- The Support page is a form rather than a phone number, so a request has to
+-- land somewhere durable: the customer is shown a reference on submit and
+-- expects to be able to quote it later, and whoever answers needs a queue
+-- rather than an inbox.
+--
+-- `user_id` is nullable because the platform is browsable without an account
+-- (§3) and a guest who cannot get a page to load is exactly the person most
+-- likely to need support. Their name, email and phone are therefore stored on
+-- the ticket itself rather than read from a user row - which is also why a
+-- signed-in user's details are copied in at submit time rather than joined at
+-- read time: what they typed is what the reply should go to, even if they
+-- change their account email afterwards.
+--
+-- `entity_type`/`entity_id` carry "Report an Offer/Shop": the platform lists
+-- merchant-submitted content, so a customer needs a way to report an offer
+-- that is wrong, misleading, expired or fraudulent, and a report is a support
+-- ticket that already knows what it is about.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS support_tickets (
+  id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  -- Human-quotable, and deliberately not the primary key: "SUP-10248" is what
+  -- a customer reads back over the phone. Assigned from the id after insert.
+  reference      VARCHAR(20)             DEFAULT NULL,
+  user_id        BIGINT UNSIGNED         DEFAULT NULL,
+  name           VARCHAR(120)    NOT NULL,
+  email          VARCHAR(190)    NOT NULL,
+  phone          VARCHAR(30)             DEFAULT NULL,
+  -- Who is asking, in their own words. Decides which queue this belongs to and
+  -- how the reply is pitched; it is not an authorization signal.
+  user_type      ENUM('customer','merchant','guest') NOT NULL DEFAULT 'customer',
+  category       VARCHAR(40)     NOT NULL,
+  subject        VARCHAR(200)    NOT NULL,
+  description    TEXT            NOT NULL,
+  attachment_url VARCHAR(500)            DEFAULT NULL,
+  -- What the ticket is about, when it is about something on the platform.
+  entity_type    VARCHAR(40)             DEFAULT NULL,
+  entity_id      BIGINT UNSIGNED         DEFAULT NULL,
+  status         ENUM('open','in_progress','waiting_on_customer','resolved','closed')
+                 NOT NULL DEFAULT 'open',
+  priority       ENUM('low','normal','high') NOT NULL DEFAULT 'normal',
+  assigned_to    BIGINT UNSIGNED         DEFAULT NULL,
+  resolved_at    DATETIME                DEFAULT NULL,
+  created_at     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_support_reference (reference),
+  -- The customer's "my requests" list.
+  KEY idx_support_user (user_id, created_at),
+  -- The support queue, which is read status-first and oldest-first within it.
+  KEY idx_support_status (status, created_at),
+  KEY idx_support_category (category, created_at),
+  KEY idx_support_entity (entity_type, entity_id),
+  -- SET NULL rather than CASCADE: a deleted account must not take the record
+  -- of what it reported with it, and the ticket still has its own contact
+  -- details to answer on.
+  CONSTRAINT fk_support_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE SET NULL,
+  CONSTRAINT fk_support_assignee FOREIGN KEY (assigned_to) REFERENCES users (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------
+-- The conversation on a ticket.
+--
+-- "Response sent" is a step in the support flow, so a reply needs somewhere to
+-- live that the customer can read - a mailbox thread nobody else can see is
+-- how a handover loses the history.
+--
+-- `is_internal` keeps a triage note out of the customer's view. It is enforced
+-- in the service's read path, not here; the column only records the intent.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS support_ticket_messages (
+  id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  ticket_id   BIGINT UNSIGNED NOT NULL,
+  -- NULL for the customer's own opening message when they were a guest.
+  author_id   BIGINT UNSIGNED         DEFAULT NULL,
+  -- Which side of the conversation this is, kept independently of author_id so
+  -- a guest's message is still attributable and a deleted staff account does
+  -- not turn its replies into customer messages.
+  author_role ENUM('customer','support') NOT NULL,
+  body        TEXT            NOT NULL,
+  is_internal TINYINT(1)      NOT NULL DEFAULT 0,
+  created_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_support_msg_ticket (ticket_id, created_at),
+  CONSTRAINT fk_support_msg_ticket FOREIGN KEY (ticket_id) REFERENCES support_tickets (id) ON DELETE CASCADE,
+  CONSTRAINT fk_support_msg_author FOREIGN KEY (author_id) REFERENCES users (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

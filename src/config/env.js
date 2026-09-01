@@ -146,6 +146,25 @@ const env = {
     from: process.env.MAIL_FROM || 'OffersOffer <no-reply@offers.app>',
   },
 
+  /**
+   * Where support requests go, and the numbers the Support and Privacy pages
+   * publish.
+   *
+   * Configurable rather than hardcoded because these are the contact details of
+   * a business, not a property of the software - they change when a support
+   * desk moves, and a redeploy should not be what it takes. `inbox` is where a
+   * new ticket is announced; it defaults to the MAIL_FROM address so a server
+   * with SMTP configured and nothing else set still delivers somewhere real.
+   */
+  support: {
+    inbox: process.env.SUPPORT_INBOX || process.env.SUPPORT_EMAIL || '',
+    email: process.env.SUPPORT_EMAIL || 'offersoffersupport@gmail.com',
+    phones: (process.env.SUPPORT_PHONES || '+91 7540043503,+91 7904795700')
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean),
+  },
+
   storage: {
     driver: process.env.STORAGE_DRIVER || 'local',
     uploadDir: path.resolve(__dirname, '../../', process.env.UPLOAD_DIR || 'uploads'),

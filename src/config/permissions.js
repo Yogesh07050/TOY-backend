@@ -86,6 +86,16 @@ const PERMISSIONS = {
     category: 'AI',
     description: 'Manage subscription plans and AI usage limits',
   },
+
+  // Support. Split in two for the same reason the claim permissions are:
+  // reading a queue of customer problems and *answering* on the platform's
+  // behalf are different amounts of trust, and a ticket carries the reporter's
+  // name, email and phone whether or not they ever had an account.
+  VIEW_SUPPORT_TICKETS: { category: 'Support', description: 'View customer support requests' },
+  MANAGE_SUPPORT_TICKETS: {
+    category: 'Support',
+    description: 'Reply to support requests and change their status',
+  },
 };
 
 const PERMISSION_NAMES = Object.keys(PERMISSIONS);
@@ -195,6 +205,8 @@ const MANAGEMENT_PERMISSIONS = [
   'MODERATE_REVIEWS',
   'VIEW_AUDIT_LOGS',
   'EXPORT_ANALYTICS',
+  'VIEW_SUPPORT_TICKETS',
+  'MANAGE_SUPPORT_TICKETS',
   'VIEW_CLAIMS',
   'VERIFY_CLAIM',
   'REDEEM_OFFER',
