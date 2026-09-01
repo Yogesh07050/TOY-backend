@@ -25,6 +25,29 @@ const pool = mysql.createPool({
 });
 
 /**
+ * Pin every connection's session time zone to UTC.
+ *
+ * `timezone: 'Z'` above is only half a convention: it tells the driver that the
+ * DATETIME values it reads and writes are UTC. It says nothing to MySQL, whose
+ * `NOW()` and `CURRENT_TIMESTAMP` follow the *session* time zone - `SYSTEM` by
+ * default, i.e. whatever the database host is set to. On a host that is not UTC
+ * the two halves disagree, and the damage is not limited to display:
+ *
+ *   - Columns written server-side (`claimed_at = NOW()`, the 88
+ *     `CURRENT_TIMESTAMP` defaults) land in local time, are read back as UTC,
+ *     and show up shifted by the host's offset.
+ *   - Worse, the comparisons shift too. `start_date <= NOW()` compares a UTC
+ *     column against a local clock, so a scheduled offer goes live - and an
+ *     active one expires - by that same offset early.
+ *
+ * Setting it per connection rather than globally keeps the fix with the code
+ * that depends on it, and works on a managed database we do not administer.
+ */
+pool.on('connection', (connection) => {
+  connection.query("SET time_zone = '+00:00'");
+});
+
+/**
  * A sanitized identifier for a statement (§13).
  *
  * §13 asks for a "query name / operation" and a table, and is explicit that the
