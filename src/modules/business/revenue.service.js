@@ -41,6 +41,15 @@ const rupees = (value) => Math.round(num(value));
  * what the price list says. A paid plan with a zero amount is a data problem
  * rather than free revenue, so it falls back to the catalogue and is counted in
  * `unpricedSubscriptions` so the discrepancy is visible instead of silent.
+ *
+ * Comped shops are the one case that must not reach that fallback. A Super
+ * Admin grant is a real Business/Premium subscription that nobody paid for -
+ * during the free launch, every merchant is one - and it is marked
+ * `payment_status = 'not_required'`. Left in, each would have added its full
+ * list price to MRR and counted itself as a paying merchant in ARPM's
+ * denominator, reporting revenue that does not exist. Their entitlements are
+ * unaffected; only the money is. Free-plan rows carry the same payment status
+ * and are already excluded by `plan <> 'FREE'`.
  */
 async function currentBook(filters = {}) {
   const filter = shopFilter(filters, 'sub.shop_id');
@@ -56,7 +65,8 @@ async function currentBook(filters = {}) {
             COALESCE(SUM(sub.price_amount = 0), 0) AS unpriced
        FROM shop_subscriptions sub
        JOIN shops s ON s.id = sub.shop_id AND s.status = 'active'
-      WHERE sub.plan <> 'FREE' AND sub.status IN (${active})${filter.sql}
+      WHERE sub.plan <> 'FREE' AND sub.status IN (${active})
+        AND sub.payment_status <> 'not_required'${filter.sql}
       GROUP BY sub.plan`,
     [...metrics.MRR_AT_RISK_STATUSES, ...metrics.MRR_AT_RISK_STATUSES, ...metrics.MRR_ACTIVE_STATUSES, ...filter.params],
   );

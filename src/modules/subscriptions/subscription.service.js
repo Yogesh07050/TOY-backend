@@ -438,7 +438,12 @@ async function activate(
       WHERE shop_id = ?`,
     [
       targetPlan,
-      target.price,
+      // What was actually charged, not what the plan lists. A Super Admin grant
+      // comes through here with `amount: 0` precisely so the row does not read
+      // as a payment that was never taken; writing `target.price` regardless
+      // put the full list price on a comped shop and billed it to MRR.
+      // A webhook passes no amount and still gets the catalogue price.
+      amount ?? target.price,
       paymentStatus,
       periodStart ?? null,
       periodEnd ?? null,

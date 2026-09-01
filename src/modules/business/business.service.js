@@ -804,7 +804,8 @@ async function cityRevenue(filters) {
             COALESCE(SUM(sub.price_amount / CASE sub.billing_cycle WHEN 'yearly' THEN 12 ELSE 1 END), 0) AS mrr
        FROM shop_subscriptions sub
        JOIN ${SHOP_CITY} AS sc ON sc.shop_id = sub.shop_id
-      WHERE sub.plan <> 'FREE' AND sub.status IN (${statuses})${filter.sql}
+      WHERE sub.plan <> 'FREE' AND sub.status IN (${statuses})
+        AND sub.payment_status <> 'not_required'${filter.sql}
       GROUP BY sc.city`,
     [...metrics.MRR_ACTIVE_STATUSES, ...filter.params],
   );
