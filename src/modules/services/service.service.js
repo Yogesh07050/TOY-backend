@@ -844,21 +844,34 @@ async function createBooking(serviceId, payload, user) {
   });
   await analyticsEvents.touchShopCustomer(service.shop_id, user.id);
 
-  // Booking confirmation (Push §18). Fire-and-forget - the booking exists
-  // either way, and a push outage must not fail the request that made it.
+  // Both halves of the same event (Push §18): the customer learns their request
+  // is in, and the shop learns it has one to answer. Kept as two calls rather
+  // than one so a failure on either side still leaves the other delivered -
+  // and the shop's half is the one that must not be dropped, since a booking
+  // waits in `requested` until somebody there accepts it.
+  //
+  // Fire-and-forget - the booking exists either way, and a push outage must not
+  // fail the request that made it.
+  const bookingNotificationFailed = (notification) => (error) =>
+    logger.error(
+      {
+        event: 'NOTIFICATION_SEND_FAILED',
+        error_code: 'NOTIFICATION_SEND_FAILED',
+        category: 'NOTIFICATION',
+        dependency: 'PUSH',
+        notification,
+        err_message: error.message,
+      },
+      'Notification fan-out failed',
+    );
+
   notifications
     .notifyBooking(result.insertId, 'BOOKING_CREATED')
-    .catch((error) => logger.error(
-        {
-          event: 'NOTIFICATION_SEND_FAILED',
-          error_code: 'NOTIFICATION_SEND_FAILED',
-          category: 'NOTIFICATION',
-          dependency: 'PUSH',
-          notification: 'BOOKING_CONFIRMED',
-          err_message: error.message,
-        },
-        'Notification fan-out failed',
-      ));
+    .catch(bookingNotificationFailed('BOOKING_CREATED'));
+
+  notifications
+    .notifyBookingRequested(result.insertId)
+    .catch(bookingNotificationFailed('BOOKING_REQUESTED'));
 
   return mapBooking(await queryOne('SELECT * FROM service_bookings WHERE id = ?', [result.insertId]));
 }

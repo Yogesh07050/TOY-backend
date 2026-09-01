@@ -40,6 +40,12 @@ const PREFERENCE_COLUMN = {
   BOOKING_CREATED: 'booking_updates',
   BOOKING_UPDATED: 'booking_updates',
   BOOKING_CANCELLED: 'booking_updates',
+  // The merchant's half of a booking. Same preference column as the customer's
+  // half - it is the same subject, read from the other side of the counter -
+  // so a shop that mutes booking updates mutes both. Without an entry here
+  // `dispatch` would fall back to `admin_announcements`, and muting
+  // announcements would silently stop bookings arriving.
+  BOOKING_REQUESTED: 'booking_updates',
 };
 
 /**
@@ -92,6 +98,9 @@ const HIGH_PRIORITY_TYPES = new Set([
   'BOOKING_CREATED',
   'BOOKING_UPDATED',
   'BOOKING_CANCELLED',
+  // A booking sits unanswered until someone at the shop accepts it, so it is
+  // worth waking the merchant's device for the same reason the customer's.
+  'BOOKING_REQUESTED',
   'SUBSCRIPTION_BILLING',
 ]);
 
@@ -836,9 +845,15 @@ async function notifyServiceOfferRedeemed(claimId) {
  * same query.
  */
 const BOOKING_MESSAGES = {
+  // A booking is created as `requested` and stays there until someone at the
+  // shop accepts it, so this cannot say "confirmed" - that is a promise only
+  // the merchant can make, and they have not seen it yet. The customer is told
+  // what is actually true: the request is in, and an answer is coming.
   BOOKING_CREATED: (booking) => ({
-    title: 'Booking confirmed',
-    message: `${booking.service_name} at ${booking.shop_name}${booking.when ? ` - ${booking.when}` : ''}.`,
+    title: 'Booking requested',
+    message: `${booking.service_name} at ${booking.shop_name}${
+      booking.when ? ` - ${booking.when}` : ''
+    }. The shop will confirm shortly.`,
   }),
   BOOKING_UPDATED: (booking) => ({
     title: 'Booking updated',
@@ -851,6 +866,19 @@ const BOOKING_MESSAGES = {
     message: `Your ${booking.service_name} booking with ${booking.shop_name} has been cancelled.`,
   }),
 };
+
+/**
+ * The requested slot as a person reads it. Both halves of a booking quote the
+ * same time, so they format it the same way rather than drifting apart.
+ */
+const bookingWhen = (requestedAt) =>
+  requestedAt
+    ? new Date(requestedAt).toLocaleString('en-IN', {
+        dateStyle: 'medium',
+        timeStyle: 'short',
+        timeZone: 'Asia/Kolkata',
+      })
+    : null;
 
 async function notifyBooking(bookingId, type) {
   const template = BOOKING_MESSAGES[type];
@@ -868,15 +896,7 @@ async function notifyBooking(bookingId, type) {
   );
   if (!booking) return 0;
 
-  const when = booking.requested_at
-    ? new Date(booking.requested_at).toLocaleString('en-IN', {
-        dateStyle: 'medium',
-        timeStyle: 'short',
-        timeZone: 'Asia/Kolkata',
-      })
-    : null;
-
-  const { title, message } = template({ ...booking, when });
+  const { title, message } = template({ ...booking, when: bookingWhen(booking.requested_at) });
   return dispatch([{ id: Number(booking.user_id), name: booking.name, email: booking.email }], {
     type,
     title,
@@ -884,6 +904,48 @@ async function notifyBooking(bookingId, type) {
     entityType: 'service_booking',
     entityId: Number(booking.id),
     deepLink: deepLinkFor('service', Number(booking.service_id)),
+  });
+}
+
+/**
+ * Tells the shop that a booking has come in - the other half of §28.
+ *
+ * `notifyBooking(id, 'BOOKING_CREATED')` above confirms the request to the
+ * customer. Nothing told the merchant, and nothing else could: a booking shows
+ * up in service analytics only as a count, and the one booking endpoint a
+ * merchant has takes an id they had no way to learn. So a customer could book
+ * a service, be told the request was in, and have it reach nobody. Since a
+ * booking is created as `requested` and waits there, the person who has to
+ * accept it is exactly the person who was not being told.
+ *
+ * Deliberately no `deepLink`: there is no merchant bookings screen to open
+ * yet, and inventing `booking/17` would produce a link matching no route.
+ * Falling back to the notification centre is honest and always valid, while
+ * `entityType`/`entityId` still record which booking this was - so the link
+ * starts resolving on its own the day that screen exists.
+ */
+async function notifyBookingRequested(bookingId) {
+  const booking = await queryOne(
+    `SELECT b.id, b.requested_at, sv.shop_id, sv.name AS service_name,
+            u.name AS customer_name
+       FROM service_bookings b
+       JOIN services sv ON sv.id = b.service_id
+       JOIN users u ON u.id = b.user_id
+      WHERE b.id = ?`,
+    [bookingId],
+  );
+  if (!booking) return 0;
+
+  const when = bookingWhen(booking.requested_at);
+
+  return notifyShopTeam(Number(booking.shop_id), {
+    type: 'BOOKING_REQUESTED',
+    title: 'New booking request',
+    message: `${booking.customer_name} requested ${booking.service_name}${
+      when ? ` for ${when}` : ''
+    }.`,
+    entityType: 'service_booking',
+    entityId: Number(booking.id),
   });
 }
 
@@ -957,6 +1019,7 @@ module.exports = {
   notifyServiceOfferClaimed,
   notifyServiceOfferRedeemed,
   notifyBooking,
+  notifyBookingRequested,
   notifyBookingStatusChanged,
   syncPushReceipts,
   announce,
