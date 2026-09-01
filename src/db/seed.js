@@ -610,6 +610,26 @@ function makeRandom(seed) {
   };
 }
 
+/**
+ * Recount `offers.view_count` / `click_count` from the raw events.
+ *
+ * The dashboard stat cards read these denormalised counters while the offer
+ * funnel counts `offer_views` directly, so the two have to agree or the same
+ * screen reports two different view totals. `trackEvent` keeps them in step for
+ * real traffic; the bulk insert in `seedAnalyticsHistory` bypasses it.
+ */
+async function rebuildOfferCounters(shopId) {
+  await execute(
+    `UPDATE offers o
+        SET o.view_count  = (SELECT COUNT(*) FROM offer_views v
+                              WHERE v.offer_id = o.id AND v.event_type = 'view'),
+            o.click_count = (SELECT COUNT(*) FROM offer_views v
+                              WHERE v.offer_id = o.id AND v.event_type = 'click')
+      WHERE o.shop_id = ?`,
+    [shopId],
+  );
+}
+
 async function seedAnalyticsHistory() {
   const shop = await queryOne('SELECT id FROM shops WHERE slug = ?', [slugify('Zara')]);
   if (!shop) return;
@@ -623,7 +643,10 @@ async function seedAnalyticsHistory() {
     [shop.id],
   );
   if (Number(already.count) > 0) {
-    console.log('  analytics history: already present, skipped');
+    // Still reconcile the counters: a database seeded before that step existed
+    // holds the events but not the totals, and the skip would strand it there.
+    await rebuildOfferCounters(shop.id);
+    console.log('  analytics history: already present, counters reconciled');
     return;
   }
 
@@ -701,6 +724,8 @@ async function seedAnalyticsHistory() {
       ],
     );
   }
+
+  await rebuildOfferCounters(shop.id);
 
   // Rebuild the customer roll-up from the events just generated, so the
   // new-vs-returning split matches the history rather than today's date.
