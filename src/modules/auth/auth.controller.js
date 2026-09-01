@@ -28,7 +28,30 @@ function cookieOptions() {
   };
 }
 
-function setRefreshCookie(res, refreshToken) {
+/**
+ * Only a browser gets the cookie.
+ *
+ * `Origin` is set by browsers on every state-changing request and by no native
+ * client, which is the same signal `csrfGuard` reads - so the two agree on who
+ * a cookie belongs to.
+ *
+ * Handing one to a native client was actively harmful. React Native shares the
+ * system cookie store (NSHTTPCookieStorage / CookieManager), so the app kept
+ * this cookie and replayed it on every later request - while still sending no
+ * Origin, because it is not a browser. That is precisely the shape
+ * `csrfGuard` treats as hostile, so from the *second* login onwards every
+ * mobile user was refused with "This request didn't come from a recognised
+ * app", for the lifetime of the install. The first login worked, which is what
+ * made it look like a credentials problem rather than a cookie problem.
+ *
+ * Nothing is lost by withholding it: the refresh token is in the response body
+ * too, and `readRefreshToken` accepts it from either place - the body is the
+ * path native clients already use.
+ */
+const isBrowserClient = (req) => Boolean(req.get('Origin') || req.get('Referer'));
+
+function setRefreshCookie(req, res, refreshToken) {
+  if (!isBrowserClient(req)) return;
   res.cookie('refresh_token', refreshToken, {
     ...cookieOptions(),
     maxAge: tokens.durationToMs(env.jwt.refreshExpiresIn),
@@ -47,7 +70,7 @@ const currentFamily = (req) => service.familyForToken(readRefreshToken(req));
 
 exports.register = async (req, res) => {
   const result = await service.register(req.body, req);
-  setRefreshCookie(res, result.refreshToken);
+  setRefreshCookie(req, res, result.refreshToken);
   // The registrant is the actor for this entry; the request had no user yet.
   req.user = { id: result.user.id };
   await audit.record(req, {
@@ -110,7 +133,7 @@ exports.login = async (req, res) => {
     throw error;
   }
 
-  setRefreshCookie(res, result.refreshToken);
+  setRefreshCookie(req, res, result.refreshToken);
   // §50 lists login among the actions that must be auditable. The device the
   // session was opened from is the detail an investigation actually needs.
   req.user = { id: result.user.id };
@@ -148,7 +171,7 @@ exports.refresh = async (req, res) => {
     throw error;
   }
 
-  setRefreshCookie(res, result.refreshToken);
+  setRefreshCookie(req, res, result.refreshToken);
   (req.log ?? logger).debug(
     { event: 'REFRESH_SUCCEEDED', user_id: String(result.user.id), result: 'SUCCESS' },
     'Token refreshed',

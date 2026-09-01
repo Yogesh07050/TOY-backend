@@ -2,6 +2,7 @@
 
 const ApiError = require('../utils/ApiError');
 const { isAllowedOrigin } = require('../config/origins');
+const env = require('../config/env');
 
 /**
  * CSRF protection for cookie-authenticated writes (§52).
@@ -47,16 +48,36 @@ function originOf(url) {
   }
 }
 
-function csrfGuard(req, _res, next) {
+function csrfGuard(req, res, next) {
   if (SAFE_METHODS.has(req.method)) return next();
   if (!req.cookies?.refresh_token) return next();
 
-  const claimed = req.get('Origin') || originOf(req.get('Referer') || '');
+  const origin = req.get('Origin');
+  const referer = req.get('Referer');
+  const claimed = origin || originOf(referer || '');
 
-  // A cookie-bearing request always comes from a browser, and a browser always
-  // sets one of the two on a cross-site write. Absent both, treat it as hostile
-  // rather than as a trusted non-browser caller - a real API client would not
-  // be holding this cookie.
+  // Neither header at all means this is not a browser, so it cannot be the
+  // cross-site request this guard exists to stop: a page attacking us always
+  // carries an Origin on a state-changing request, and falls back to a Referer
+  // where an old browser omits it. Suppressing both is not something page
+  // script can do.
+  //
+  // The case that lands here is a native client holding a cookie it should
+  // never have been given. React Native shares the system cookie store, so
+  // versions of the app that logged in before `setRefreshCookie` learned to
+  // withhold the cookie from native clients still replay it forever - and were
+  // refused on every write, permanently, with no way for the user to clear it.
+  //
+  // So the cookie is discarded rather than trusted: dropped from this request,
+  // and expired on the client so the device stops sending it. The request then
+  // proceeds on its Bearer token exactly as a native request should, and a
+  // browser is unaffected because a browser always has one of the headers.
+  if (!origin && !referer) {
+    delete req.cookies.refresh_token;
+    res.clearCookie('refresh_token', { path: `${env.apiPrefix}/auth` });
+    return next();
+  }
+
   if (!isAllowedOrigin(claimed)) {
     return next(
       new ApiError(
