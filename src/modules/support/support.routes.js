@@ -10,6 +10,7 @@ const audit = require('../../utils/audit');
 const { authenticate, optionalAuth } = require('../../middleware/auth');
 const { requirePermission } = require('../../middleware/authorize');
 const { supportLimiter } = require('../../middleware/rateLimit');
+const { idempotent } = require('../../middleware/idempotency');
 const { ok, created, paginated } = require('../../utils/respond');
 
 const router = express.Router();
@@ -42,6 +43,16 @@ router.post(
   '/tickets',
   supportLimiter,
   optionalAuth,
+  // A retry after a timeout gets the original ticket and its original
+  // reference, rather than a second ticket saying the same thing - the client
+  // sends the same key on both attempts.
+  //
+  // After `optionalAuth`, so a signed-in caller's key is scoped to them. It
+  // does nothing for a guest: `uq_idempotency` is (key, user_id), and MySQL
+  // treats NULL user ids as distinct, so a guest's retry inserts rather than
+  // replaying. Their protection is the form itself, which disables the button
+  // while sending and replaces itself with the confirmation.
+  idempotent(),
   validate({ body: schema.createTicketSchema }),
   asyncHandler(async (req, res) => {
     const ticket = await service.create(req.body, req.user);

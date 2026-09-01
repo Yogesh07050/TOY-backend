@@ -58,14 +58,17 @@ const createTicketSchema = z
     entityType: z.enum(REPORTABLE).optional().nullable(),
     entityId: z.coerce.number().int().positive().optional().nullable(),
   })
-  // A report is only useful if it says what it is about, and an entity id
-  // without a type cannot be looked up. Neither half stands alone.
+  // An entity id without a type cannot be looked up, and a type without an id
+  // names nothing. Neither half stands alone.
+  //
+  // Note what is deliberately *not* required: a `report_content` ticket with no
+  // entity at all. Most reports arrive from the "Report this offer" link and
+  // carry their target, but somebody who found the problem after the listing
+  // was pulled - or who is reporting a shop by name from the Support page -
+  // still has something worth telling us, and refusing that report to keep the
+  // data tidy loses the only copy of it.
   .refine((value) => Boolean(value.entityType) === Boolean(value.entityId), {
     message: 'A report must name both what is being reported and which one',
-    path: ['entityId'],
-  })
-  .refine((value) => value.category !== 'report_content' || Boolean(value.entityType), {
-    message: 'Choose the offer, service or shop you are reporting',
     path: ['entityId'],
   });
 
