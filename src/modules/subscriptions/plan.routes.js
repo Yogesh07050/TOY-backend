@@ -132,11 +132,12 @@ router.get(
   validate({ params: shopIdParam }),
   asyncHandler(async (req, res) => {
     const shopId = Number(req.params.shopId);
-    if (
-      !req.user.isSuperAdmin
-      && !access.hasShopPermission(req.user, shopId, 'VIEW_SHOP')
-      && !access.hasShopPermission(req.user, shopId, 'USE_AI_CONTENT')
-    ) {
+    // Membership, not permission. VIEW_SHOP and USE_AI_CONTENT are both held
+    // globally by roles outside this shop - VIEW_SHOP by every CUSTOMER - and
+    // `hasShopPermission` grants on a global hold before it checks membership,
+    // so either test let any signed-in user read this shop's plan and price.
+    // See the same fix on `canReadShop` in subscription.routes.js.
+    if (!req.user.isSuperAdmin && !req.user.shopIds?.includes(shopId)) {
       throw ApiError.forbidden('You do not have access to this shop');
     }
     ok(res, await subscriptions.getShopSubscription(shopId));

@@ -96,12 +96,24 @@ router.get(
 );
 
 /**
- * Reading a shop's plan needs any shop-level right; VIEW_SHOP is held by every
- * member, which is the level at which "what plan am I on" is safe to expose.
+ * Reading a shop's plan is for that shop's own people, and for a Super Admin.
+ *
+ * This used to ask `hasShopPermission(user, shopId, 'VIEW_SHOP')` on the
+ * reasoning that VIEW_SHOP is held by every member. It is - but it is also a
+ * *global* permission on the CUSTOMER role, because browsing shop pages is
+ * what customers do. `hasShopPermission` grants on a global hold before it
+ * ever looks at membership, so that check passed for every signed-in user
+ * against every shop id, and handed out a competitor's plan, price, payment
+ * status and renewal date to anyone with an account.
+ *
+ * Membership is therefore tested directly. A permission that the public also
+ * holds cannot stand in for "belongs to this shop".
  */
 const canReadShop = (req, _res, next) => {
+  if (!req.user) return next(ApiError.unauthorized());
   const shopId = Number(req.params.shopId);
-  if (accessControl.hasShopPermission(req.user, shopId, 'VIEW_SHOP')) return next();
+  if (req.user.isSuperAdmin) return next();
+  if (req.user.shopIds?.includes(shopId)) return next();
   next(ApiError.forbidden('You do not have access to this shop'));
 };
 
