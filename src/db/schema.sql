@@ -1660,3 +1660,464 @@ CREATE TABLE IF NOT EXISTS support_ticket_messages (
   CONSTRAINT fk_support_msg_ticket FOREIGN KEY (ticket_id) REFERENCES support_tickets (id) ON DELETE CASCADE,
   CONSTRAINT fk_support_msg_author FOREIGN KEY (author_id) REFERENCES users (id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- =====================================================================
+--  Visibility & Promotion System
+--  ("Offers App - Visibility & Promotion System" §22, §31, §32)
+--
+--  Ten tables, in the order §31 lists them. The through-line: nothing about
+--  how listings are ranked or promoted may be a constant in the code (§4,
+--  §22), and every prominent impression a customer receives has to be
+--  attributable afterwards (§17, §20).
+-- =====================================================================
+
+-- ---------------------------------------------------------------------
+-- Configurable ranking weights (§4: "Weights must be configurable from the
+-- backend rather than permanently hard-coded").
+--
+-- One row per (surface, factor). Surfaces are separate because the same
+-- factor means different things in different places: §13 orders search by
+-- relevance first, §14 starts Near Me from the customer's location, and a
+-- single global weight set cannot satisfy both.
+--
+-- Defaults are seeded from `config/visibility.js`; a missing row falls back
+-- to that default rather than scoring zero, so a bad delete degrades the
+-- ranking instead of emptying it.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS ranking_weights (
+  id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  surface    VARCHAR(40)     NOT NULL,
+  factor     VARCHAR(40)     NOT NULL,
+  weight     DECIMAL(6,3)    NOT NULL DEFAULT 1.000,
+  -- Turning a factor off is not the same as weighting it 0: the weight is
+  -- preserved so it can be switched back on at the value it was tuned to.
+  is_active  TINYINT(1)      NOT NULL DEFAULT 1,
+  updated_by BIGINT UNSIGNED         DEFAULT NULL,
+  created_at DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_ranking_weight (surface, factor),
+  CONSTRAINT fk_rw_user FOREIGN KEY (updated_by) REFERENCES users (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------
+-- The rest of the tunables (§2.3, §2.6, §10, §18, §19, §25): decay curve
+-- shapes, diversity limits, rotation timing, anti-manipulation thresholds.
+--
+-- A weight says how much a factor counts; a rule says what the factor's
+-- curve looks like. Halving `freshnessHalfLifeDays` and halving the
+-- FRESHNESS weight are different changes with different effects, and §22
+-- puts both in the Super Admin's hands.
+--
+-- `value_number` and `value_json` rather than one text column: most rules
+-- are a single number and are read on every ranked request, and parsing JSON
+-- to get "3" back would be a strange price to pay for uniformity.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS visibility_rules (
+  id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  rule_key     VARCHAR(80)     NOT NULL,
+  value_number DECIMAL(12,4)           DEFAULT NULL,
+  value_json   JSON                    DEFAULT NULL,
+  description  VARCHAR(255)            DEFAULT NULL,
+  is_active    TINYINT(1)      NOT NULL DEFAULT 1,
+  updated_by   BIGINT UNSIGNED         DEFAULT NULL,
+  created_at   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_visibility_rule (rule_key),
+  CONSTRAINT fk_vr_user FOREIGN KEY (updated_by) REFERENCES users (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------
+-- Featured slots (§6, §11): the controlled promotional spaces themselves.
+--
+-- `capacity` is what makes §10's rotation meaningful. A slot that showed
+-- every eligible campaign at once would need no rotation and would also be
+-- useless; capping it at N and rotating the eligible pool through those N
+-- positions is exactly the difference between "A A A A" and "A B C A".
+--
+-- `min_plan_rank` is the slot's own eligibility floor (§9): 2 for the
+-- Premium-only spaces, 1 for Ending Soon, which §12 opens to Business too.
+-- It is a floor, not the whole check - `promotion.service` still validates
+-- the offer, the shop, the location and the schedule.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS featured_slots (
+  id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  code           VARCHAR(60)     NOT NULL,
+  placement_type VARCHAR(40)     NOT NULL,
+  name           VARCHAR(120)    NOT NULL,
+  description    VARCHAR(500)            DEFAULT NULL,
+  capacity       SMALLINT UNSIGNED NOT NULL DEFAULT 4,
+  min_plan_rank  TINYINT UNSIGNED NOT NULL DEFAULT 2,
+  -- Slot-level targeting, for spaces that exist only in one place: a
+  -- "Featured in Clothing" slot pins its own category so campaigns cannot
+  -- wander into it from elsewhere.
+  category_id    BIGINT UNSIGNED         DEFAULT NULL,
+  city           VARCHAR(120)            DEFAULT NULL,
+  status         ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  created_at     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_slot_code (code),
+  KEY idx_slot_placement (placement_type, status),
+  CONSTRAINT fk_slot_category FOREIGN KEY (category_id) REFERENCES categories (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------
+-- Featured campaigns (§8, §9, §10).
+--
+-- A campaign is a merchant's bid for a slot over a window, with its own
+-- targeting. §8 requires the system to activate and deactivate it on
+-- schedule, which is why `start_at`/`end_at` are authoritative and `status`
+-- is a cache the scheduler maintains: the live query re-checks the window on
+-- every read, so a scheduler that has not run yet can make a list look stale
+-- but can never show an expired campaign (§24).
+--
+-- `campaign_id` links to the existing `campaigns` table (the merchant's ROI
+-- grouping) so a Featured campaign's spend and its organic offers report
+-- together. It is optional - a Featured campaign is useful on its own.
+--
+-- `status` carries approval as well as lifecycle because §22 gives Super
+-- Admin campaign approval, and an approved-but-not-yet-started campaign is a
+-- different thing from one awaiting review.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS featured_campaigns (
+  id                 BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  shop_id            BIGINT UNSIGNED NOT NULL,
+  slot_id            BIGINT UNSIGNED NOT NULL,
+  campaign_id        BIGINT UNSIGNED         DEFAULT NULL,
+  name               VARCHAR(160)    NOT NULL,
+  description        VARCHAR(500)            DEFAULT NULL,
+  placement_type     VARCHAR(40)     NOT NULL,
+  -- Targeting (§8). All optional: an untargeted campaign is eligible
+  -- wherever its slot appears, which is the sensible default for a small
+  -- merchant with one shop.
+  target_category_id BIGINT UNSIGNED         DEFAULT NULL,
+  target_city        VARCHAR(120)            DEFAULT NULL,
+  target_latitude    DECIMAL(10,7)           DEFAULT NULL,
+  target_longitude   DECIMAL(10,7)           DEFAULT NULL,
+  target_radius_km   DECIMAL(6,2)            DEFAULT NULL,
+  start_at           DATETIME        NOT NULL,
+  end_at             DATETIME        NOT NULL,
+  -- A Super Admin's ordering hint inside a slot. Deliberately narrow: §10
+  -- settles ordering by rotation, and a priority that could override that
+  -- would reintroduce the permanent #1 position §21 forbids.
+  priority           TINYINT         NOT NULL DEFAULT 0,
+  status             ENUM('draft','pending_approval','approved','active','paused',
+                          'completed','rejected','archived') NOT NULL DEFAULT 'draft',
+  -- Exposure bookkeeping for §10's rotation. Maintained by the placement
+  -- service as it serves the slot.
+  exposure_count     BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  last_shown_at      DATETIME                DEFAULT NULL,
+  approved_by        BIGINT UNSIGNED         DEFAULT NULL,
+  approved_at        DATETIME                DEFAULT NULL,
+  rejection_reason   VARCHAR(500)            DEFAULT NULL,
+  created_by         BIGINT UNSIGNED         DEFAULT NULL,
+  created_at         DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at         DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  -- The live-slot read: one slot, currently within its window, approved.
+  KEY idx_fc_slot_window (slot_id, status, start_at, end_at),
+  KEY idx_fc_shop (shop_id, status),
+  KEY idx_fc_window (status, start_at, end_at),
+  KEY idx_fc_placement (placement_type, status),
+  -- `fk_fcam_*`, not `fk_fc_*`: InnoDB constraint names are unique per
+  -- database, and `followed_categories` already owns fk_fc_user/fk_fc_category.
+  CONSTRAINT fk_fcam_shop     FOREIGN KEY (shop_id)            REFERENCES shops (id)          ON DELETE CASCADE,
+  CONSTRAINT fk_fcam_slot     FOREIGN KEY (slot_id)            REFERENCES featured_slots (id) ON DELETE CASCADE,
+  CONSTRAINT fk_fcam_category FOREIGN KEY (target_category_id) REFERENCES categories (id)     ON DELETE SET NULL,
+  CONSTRAINT fk_fcam_approver FOREIGN KEY (approved_by)        REFERENCES users (id)          ON DELETE SET NULL,
+  CONSTRAINT fk_fcam_creator  FOREIGN KEY (created_by)         REFERENCES users (id)          ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------
+-- What each campaign actually promotes (§6, §9).
+--
+-- A campaign is the schedule and the targeting; a placement is one listing
+-- inside it. Splitting them is what lets "Diwali Collection" promote four
+-- offers and rotate between them, and what lets one expired offer drop out
+-- of a campaign without taking the campaign down with it (§9: "Offer is
+-- active", "Offer is not expired" are per-listing conditions).
+--
+-- `listing_type` + `listing_id` rather than three nullable FK columns: the
+-- three listing kinds live in three tables, and a polymorphic pair keeps the
+-- rotation query one index scan. Referential integrity is enforced in
+-- `promotion.service` on write and re-checked on every live read, which is
+-- what §24 requires anyway.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS promotion_placements (
+  id                  BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  featured_campaign_id BIGINT UNSIGNED NOT NULL,
+  shop_id             BIGINT UNSIGNED NOT NULL,
+  listing_type        ENUM('offer','service_offer','shop') NOT NULL,
+  listing_id          BIGINT UNSIGNED NOT NULL,
+  display_order       SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+  status              ENUM('active','paused') NOT NULL DEFAULT 'active',
+  exposure_count      BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  last_shown_at       DATETIME                DEFAULT NULL,
+  created_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_placement (featured_campaign_id, listing_type, listing_id),
+  KEY idx_pp_campaign (featured_campaign_id, status, display_order),
+  KEY idx_pp_listing (listing_type, listing_id),
+  KEY idx_pp_rotation (featured_campaign_id, last_shown_at),
+  CONSTRAINT fk_pp_campaign FOREIGN KEY (featured_campaign_id) REFERENCES featured_campaigns (id) ON DELETE CASCADE,
+  CONSTRAINT fk_pp_shop     FOREIGN KEY (shop_id)              REFERENCES shops (id)              ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------
+-- Visibility entitlements granted outside the subscription (§23).
+--
+-- §23's resolution rule is
+--
+--     Role Permission AND (Subscription Entitlement OR Super Admin Override)
+--
+-- and the OR is what this table is. `feature_overrides` already grants named
+-- *feature flags*; a visibility *level* is not a flag - "give this founding
+-- merchant Premium visibility until 31 Dec 2026" is a rank, with a reason
+-- and an expiry, and squeezing it into a boolean would lose all three.
+--
+-- Nothing here is ever consulted for billing. It raises what a merchant is
+-- eligible for; it never marks anything as paid.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS merchant_visibility_entitlements (
+  id               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  shop_id          BIGINT UNSIGNED NOT NULL,
+  visibility_level ENUM('BASIC','ENHANCED','PRIORITY') NOT NULL,
+  -- Why this merchant has it, in the granter's words: "Founding Merchant".
+  -- §23's example includes it, and an override no one can explain later is
+  -- an override no one dares revoke.
+  reason           VARCHAR(255)            DEFAULT NULL,
+  -- Also grants access to Featured placements without a Premium plan, which
+  -- §9 puts explicitly in the Super Admin's gift.
+  featured_access  TINYINT(1)      NOT NULL DEFAULT 0,
+  starts_at        DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  -- NULL means open-ended. The free-launch grants in §23 all carry a date.
+  expires_at       DATETIME                DEFAULT NULL,
+  status           ENUM('active','revoked','expired') NOT NULL DEFAULT 'active',
+  granted_by       BIGINT UNSIGNED         DEFAULT NULL,
+  revoked_by       BIGINT UNSIGNED         DEFAULT NULL,
+  revoked_at       DATETIME                DEFAULT NULL,
+  created_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  -- One live grant per shop; history is kept by the revoked/expired rows,
+  -- which is why this is not unique on shop_id alone.
+  KEY idx_mve_shop_status (shop_id, status, expires_at),
+  CONSTRAINT fk_mve_shop    FOREIGN KEY (shop_id)    REFERENCES shops (id) ON DELETE CASCADE,
+  CONSTRAINT fk_mve_granter FOREIGN KEY (granted_by) REFERENCES users (id) ON DELETE SET NULL,
+  CONSTRAINT fk_mve_revoker FOREIGN KEY (revoked_by) REFERENCES users (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------
+-- The visibility event stream (§32).
+--
+-- Distinct from `analytics_events` on purpose. That stream answers "how is
+-- my shop doing"; this one answers "where was this listing shown, in what
+-- position, under which campaign, and did the customer act on it" - which
+-- needs surface, placement and rank on every row. It also feeds ranking
+-- (§32: "These events support both analytics and ranking intelligence"),
+-- so it carries the fields anti-manipulation needs to discount a signal.
+--
+-- `session_id`, `device_hash` and `ip_hash` are hashes, never raw values:
+-- §25 needs to recognise that fifty impressions came from one device without
+-- the platform storing a device fingerprint it has no other use for.
+--
+-- `is_suspicious` is set by the rollup, not the writer. Deciding at insert
+-- time would mean a read-modify-write on the hot path of every impression;
+-- deciding in the rollup costs nothing and sees the whole window at once.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS visibility_events (
+  id                   BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  event_type           VARCHAR(40)     NOT NULL,
+  -- Where it happened: SEARCH / NEAR_ME / HOME / CATEGORY / ENDING_SOON.
+  surface              VARCHAR(40)             DEFAULT NULL,
+  -- Set only for promoted impressions, which is exactly what makes §20's
+  -- "Featured placement must not artificially change or falsify organic
+  -- analytics" enforceable: organic and featured are the same table split by
+  -- one indexed column, so neither can be reported as the other.
+  placement_type       VARCHAR(40)             DEFAULT NULL,
+  featured_campaign_id BIGINT UNSIGNED         DEFAULT NULL,
+  slot_id              BIGINT UNSIGNED         DEFAULT NULL,
+  listing_type         ENUM('offer','service_offer','shop') NOT NULL DEFAULT 'offer',
+  listing_id           BIGINT UNSIGNED         DEFAULT NULL,
+  shop_id              BIGINT UNSIGNED         DEFAULT NULL,
+  branch_id            BIGINT UNSIGNED         DEFAULT NULL,
+  category_id          BIGINT UNSIGNED         DEFAULT NULL,
+  user_id              BIGINT UNSIGNED         DEFAULT NULL,
+  session_id           CHAR(64)                DEFAULT NULL,
+  device_hash          CHAR(64)                DEFAULT NULL,
+  ip_hash              CHAR(64)                DEFAULT NULL,
+  -- 1-based rank the listing occupied. This is what makes §15's "average
+  -- position" answerable at all.
+  position             SMALLINT UNSIGNED       DEFAULT NULL,
+  city                 VARCHAR(120)            DEFAULT NULL,
+  latitude             DECIMAL(10,7)           DEFAULT NULL,
+  longitude            DECIMAL(10,7)           DEFAULT NULL,
+  distance_km          DECIMAL(8,2)            DEFAULT NULL,
+  term                 VARCHAR(160)            DEFAULT NULL,
+  is_suspicious        TINYINT(1)      NOT NULL DEFAULT 0,
+  created_at           DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  -- The merchant dashboard's read: one shop, one event type, a window.
+  KEY idx_ve_shop_type_time (shop_id, event_type, created_at),
+  -- The ranking rollup's read: one listing, a window.
+  KEY idx_ve_listing (listing_type, listing_id, created_at),
+  KEY idx_ve_campaign (featured_campaign_id, event_type, created_at),
+  KEY idx_ve_surface (surface, event_type, created_at),
+  -- Frequency capping (§18) asks "how often has this person seen this?"
+  KEY idx_ve_user_listing (user_id, listing_type, listing_id, created_at),
+  KEY idx_ve_session_listing (session_id, listing_type, listing_id, created_at),
+  -- Anti-manipulation (§25) sweeps one device's recent events.
+  KEY idx_ve_device (device_hash, created_at),
+  KEY idx_ve_time (created_at),
+  CONSTRAINT fk_ve_shop     FOREIGN KEY (shop_id)              REFERENCES shops (id)              ON DELETE CASCADE,
+  CONSTRAINT fk_ve_branch   FOREIGN KEY (branch_id)            REFERENCES shop_branches (id)      ON DELETE SET NULL,
+  CONSTRAINT fk_ve_category FOREIGN KEY (category_id)          REFERENCES categories (id)         ON DELETE SET NULL,
+  CONSTRAINT fk_ve_user     FOREIGN KEY (user_id)              REFERENCES users (id)              ON DELETE SET NULL,
+  CONSTRAINT fk_ve_campaign FOREIGN KEY (featured_campaign_id) REFERENCES featured_campaigns (id) ON DELETE SET NULL,
+  CONSTRAINT fk_ve_slot     FOREIGN KEY (slot_id)              REFERENCES featured_slots (id)     ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------
+-- Per-campaign daily counters (§17).
+--
+-- Named as §31 names it. It holds aggregates rather than raw rows: the raw
+-- events already live in `visibility_events`, and a second copy of them
+-- would be a second thing to keep honest. §17's campaign card is eight
+-- numbers over a window, and this makes it one indexed read per day instead
+-- of a scan over every impression the campaign ever served.
+--
+-- Rebuilt idempotently by the rollup job, so a re-run corrects rather than
+-- doubles.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS campaign_events (
+  id                   BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  featured_campaign_id BIGINT UNSIGNED NOT NULL,
+  shop_id              BIGINT UNSIGNED NOT NULL,
+  event_date           DATE            NOT NULL,
+  impressions          INT UNSIGNED    NOT NULL DEFAULT 0,
+  banner_clicks        INT UNSIGNED    NOT NULL DEFAULT 0,
+  offer_views          INT UNSIGNED    NOT NULL DEFAULT 0,
+  saves                INT UNSIGNED    NOT NULL DEFAULT 0,
+  claims               INT UNSIGNED    NOT NULL DEFAULT 0,
+  redemptions          INT UNSIGNED    NOT NULL DEFAULT 0,
+  shop_visits          INT UNSIGNED    NOT NULL DEFAULT 0,
+  directions_clicks    INT UNSIGNED    NOT NULL DEFAULT 0,
+  unique_customers     INT UNSIGNED    NOT NULL DEFAULT 0,
+  created_at           DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at           DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_campaign_day (featured_campaign_id, event_date),
+  KEY idx_ce_shop_date (shop_id, event_date),
+  CONSTRAINT fk_ce_campaign FOREIGN KEY (featured_campaign_id) REFERENCES featured_campaigns (id) ON DELETE CASCADE,
+  CONSTRAINT fk_ce_shop     FOREIGN KEY (shop_id)              REFERENCES shops (id)              ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------
+-- Ranking exclusions (§24, §25).
+--
+-- The hard "this must not rank" list, above and beyond the status and date
+-- checks the queries already apply. Two sources:
+--
+--   admin - a Super Admin pulling something from discovery pending review.
+--   auto  - the anti-manipulation sweep, which suspends a listing whose
+--           engagement is being fabricated rather than silently letting the
+--           inflated signal keep ranking it.
+--
+-- Either a listing or a whole shop; `expires_at` lets an automatic
+-- suspension lapse on its own, so a false positive costs a day rather than
+-- forever.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS ranking_exclusions (
+  id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  listing_type ENUM('offer','service_offer','shop') DEFAULT NULL,
+  listing_id   BIGINT UNSIGNED         DEFAULT NULL,
+  shop_id      BIGINT UNSIGNED         DEFAULT NULL,
+  scope        ENUM('listing','shop')  NOT NULL DEFAULT 'listing',
+  source       ENUM('admin','auto')    NOT NULL DEFAULT 'admin',
+  reason       VARCHAR(255)            DEFAULT NULL,
+  expires_at   DATETIME                DEFAULT NULL,
+  status       ENUM('active','lifted') NOT NULL DEFAULT 'active',
+  created_by   BIGINT UNSIGNED         DEFAULT NULL,
+  lifted_by    BIGINT UNSIGNED         DEFAULT NULL,
+  lifted_at    DATETIME                DEFAULT NULL,
+  created_at   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_rx_listing (listing_type, listing_id, status),
+  KEY idx_rx_shop (shop_id, status),
+  KEY idx_rx_status (status, expires_at),
+  CONSTRAINT fk_rx_shop    FOREIGN KEY (shop_id)    REFERENCES shops (id) ON DELETE CASCADE,
+  CONSTRAINT fk_rx_creator FOREIGN KEY (created_by) REFERENCES users (id) ON DELETE SET NULL,
+  CONSTRAINT fk_rx_lifter  FOREIGN KEY (lifted_by)  REFERENCES users (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------
+-- Frequency limits (§18).
+--
+-- "Maximum X prominent impressions per customer/session within a period",
+-- with X, the period and the scope all configurable rather than compiled in.
+--
+-- `applies_to` distinguishes the signed-in customer from the anonymous
+-- session, because a guest has no user id and capping them by IP would cap
+-- an entire office together.
+--
+-- A row with `placement_type` set applies only inside that promotional
+-- space, which is how featured content is capped more tightly than organic
+-- results without needing a second table.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS frequency_limits (
+  id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  scope           ENUM('offer','shop','campaign','placement') NOT NULL,
+  placement_type  VARCHAR(40)             DEFAULT NULL,
+  applies_to      ENUM('user','session')  NOT NULL DEFAULT 'user',
+  max_impressions INT UNSIGNED    NOT NULL DEFAULT 6,
+  window_minutes  INT UNSIGNED    NOT NULL DEFAULT 1440,
+  status          ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  updated_by      BIGINT UNSIGNED         DEFAULT NULL,
+  created_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_frequency (scope, placement_type, applies_to),
+  KEY idx_fl_status (status),
+  CONSTRAINT fk_fl_user FOREIGN KEY (updated_by) REFERENCES users (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------
+-- Precomputed listing quality and engagement scores (§33: "Precompute
+-- merchant/listing quality scores").
+--
+-- Not in §31's table list, and needed anyway. Engagement (§2.4) is a
+-- distinct-customer-weighted aggregate over 30 days of events, and offer
+-- quality (§4) is a completeness checklist over the listing and its shop.
+-- Computing either inside a ranked request would put a multi-table
+-- aggregate on the hot path of every search; computing them hourly turns
+-- both into one indexed lookup.
+--
+-- Staleness is bounded and harmless: an hour-old engagement score cannot
+-- show an expired offer, because expiry is checked live in the candidate
+-- query. It can only mean a listing that went viral in the last hour has
+-- not been rewarded for it yet.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS listing_quality_scores (
+  id               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  listing_type     ENUM('offer','service_offer','shop') NOT NULL,
+  listing_id       BIGINT UNSIGNED NOT NULL,
+  shop_id          BIGINT UNSIGNED NOT NULL,
+  -- Both normalised 0-1, so a weight change is the only thing that moves
+  -- their relative influence.
+  quality_score    DECIMAL(6,4)    NOT NULL DEFAULT 0.0000,
+  engagement_score DECIMAL(6,4)    NOT NULL DEFAULT 0.0000,
+  -- Kept alongside the score so a merchant can be told *why* their quality
+  -- score is what it is (§27) rather than just being handed a number.
+  quality_detail   JSON                    DEFAULT NULL,
+  engagement_raw   JSON                    DEFAULT NULL,
+  computed_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_lqs_listing (listing_type, listing_id),
+  KEY idx_lqs_shop (shop_id),
+  KEY idx_lqs_computed (computed_at),
+  CONSTRAINT fk_lqs_shop FOREIGN KEY (shop_id) REFERENCES shops (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

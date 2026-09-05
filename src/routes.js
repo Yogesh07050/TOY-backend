@@ -60,6 +60,17 @@ router.use('/business', require('./modules/business/business.routes'));
 // versioned with a release: it is the desk the whole platform points at.
 router.use('/support', require('./modules/support/support.routes'));
 
+// ---- Visibility & Promotion System ----
+// Four routers, mounted most-specific first so `/visibility/admin` is matched
+// by the admin router rather than swallowed by the customer one's `/:...`
+// routes. The split is by *audience*, not by entity: what a customer may read,
+// what a merchant may manage, what a merchant may measure, and what only the
+// platform owner may configure (§22, §24).
+router.use('/visibility/admin', require('./modules/visibility/visibilityAdmin.routes'));
+router.use('/visibility/analytics', require('./modules/visibility/visibilityAnalytics.routes'));
+router.use('/visibility', require('./modules/visibility/visibility.routes'));
+router.use('/featured-campaigns', require('./modules/visibility/featuredCampaign.routes'));
+
 // ---- V4: Services ----
 router.use('/services', require('./modules/services/service.routes'));
 router.use('/service-offer-claims', require('./modules/services/serviceOfferClaim.routes'));

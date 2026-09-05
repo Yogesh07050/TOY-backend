@@ -2,6 +2,8 @@
 
 const { execute, queryOne } = require('../db/pool');
 const logger = require('../utils/logger');
+const visibilityEvents = require('./visibility/visibilityAnalytics.service');
+const visibilityConfig = require('../config/visibility');
 
 /**
  * Analytics event tracking (V3 §28).
@@ -136,10 +138,81 @@ const CLIENT_EVENT_TYPES = [
 ];
 
 /**
+ * Events that are also *visibility* events (Visibility §32).
+ *
+ * The two streams answer different questions - this one "how is my shop
+ * doing", the other "where was this shown, in what position, and did it work"
+ * - but they overlap on the handful of things a customer actually does. Rather
+ * than adding a second `record` call at every claim, save and redemption site,
+ * the mapping lives here: one wiring point, and no way for a new call site to
+ * feed one stream and forget the other.
+ *
+ * Only events that name a specific listing are mirrored with a listing id.
+ * SERVICE_SAVE is the deliberate exception - a customer saves a *service*,
+ * while the thing that ranks is a service *offer*, and there is no honest
+ * one-to-one between them. It is mirrored at shop level, so it counts towards
+ * the merchant's dashboard totals (§15) but never credits a listing it cannot
+ * identify with engagement it did not earn (§2.4).
+ */
+const VISIBILITY_MIRROR = {
+  OFFER_VIEW: { event: 'VIEW', listingType: 'offer', idKey: 'offerId' },
+  OFFER_SAVE: { event: 'SAVE', listingType: 'offer', idKey: 'offerId' },
+  OFFER_CLAIM: { event: 'CLAIM', listingType: 'offer', idKey: 'offerId' },
+  OFFER_REDEMPTION: { event: 'REDEMPTION', listingType: 'offer', idKey: 'offerId' },
+  SHOP_VIEW: { event: 'PROFILE_VIEW', listingType: 'shop', idKey: 'shopId' },
+  SERVICE_OFFER_VIEW: { event: 'VIEW', listingType: 'service_offer', idKey: 'serviceOfferId' },
+  SERVICE_OFFER_CLAIM: { event: 'CLAIM', listingType: 'service_offer', idKey: 'serviceOfferId' },
+  SERVICE_OFFER_REDEEM: { event: 'REDEMPTION', listingType: 'service_offer', idKey: 'serviceOfferId' },
+  SERVICE_SAVE: { event: 'SAVE', listingType: 'service_offer', idKey: null },
+  // Same wrinkle as SERVICE_SAVE, and the same answer: a customer views a
+  // *service*, while the thing that ranks is a service *offer*. Mirrored at
+  // shop level so it reaches the merchant's dashboard totals (§15) without
+  // crediting a listing it cannot name with engagement it did not earn (§2.4).
+  SERVICE_VIEW: { event: 'VIEW', listingType: 'service_offer', idKey: null },
+};
+
+/**
+ * Mirrors one event into `visibility_events`, if it is one of the shared ones.
+ *
+ * Fire-and-forget and never awaited by `record`: the mirror is a second
+ * best-effort write behind a first best-effort write, and making the caller
+ * wait for it would double the cost of a save for no benefit either stream
+ * can point to.
+ */
+function mirrorToVisibility(eventType, payload) {
+  const mapping = VISIBILITY_MIRROR[eventType];
+  if (!mapping) return;
+
+  const listingId = mapping.idKey ? (payload[mapping.idKey] ?? null) : null;
+  if (mapping.idKey && !listingId) return;
+
+  visibilityEvents
+    .record({
+      eventType: visibilityConfig.EVENT_TYPES[mapping.event],
+      listingType: mapping.listingType,
+      listingId,
+      shopId: payload.shopId ?? null,
+      branchId: payload.branchId ?? null,
+      categoryId: payload.categoryId ?? null,
+      userId: payload.userId ?? null,
+      city: payload.city ?? null,
+      latitude: payload.latitude ?? null,
+      longitude: payload.longitude ?? null,
+      // No surface, position or placement: this event came from an action on a
+      // detail screen, not from a ranked list. Leaving them NULL is what keeps
+      // "average position" (§15) an average of real positions, and keeps a
+      // save recorded here out of every featured figure (§20).
+    })
+    .catch(() => {});
+}
+
+/**
  * Appends one event. Never throws - callers sit on request paths where losing
  * an analytics row is far cheaper than losing the response.
  */
 async function record(eventType, payload = {}) {
+  mirrorToVisibility(eventType, payload);
+
   try {
     await execute(
       `INSERT INTO analytics_events
@@ -242,6 +315,7 @@ async function shopContextForService(serviceId) {
 module.exports = {
   EVENT_TYPES,
   EVENT_TYPE_NAMES,
+  VISIBILITY_MIRROR,
   CLIENT_EVENT_TYPES,
   record,
   touchShopCustomer,

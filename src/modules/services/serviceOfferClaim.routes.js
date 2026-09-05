@@ -120,6 +120,10 @@ router.post(
       await analyticsEvents.record(analyticsEvents.EVENT_TYPES.SERVICE_OFFER_CLAIM, {
         shopId: offer.shop_id,
         userId: req.user.id,
+        // Carried for the visibility stream (Visibility §32): a claim is one of
+        // the strongest ranking signals there is, and it can only credit the
+        // right listing if the listing is named.
+        serviceOfferId: Number(req.params.serviceOfferId),
       });
 
       notifications

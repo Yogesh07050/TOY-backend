@@ -788,6 +788,58 @@ async function seedCampaign() {
   console.log('  campaign: Season End Sale');
 }
 
+/**
+ * A live Featured campaign, so the Visibility & Promotion System has something
+ * to show on a fresh install (§7, §8, §9, §11).
+ *
+ * `approved`, not `active`: §22 makes approval a Super Admin action and the
+ * scheduler flips it to active on its own within five minutes, so seeding it
+ * as approved exercises the real path rather than short-circuiting it.
+ *
+ * Seeding an image first is not decoration - §9 requires complete promotional
+ * content, so without one the campaign would be created and then correctly
+ * refuse to display, which looks like a bug on a first run.
+ */
+async function seedFeaturedCampaign() {
+  const shop = await queryOne('SELECT id FROM shops WHERE slug = ?', [slugify('Zara')]);
+  const slot = await queryOne("SELECT id, placement_type FROM featured_slots WHERE code = 'HOME_FEATURED'");
+  if (!shop || !slot) return;
+
+  const existing = await queryOne('SELECT id FROM featured_campaigns WHERE shop_id = ?', [shop.id]);
+  if (existing) return;
+
+  const offer = await queryOne(
+    "SELECT id FROM offers WHERE shop_id = ? AND status = 'active' ORDER BY id LIMIT 1",
+    [shop.id],
+  );
+  if (!offer) return;
+
+  await execute(
+    `INSERT INTO offer_images (offer_id, image_url, display_order)
+     SELECT ?, '/uploads/demo/offer-featured.jpg', 0
+      WHERE NOT EXISTS (SELECT 1 FROM offer_images oi WHERE oi.offer_id = ?)`,
+    [offer.id, offer.id],
+  );
+
+  const result = await execute(
+    `INSERT INTO featured_campaigns
+       (shop_id, slot_id, name, description, placement_type, start_at, end_at, status, approved_at)
+     VALUES (?, ?, 'Diwali Collection', 'DIWALI SPECIAL - Shop Now', ?,
+             DATE_SUB(NOW(), INTERVAL 1 DAY), DATE_ADD(NOW(), INTERVAL 14 DAY),
+             'approved', NOW())`,
+    [shop.id, slot.id, slot.placement_type],
+  );
+
+  await execute(
+    `INSERT IGNORE INTO promotion_placements
+       (featured_campaign_id, shop_id, listing_type, listing_id, display_order)
+     VALUES (?, ?, 'offer', ?, 0)`,
+    [result.insertId, shop.id, offer.id],
+  );
+
+  console.log('  featured campaign: Diwali Collection (Home Featured)');
+}
+
 async function main() {
   assertProductionSeedIsSafe();
   console.log('Seeding %s ...', env.db.database);
@@ -813,6 +865,7 @@ async function main() {
     await seedSubscriptions();
     await seedAnalyticsHistory();
     await seedCampaign();
+    await seedFeaturedCampaign();
   }
 
   const counts = await query(

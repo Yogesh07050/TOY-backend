@@ -12,6 +12,11 @@ const subscriptionService = require('../modules/subscriptions/subscription.servi
 const featureOverrides = require('../modules/featureOverrides/featureOverride.service');
 const claimService = require('../modules/claims/claim.service');
 const failureLog = require('../services/failureLog');
+const featuredCampaigns = require('../services/visibility/campaign.service');
+const visibilitySignals = require('../services/visibility/signals.service');
+const visibilityAnalytics = require('../services/visibility/visibilityAnalytics.service');
+const antiManipulation = require('../services/visibility/antiManipulation');
+const visibilityEntitlements = require('../services/visibility/merchantEntitlement.service');
 const idempotency = require('../middleware/idempotency');
 const logger = require('../utils/logger');
 const env = require('../config/env');
@@ -129,6 +134,70 @@ const jobs = [
     // all, which is worse than the duplicate the key was preventing.
     schedule: '*/5 * * * *',
     run: async () => ({ processed: await idempotency.releaseStale(15) }),
+  },
+
+  // ---- Visibility & Promotion System ---------------------------------------
+  {
+    name: 'featured-campaign-schedule',
+    // Every five minutes, on the same clock as the offer lifecycle. §8 asks
+    // the system to activate and deactivate campaigns automatically; this is
+    // that. It is bookkeeping rather than enforcement - every read path
+    // re-derives the window from start_at/end_at (§24), so a late run can make
+    // an admin list look stale but can never leave an ended campaign on the
+    // home page.
+    schedule: '*/5 * * * *',
+    run: async () => {
+      const { activated, completed } = await featuredCampaigns.sync();
+      return { processed: activated + completed, campaigns_activated: activated, campaigns_completed: completed };
+    },
+  },
+  {
+    name: 'visibility-signals',
+    // Hourly at :05. Rebuilds the precomputed listing quality and engagement
+    // scores ranking reads (§33), after the anti-manipulation sweep has
+    // flagged the events that should not count towards them (§25).
+    //
+    // The order inside the run matters: flag first, then score. Scoring first
+    // would bake a day of fabricated engagement into the ranking and only
+    // discount it an hour later.
+    schedule: '5 * * * *',
+    run: async () => {
+      const flagged = await antiManipulation.flagExcessEvents();
+      const suspended = await antiManipulation.suspendManipulatedListings();
+      const lifted = await antiManipulation.lapseExpiredExclusions();
+      const scored = await visibilitySignals.rebuild();
+      return {
+        processed: scored,
+        events_flagged: flagged,
+        listings_suspended: suspended,
+        exclusions_lifted: lifted,
+        listings_scored: scored,
+      };
+    },
+  },
+  {
+    name: 'campaign-rollup',
+    // 00:25 daily, just after the analytics snapshots. Folds yesterday's
+    // visibility events into the per-campaign daily counters §17's card reads.
+    // Yesterday *and* today: today's partial day is rebuilt so a merchant
+    // checking a campaign mid-morning sees the morning, not zeros.
+    schedule: '25 0 * * *',
+    run: async () => {
+      const yesterday = new Date(Date.now() - 86400000);
+      const [past, current] = await Promise.all([
+        visibilityAnalytics.rollupCampaignDay(yesterday),
+        visibilityAnalytics.rollupCampaignDay(new Date()),
+      ]);
+      return { processed: past + current, rolled_yesterday: past, rolled_today: current };
+    },
+  },
+  {
+    name: 'visibility-entitlement-expiry',
+    // 02:15 daily, alongside the feature-override sweep it mirrors. §23's
+    // free-launch grants carry an expiry; this is what makes the admin list
+    // agree with what the resolver has already stopped granting.
+    schedule: '15 2 * * *',
+    run: async () => ({ processed: await visibilityEntitlements.expireLapsed() }),
   },
   {
     name: 'prune',

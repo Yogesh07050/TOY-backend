@@ -61,6 +61,31 @@ const PERMISSIONS = {
   },
   MANAGE_CAMPAIGNS: { category: 'Campaigns', description: 'Create and manage marketing campaigns' },
 
+  // Visibility & Promotion (§22).
+  //
+  // Four grants rather than one, split by who is trusted with what. A
+  // merchant may build and read their own promotional campaigns; only the
+  // platform owner may change how ranking works or approve a campaign onto a
+  // shared promotional space. §24 is explicit that "Admins cannot directly set
+  // their own ranking score", and the only structural way to guarantee that is
+  // for the ranking controls to be a permission a merchant never holds.
+  MANAGE_VISIBILITY: {
+    category: 'Visibility',
+    description: 'Configure ranking weights, visibility rules, slots and frequency limits',
+  },
+  MANAGE_FEATURED_CAMPAIGNS: {
+    category: 'Visibility',
+    description: 'Create and manage featured promotional campaigns',
+  },
+  APPROVE_FEATURED_CAMPAIGN: {
+    category: 'Visibility',
+    description: 'Approve, reject or suspend featured campaigns',
+  },
+  VIEW_VISIBILITY_ANALYTICS: {
+    category: 'Insights',
+    description: 'View visibility, reach and campaign performance analytics',
+  },
+
   // V4 §18: Services are a first-class listing type alongside offers, with
   // their own permission set mirroring the offer permissions above.
   CREATE_SERVICE: { category: 'Services', description: 'Create services' },
@@ -152,6 +177,12 @@ const SYSTEM_ROLES = {
       'VIEW_SUBSCRIPTION',
       'MANAGE_SUBSCRIPTION',
       'MANAGE_CAMPAIGNS',
+      // The merchant's own promotional campaigns and their reach reporting.
+      // Deliberately no MANAGE_VISIBILITY or APPROVE_FEATURED_CAMPAIGN: a
+      // merchant who could tune the ranking weights, or wave their own
+      // campaign onto the home page, is exactly what §24 forbids.
+      'MANAGE_FEATURED_CAMPAIGNS',
+      'VIEW_VISIBILITY_ANALYTICS',
       // The subscription plan is the real gate on these two, so granting them
       // to every Admin costs nothing and keeps the upgrade prompt reachable.
       'USE_AI_ASSISTANT',
@@ -214,6 +245,10 @@ const MANAGEMENT_PERMISSIONS = [
   'VIEW_SUBSCRIPTION',
   'MANAGE_SUBSCRIPTION',
   'MANAGE_CAMPAIGNS',
+  'MANAGE_VISIBILITY',
+  'MANAGE_FEATURED_CAMPAIGNS',
+  'APPROVE_FEATURED_CAMPAIGN',
+  'VIEW_VISIBILITY_ANALYTICS',
   'CREATE_SERVICE',
   'EDIT_SERVICE',
   'DELETE_SERVICE',

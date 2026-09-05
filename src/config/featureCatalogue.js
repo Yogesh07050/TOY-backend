@@ -27,6 +27,8 @@ const CATEGORY_FOR = {
   ENDING_SOON: 'Discovery',
   CAMPAIGNS: 'Publishing',
   PRIORITY_DISCOVERY: 'Discovery',
+  ENHANCED_DISCOVERY: 'Discovery',
+  FEATURED_PLACEMENTS: 'Discovery',
   NOTIFICATIONS_ADVANCED: 'Engagement',
   PRIORITY_SUPPORT: 'Support',
   SERVICE_SCHEDULING: 'Services',
@@ -52,6 +54,8 @@ const analyticsKeys = new Set([
   'OFFER_INTELLIGENCE',
   'ROI_DASHBOARD',
   'ANALYTICS_EXPORT',
+  'VISIBILITY_ANALYTICS',
+  'VISIBILITY_ANALYTICS_ADVANCED',
 ]);
 
 /**

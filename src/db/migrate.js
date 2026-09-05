@@ -13,6 +13,7 @@ const path = require('node:path');
 const mysql = require('mysql2/promise');
 const env = require('../config/env');
 const featureCatalogue = require('../config/featureCatalogue');
+const visibility = require('../config/visibility');
 
 const FRESH = process.argv.includes('--fresh');
 
@@ -638,6 +639,115 @@ const STATEMENT_PATCHES = [
       await connection.query('ALTER TABLE service_offer_claims DROP INDEX uq_service_claim_user_offer');
     },
   },
+
+  // ---- Visibility & Promotion System --------------------------------------
+  {
+    name: 'ranking_weights seeded from config/visibility.js',
+    // §4 requires the weights to be configurable from the backend, which means
+    // they have to exist as rows before anyone can configure them. Seeded from
+    // the coded defaults, and only ever *inserted* - a re-run must never
+    // silently undo a Super Admin's tuning, which is exactly what an upsert
+    // here would do on every deploy.
+    check: async (connection) => {
+      const [rows] = await connection.query('SELECT COUNT(*) AS n FROM ranking_weights');
+      const expected = visibility.SURFACE_KEYS.length * visibility.FACTOR_KEYS.length;
+      return Number(rows[0].n) < expected;
+    },
+    run: async (connection) => {
+      for (const surface of visibility.SURFACE_KEYS) {
+        for (const factor of visibility.FACTOR_KEYS) {
+          await connection.query(
+            `INSERT IGNORE INTO ranking_weights (surface, factor, weight, is_active)
+             VALUES (?, ?, ?, 1)`,
+            [surface, factor, visibility.DEFAULT_WEIGHTS[surface][factor]],
+          );
+        }
+      }
+    },
+  },
+  {
+    name: 'visibility_rules seeded from config/visibility.js',
+    check: async (connection) => {
+      const [rows] = await connection.query('SELECT COUNT(*) AS n FROM visibility_rules');
+      return Number(rows[0].n) < Object.keys(visibility.DEFAULT_RULES).length;
+    },
+    run: async (connection) => {
+      for (const [key, value] of Object.entries(visibility.DEFAULT_RULES)) {
+        // Scalars go in `value_number` so the hot read path never parses JSON
+        // to get a number back; objects and booleans go in `value_json`.
+        const isNumber = typeof value === 'number';
+        await connection.query(
+          `INSERT IGNORE INTO visibility_rules (rule_key, value_number, value_json, is_active)
+           VALUES (?, ?, ?, 1)`,
+          [key, isNumber ? value : null, isNumber ? null : JSON.stringify(value)],
+        );
+      }
+    },
+  },
+  {
+    name: 'featured_slots seeded from config/visibility.js',
+    // §11's placement types, as slots a campaign can actually be booked into.
+    check: async (connection) => {
+      const [rows] = await connection.query('SELECT COUNT(*) AS n FROM featured_slots');
+      return Number(rows[0].n) < visibility.DEFAULT_SLOTS.length;
+    },
+    run: async (connection) => {
+      for (const slot of visibility.DEFAULT_SLOTS) {
+        await connection.query(
+          `INSERT IGNORE INTO featured_slots
+             (code, placement_type, name, description, capacity, min_plan_rank, status)
+           VALUES (?, ?, ?, ?, ?, ?, 'active')`,
+          [slot.code, slot.placementType, slot.name, slot.description, slot.capacity, slot.minPlanRank],
+        );
+      }
+    },
+  },
+  {
+    name: 'frequency_limits seeded from config/visibility.js',
+    // §18's caps. Present from the first request rather than from the first
+    // time someone opens the admin screen: an uncapped launch is exactly the
+    // customer fatigue §18 exists to prevent.
+    check: async (connection) => {
+      const [rows] = await connection.query('SELECT COUNT(*) AS n FROM frequency_limits');
+      return Number(rows[0].n) < visibility.DEFAULT_FREQUENCY_LIMITS.length;
+    },
+    run: async (connection) => {
+      for (const limit of visibility.DEFAULT_FREQUENCY_LIMITS) {
+        await connection.query(
+          `INSERT IGNORE INTO frequency_limits
+             (scope, placement_type, applies_to, max_impressions, window_minutes, status)
+           VALUES (?, ?, ?, ?, ?, 'active')`,
+          [limit.scope, limit.placementType, limit.appliesTo, limit.maxImpressions, limit.windowMinutes],
+        );
+      }
+    },
+  },
+  {
+    name: 'shop Admins may manage featured campaigns and read visibility analytics',
+    // The merchant's half of §22. Deliberately not MANAGE_VISIBILITY or
+    // APPROVE_FEATURED_CAMPAIGN: §24 says an Admin cannot set their own ranking
+    // score, and a merchant who could approve their own campaign onto the home
+    // page would have routed around the approval step in one request.
+    //
+    // `seedRoles` grants these on a fresh install; this is for the installs
+    // that already exist and will not re-run the seeder.
+    check: async (connection) => {
+      const [rows] = await connection.query(
+        `SELECT 1 FROM roles r
+           JOIN permissions p ON p.name IN ('MANAGE_FEATURED_CAMPAIGNS','VIEW_VISIBILITY_ANALYTICS')
+          WHERE r.name = 'ADMIN'
+            AND NOT EXISTS (SELECT 1 FROM role_permissions rp
+                             WHERE rp.role_id = r.id AND rp.permission_id = p.id)
+          LIMIT 1`,
+      );
+      return rows.length > 0;
+    },
+    sql: `INSERT IGNORE INTO role_permissions (role_id, permission_id)
+          SELECT r.id, p.id FROM roles r
+            JOIN permissions p ON p.name IN ('MANAGE_FEATURED_CAMPAIGNS','VIEW_VISIBILITY_ANALYTICS')
+           WHERE r.name = 'ADMIN'`,
+  },
+
   {
     name: 'claim_verifications.service_claim_id -> service_offer_claims FK',
     // `service_offer_claims` is created later in schema.sql than

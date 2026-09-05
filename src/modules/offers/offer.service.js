@@ -8,6 +8,7 @@ const { limitOffset } = require('../../utils/pagination');
 const accessControl = require('../../services/accessControl');
 const entitlements = require('../../services/entitlements');
 const analyticsEvents = require('../../services/analyticsEvents');
+const visibilityEvents = require('../../services/visibility/visibilityAnalytics.service');
 const subscriptions = require('../subscriptions/subscription.service');
 const { FEATURES } = require('../../config/plans');
 const notifications = require('../../services/notifications');
@@ -885,6 +886,36 @@ async function trackEvent(offerId, { event, branchId, city, latitude, longitude 
 
   // Feeds the new-vs-returning split (§14) without a second pass over events.
   if (user) await analyticsEvents.touchShopCustomer(offer.shop_id, user.id);
+
+  /**
+   * Mirror into the visibility stream (Visibility §32).
+   *
+   * Recorded here rather than left to `analyticsEvents`' mirror, because this
+   * path never calls it: an offer view lands in `offer_views`, its own table,
+   * and nothing else. Without this the strongest mid-funnel signal there is -
+   * a customer actually opening an offer - reached neither the ranking's
+   * ENGAGEMENT factor (§2.4) nor the merchant's "Opened" counter (§15), and
+   * both would have read zero forever while looking perfectly healthy.
+   *
+   * Only 'view' is mirrored. Impressions arrive from the client with a surface
+   * and a rank attached (§32), and a second copy from here with neither would
+   * corrupt the average-position figure §15 reports.
+   */
+  if (event === 'view') {
+    visibilityEvents
+      .record({
+        eventType: 'VIEW',
+        listingType: 'offer',
+        listingId: Number(offerId),
+        shopId: offer.shop_id,
+        branchId: branchId ?? null,
+        userId: user?.id ?? null,
+        city: resolvedCity,
+        latitude: latitude ?? null,
+        longitude: longitude ?? null,
+      })
+      .catch(() => {});
+  }
 }
 
 /**

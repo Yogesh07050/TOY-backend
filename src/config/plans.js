@@ -45,6 +45,17 @@ const FEATURES = {
   PRIORITY_SUPPORT: 'PRIORITY_SUPPORT',
   PRIORITY_DISCOVERY: 'PRIORITY_DISCOVERY',
 
+  // Visibility & Promotion (§3, §7, §12, §15, §16).
+  //
+  // These name *eligibility*, never placement. ENHANCED_DISCOVERY and
+  // PRIORITY_DISCOVERY raise how much the SUBSCRIPTION factor contributes to a
+  // listing's score; neither reorders anything on its own, which is what keeps
+  // §21's "no permanent #1 position" true no matter which plan a shop is on.
+  ENHANCED_DISCOVERY: 'ENHANCED_DISCOVERY',
+  FEATURED_PLACEMENTS: 'FEATURED_PLACEMENTS',
+  VISIBILITY_ANALYTICS: 'VISIBILITY_ANALYTICS',
+  VISIBILITY_ANALYTICS_ADVANCED: 'VISIBILITY_ANALYTICS_ADVANCED',
+
   // Services (V4)
   SERVICE_SCHEDULING: 'SERVICE_SCHEDULING',
   SERVICE_ANALYTICS_BASIC: 'SERVICE_ANALYTICS_BASIC',
@@ -78,6 +89,10 @@ const FEATURE_LABELS = {
   NOTIFICATIONS_ADVANCED: 'Advanced notifications',
   PRIORITY_SUPPORT: 'Priority support',
   PRIORITY_DISCOVERY: 'Priority customer app discovery',
+  ENHANCED_DISCOVERY: 'Enhanced customer app discovery',
+  FEATURED_PLACEMENTS: 'Featured promotional placements',
+  VISIBILITY_ANALYTICS: 'Visibility & reach analytics',
+  VISIBILITY_ANALYTICS_ADVANCED: 'Advanced visibility & campaign analytics',
   SERVICE_SCHEDULING: 'Service scheduling',
   SERVICE_ANALYTICS_BASIC: 'Basic service analytics',
   SERVICE_ANALYTICS_ADVANCED: 'Advanced service analytics',
@@ -135,6 +150,8 @@ const PLANS = {
       FEATURES.CLAIMS_ANALYTICS,
       FEATURES.SERVICE_SCHEDULING,
       FEATURES.SERVICE_ANALYTICS_BASIC,
+      FEATURES.ENHANCED_DISCOVERY,
+      FEATURES.VISIBILITY_ANALYTICS,
     ],
   },
 
@@ -187,6 +204,10 @@ const PLANS = {
       FEATURES.SERVICE_SCHEDULING,
       FEATURES.SERVICE_ANALYTICS_BASIC,
       FEATURES.SERVICE_ANALYTICS_ADVANCED,
+      FEATURES.ENHANCED_DISCOVERY,
+      FEATURES.FEATURED_PLACEMENTS,
+      FEATURES.VISIBILITY_ANALYTICS,
+      FEATURES.VISIBILITY_ANALYTICS_ADVANCED,
     ],
   },
 };
@@ -248,6 +269,8 @@ const COMPARISON_MATRIX = [
   { label: 'Notifications', values: ['Basic', 'Standard', 'Advanced'] },
   { label: 'Priority support', values: [false, 'Standard', 'Priority'] },
   { label: 'Customer app exposure', values: [true, true, 'Priority discovery'] },
+  { label: 'Featured placements', values: [false, false, true] },
+  { label: 'Visibility analytics', values: [false, 'Standard', 'Advanced'] },
   { label: 'Services per month', values: ['1', 'Unlimited', 'Unlimited'] },
   { label: 'Service scheduling', values: [false, true, true] },
   { label: 'Service analytics', values: [false, 'Basic', 'Advanced'] },

@@ -253,6 +253,12 @@ router.post(
         // analytics_events.offer_id has a foreign key to `offers`, so a service
         // redemption is tagged by shop and branch alone.
         offerId: kind === 'offer' ? Number(row.offer_id) : null,
+        // `row.offer_id` is aliased from `service_offer_id` for a service
+        // claim, so this names the service offer without a second lookup. The
+        // visibility stream has no FK to `offers` and can therefore credit a
+        // verified service redemption to the listing that earned it - which
+        // §2.4 makes the strongest ranking signal on the platform.
+        serviceOfferId: kind === 'service_offer' ? Number(row.offer_id) : null,
         userId: Number(row.user_id),
         branchId: branch,
       },
