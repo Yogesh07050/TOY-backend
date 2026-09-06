@@ -89,6 +89,10 @@ function mapListing(entry, { includeScore = false } = {}) {
     longitude: row.longitude === null || row.longitude === undefined ? null : Number(row.longitude),
     isSaved: Boolean(row.is_saved),
     featured: false,
+    // Carried for impression attribution (§16), not for display: the nearest
+    // applicable branch and its city.
+    branchId: row.branch_id === null || row.branch_id === undefined ? null : Number(row.branch_id),
+    branchCity: row.branch_city ?? null,
     shop: {
       id: Number(row.shop_id),
       name: row.shop_name,

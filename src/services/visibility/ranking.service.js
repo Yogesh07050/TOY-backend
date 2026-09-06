@@ -236,6 +236,7 @@ function buildCandidateSql(params, user, poolSize) {
            ${nearest(branchPredicateOffer, 'latitude')} AS latitude,
            ${nearest(branchPredicateOffer, 'longitude')} AS longitude,
            ${nearest(branchPredicateOffer, 'id')} AS branch_id,
+           ${nearest(branchPredicateOffer, 'city')} AS branch_city,
            ${distanceOf(branchPredicateOffer)} AS distance_km,
            ${offerSaved}
       FROM offers o
@@ -267,6 +268,7 @@ function buildCandidateSql(params, user, poolSize) {
            ${nearest(branchPredicateService, 'latitude')} AS latitude,
            ${nearest(branchPredicateService, 'longitude')} AS longitude,
            ${nearest(branchPredicateService, 'id')} AS branch_id,
+           ${nearest(branchPredicateService, 'city')} AS branch_city,
            ${distanceOf(branchPredicateService)} AS distance_km,
            ${serviceSaved}
       FROM service_offers so
@@ -281,7 +283,15 @@ function buildCandidateSql(params, user, poolSize) {
   // order: latitude, longitude, branch_id, distance_km. Getting this wrong
   // shifts every following placeholder, so the order is spelled out rather
   // than inferred.
-  const perHalfDistance = [...distanceParams, ...distanceParams, ...distanceParams, ...distanceParams];
+  // One set per `distanceKmSql()` occurrence in a half's SELECT list, in text
+  // order: latitude, longitude, branch_id, branch_city, distance_km.
+  const perHalfDistance = [
+    ...distanceParams,
+    ...distanceParams,
+    ...distanceParams,
+    ...distanceParams,
+    ...distanceParams,
+  ];
 
   const parts = [];
   const unionParams = [];

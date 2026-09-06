@@ -310,6 +310,18 @@ const DEFAULT_RULES = {
   // nothing new can ever rank. It is scored at this until it has data.
   coldStartEngagementScore: 0.25,
 
+  // §16's "visibility by location" needs a coarse place name for the customer,
+  // and neither the app nor the web client knows one - a device fix is a pair of
+  // coordinates, not a city. Reverse geocoding every impression is not an option
+  // (the provider allows about one request a second), so the city of the nearest
+  // branch the customer was actually shown stands in for it.
+  //
+  // Only within this radius. Beyond it the nearest shop says nothing about where
+  // the customer is, and labelling someone 60 km away with that city would put a
+  // confident wrong answer in front of a merchant - worse than the blank it
+  // replaces. Outside the radius the impression keeps its coordinates and no city.
+  cityAttributionRadiusKm: 25,
+
   // §9's "required promotional content is complete", as a quality threshold.
   // Below this a listing is not considered fit for a prominent position, no
   // matter what its shop is paying.

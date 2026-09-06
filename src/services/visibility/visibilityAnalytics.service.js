@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const { query, execute, rawQuery } = require('../../db/pool');
 const logger = require('../../utils/logger');
 const vis = require('../../config/visibility');
+const { DEFAULT_RULES: rules } = vis;
 
 /**
  * VisibilityAnalyticsService (§30): "Records and aggregates visibility events."
@@ -157,11 +158,27 @@ async function record(events) {
 const recentImpressions = new Map();
 const IMPRESSION_DEDUPE_MS = 10 * 60 * 1000;
 
-function alreadyCounted(key, now) {
-  const seenAt = recentImpressions.get(key);
-  if (seenAt && now - seenAt < IMPRESSION_DEDUPE_MS) return true;
-  recentImpressions.set(key, now);
-  return false;
+/**
+ * Whether this impression was already counted, and whether the one we counted
+ * knew where the customer was.
+ *
+ * The second half matters more than it looks. A ranked screen renders before
+ * location resolves, so a session's *first* page is served - and counted -
+ * with no coordinates; the located refetch that follows a second later is then
+ * correctly suppressed as a duplicate. The net effect was that the first
+ * surface of every session contributed nothing to §16's visibility-by-location,
+ * and since Home is where most sessions land, that was most of the data.
+ */
+function impressionState(key, now, located) {
+  const entry = recentImpressions.get(key);
+  if (entry && now - entry.at < IMPRESSION_DEDUPE_MS) {
+    // Only worth revisiting if this view knows something the counted one did not.
+    const backfill = located && !entry.located;
+    if (backfill) entry.located = true;
+    return { counted: true, backfill };
+  }
+  recentImpressions.set(key, { at: now, located });
+  return { counted: false, backfill: false };
 }
 
 /**
@@ -171,8 +188,81 @@ function alreadyCounted(key, now) {
  */
 function pruneImpressionKeys(now) {
   if (recentImpressions.size < 10000) return;
-  for (const [key, seenAt] of recentImpressions) {
-    if (now - seenAt >= IMPRESSION_DEDUPE_MS) recentImpressions.delete(key);
+  for (const [key, entry] of recentImpressions) {
+    if (now - entry.at >= IMPRESSION_DEDUPE_MS) recentImpressions.delete(key);
+  }
+}
+
+/**
+ * Adds the location to impressions that were counted before it was known.
+ *
+ * An UPDATE rather than a second INSERT: the customer saw these listings once,
+ * and recording a second impression to capture the coordinates would inflate
+ * the merchant's reach to fix an analytics gap - trading a real number for a
+ * softer one. Matched on the natural key so no row id has to be threaded
+ * through the write path.
+ *
+ * Best-effort and never awaited, like every other write here.
+ */
+/**
+ * The city to attribute an impression to, or null when nothing honest applies.
+ */
+function cityFor(item) {
+  if (!item.branchCity) return null;
+  const distance = item.distanceKm;
+  if (distance === null || distance === undefined) return null;
+  return distance <= rules.cityAttributionRadiusKm ? item.branchCity : null;
+}
+
+function backfillLocation(items, context, identityColumn, identityValue) {
+  if (!items.length) return;
+
+  // City and branch differ per listing - they describe the branch *that
+  // listing* was nearest to - so a single blanket UPDATE cannot carry them.
+  // Grouping by the (city, branch) pair keeps this to the handful of
+  // statements those values actually take, which in practice is one or two:
+  // listings near the same customer are usually near the same branch.
+  const groups = new Map();
+  for (const item of items) {
+    const city = context.city ?? cityFor(item);
+    const branchId = item.branchId ?? null;
+    const key = `${city ?? ''}|${branchId ?? ''}`;
+    const group = groups.get(key) ?? { city, branchId, ids: [] };
+    group.ids.push(item.id);
+    groups.set(key, group);
+  }
+
+  // A promoted card and an organic one can be the same listing on the same
+  // surface, and they are separate impressions with separate rows. Without this
+  // split the featured pass - which has no distance, so no city - filled in the
+  // coordinates for both, and the organic pass that *did* know the city then
+  // matched nothing because its `latitude IS NULL` guard was already satisfied.
+  const placementScope = items[0]?.featured ? 'placement_type IS NOT NULL' : 'placement_type IS NULL';
+
+  const windowMinutes = Math.round(IMPRESSION_DEDUPE_MS / 60000);
+  for (const { city, branchId, ids } of groups.values()) {
+    execute(
+      `UPDATE visibility_events
+          SET latitude = ?, longitude = ?,
+              city = COALESCE(city, ?),
+              branch_id = COALESCE(branch_id, ?)
+        WHERE ${identityColumn} = ?
+          AND surface = ?
+          AND ${placementScope}
+          AND listing_id IN (${ids.map(() => '?').join(',')})
+          AND latitude IS NULL
+          AND created_at >= DATE_SUB(NOW(), INTERVAL ? MINUTE)`,
+      [
+        context.latitude,
+        context.longitude,
+        city,
+        branchId,
+        identityValue,
+        context.surface,
+        ...ids,
+        windowMinutes,
+      ],
+    ).catch(() => {});
   }
 }
 
@@ -212,15 +302,25 @@ function recordImpressions(items, context) {
   // dropped ahead of it - a listing that ranked fourth would be recorded as
   // first, and §15's "average position" would quietly become fiction.
   const ranked = items.map((item, index) => ({ item, position: index + 1 }));
-  const fresh = who
-    ? ranked.filter(
-        ({ item }) =>
-          !alreadyCounted(
-            `${who}:${context.surface}:${item.featured ? 'f' : 'o'}:${item.listingType ?? 'offer'}:${item.id}`,
-            now,
-          ),
-      )
-    : ranked;
+  const located = context.latitude !== null && context.latitude !== undefined;
+
+  const fresh = [];
+  const needLocation = [];
+  for (const entry of ranked) {
+    if (!who) {
+      fresh.push(entry);
+      continue;
+    }
+    const key = `${who}:${context.surface}:${entry.item.featured ? 'f' : 'o'}:${entry.item.listingType ?? 'offer'}:${entry.item.id}`;
+    const state = impressionState(key, now, located);
+    if (!state.counted) fresh.push(entry);
+    else if (state.backfill) needLocation.push(entry.item);
+  }
+
+  if (needLocation.length && located) {
+    const column = context.identity?.userId ? 'user_id' : 'session_id';
+    backfillLocation(needLocation, context, column, context.identity?.userId ?? context.identity?.sessionId);
+  }
   if (!fresh.length) return;
 
   const events = fresh.map(({ item, position }) => ({
@@ -237,8 +337,12 @@ function recordImpressions(items, context) {
     categoryId: item.category?.id ?? item.categoryId ?? null,
     position,
     distanceKm: item.distanceKm ?? null,
+    branchId: item.branchId ?? null,
     ...context.identity,
-    city: context.city ?? null,
+    // The customer's coarse location: whatever the caller knew, else the city
+    // of the nearest branch they were shown - but only when that branch is
+    // close enough for its city to describe where they are (§16).
+    city: context.city ?? cityFor(item),
     latitude: context.latitude ?? null,
     longitude: context.longitude ?? null,
     term: context.term ?? null,
