@@ -2,6 +2,7 @@
 
 const { query, queryOne, execute, rawQuery } = require('../../db/pool');
 const ApiError = require('../../utils/ApiError');
+const geo = require('../../utils/geo');
 const vis = require('../../config/visibility');
 const config = require('./config');
 const fairness = require('./fairness');
@@ -299,6 +300,90 @@ async function resolveSlot(slotCode, context = {}) {
 }
 
 /**
+ * Attaches the nearest applicable branch to each served item.
+ *
+ * Featured placements had no distance at all, which meant §16 could not
+ * attribute a city to a promoted impression the way it does an organic one -
+ * so location analytics silently counted organic reach only.
+ *
+ * Resolved here rather than inside `promotion.listingRow`, which is also the
+ * write-time eligibility check: that path has no customer and no coordinates,
+ * and giving it an optional position it ignores would be a worse shape than
+ * one extra query on the read path that actually needs it.
+ *
+ * One query per listing kind for the whole rail - a slot serves a handful of
+ * items, not a page - and only when a position is known.
+ */
+async function attachNearestBranch(items, context) {
+  if (context.latitude === undefined || context.longitude === undefined) return;
+
+  const distanceParams = geo.distanceKmParams(context.latitude, context.longitude);
+  const nearest = (predicate, column) =>
+    `(SELECT b.${column} FROM shop_branches b
+       WHERE b.status = 'active' AND b.latitude IS NOT NULL AND b.longitude IS NOT NULL
+         AND ${predicate}
+       ORDER BY ${geo.distanceKmSql('b.latitude', 'b.longitude')} ASC LIMIT 1)`;
+  const distanceOf = (predicate) =>
+    `(SELECT MIN(${geo.distanceKmSql('b.latitude', 'b.longitude')}) FROM shop_branches b
+       WHERE b.status = 'active' AND b.latitude IS NOT NULL AND b.longitude IS NOT NULL
+         AND ${predicate})`;
+
+  const offerPredicate = `((o.applicability_type = 'shop_wide' AND b.shop_id = o.shop_id)
+     OR (o.applicability_type = 'selected_branches' AND EXISTS (
+          SELECT 1 FROM offer_locations ol WHERE ol.offer_id = o.id AND ol.branch_id = b.id)))`;
+  const servicePredicate = `((sv.applicability_type = 'shop_wide' AND b.shop_id = sv.shop_id)
+     OR (sv.applicability_type = 'selected_branches' AND EXISTS (
+          SELECT 1 FROM service_locations sl WHERE sl.service_id = sv.id AND sl.branch_id = b.id)))`;
+
+  const byKind = {
+    offer: items.filter((item) => item.listingType === vis.LISTING_TYPES.OFFER).map((item) => item.id),
+    service_offer: items
+      .filter((item) => item.listingType === vis.LISTING_TYPES.SERVICE_OFFER)
+      .map((item) => item.id),
+  };
+
+  const resolved = new Map();
+
+  if (byKind.offer.length) {
+    const rows = await rawQuery(
+      `SELECT o.id,
+              ${nearest(offerPredicate, 'id')} AS branch_id,
+              ${nearest(offerPredicate, 'city')} AS branch_city,
+              ${distanceOf(offerPredicate)} AS distance_km
+         FROM offers o WHERE o.id IN (${byKind.offer.map(() => '?').join(',')})`,
+      // One parameter set per distanceKmSql() occurrence, in text order.
+      [...distanceParams, ...distanceParams, ...distanceParams, ...byKind.offer],
+    );
+    for (const row of rows) resolved.set(`offer:${row.id}`, row);
+  }
+
+  if (byKind.service_offer.length) {
+    const rows = await rawQuery(
+      `SELECT so.id,
+              ${nearest(servicePredicate, 'id')} AS branch_id,
+              ${nearest(servicePredicate, 'city')} AS branch_city,
+              ${distanceOf(servicePredicate)} AS distance_km
+         FROM service_offers so
+         JOIN services sv ON sv.id = so.service_id
+        WHERE so.id IN (${byKind.service_offer.map(() => '?').join(',')})`,
+      [...distanceParams, ...distanceParams, ...distanceParams, ...byKind.service_offer],
+    );
+    for (const row of rows) resolved.set(`service_offer:${row.id}`, row);
+  }
+
+  for (const item of items) {
+    const row = resolved.get(`${item.listingType}:${item.id}`);
+    if (!row) continue;
+    item.branchId = row.branch_id === null ? null : Number(row.branch_id);
+    item.branchCity = row.branch_city ?? null;
+    item.distanceKm =
+      row.distance_km === null || row.distance_km === undefined
+        ? null
+        : Number(Number(row.distance_km).toFixed(2));
+  }
+}
+
+/**
  * Serves a placement as flat, renderable items.
  *
  * Each item is tagged `featured: true` with its campaign and slot, which is
@@ -347,7 +432,11 @@ async function serve(placementType, context = {}, { limit = 10 } = {}) {
     if (items.length >= limit) break;
   }
 
-  return items.slice(0, limit);
+  const served = items.slice(0, limit);
+  // §16: a promoted impression should be attributable to a place the same way
+  // an organic one is.
+  await attachNearestBranch(served, context);
+  return served;
 }
 
 /**

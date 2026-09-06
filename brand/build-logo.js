@@ -202,6 +202,15 @@ async function build() {
   // transparent and is centred by expo-splash-screen itself.
   await wide(gloss, 900, { out: path.join(APP, 'splash-icon.png') });
 
+  // In-app header mark. Transparent, because it sits on whatever the screen
+  // behind it is painted - cream in light mode, near-black in dark - and a
+  // baked-in background would show as a pale rectangle on one of them.
+  //
+  // `wide` rather than `square`: the mark is 146x94, so a square canvas would
+  // letterbox it and leave the header's leading edge padded with nothing.
+  // 192px carries a ~28pt header on a 3x screen with room to spare.
+  await wide(gloss, 192, { out: path.join(APP, 'logo-header.png') });
+
   // Android adaptive icon: a solid cream plate plus a foreground kept well
   // inside the mask's safe zone. The blue plate this replaces was the one
   // Expo ships in its template.
