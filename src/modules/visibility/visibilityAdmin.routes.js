@@ -55,6 +55,21 @@ router.use(requireGlobalPermission('MANAGE_VISIBILITY'));
  * — the kind of mismatch that is invisible in a unit test and obvious the
  * moment a person clicks the button.
  */
+/**
+ * The rules response, in one place.
+ *
+ * GET and PUT must answer with the same shape. They did not: PUT returned only
+ * `rules`, the client's type promised `defaults` as well, and the admin screen
+ * read `defaults[key]` straight after a save - which threw, silently, in a
+ * component that had already rendered. The value was saved correctly, so the
+ * only symptom was a console error and a "· default N" comparison that stopped
+ * appearing. Found by reading the browser console during end-to-end testing.
+ */
+async function rulesDocument() {
+  const current = await config.get();
+  return { rules: current.rules, defaults: vis.DEFAULT_RULES };
+}
+
 async function weightsDocument() {
   const current = await config.get();
   return {
@@ -145,7 +160,7 @@ router.get(
   '/rules',
   asyncHandler(async (_req, res) => {
     const current = await config.get();
-    ok(res, { rules: current.rules, defaults: vis.DEFAULT_RULES });
+    ok(res, await rulesDocument());
   }),
 );
 
@@ -184,8 +199,7 @@ router.put(
       newValue: req.body,
     });
 
-    const after = await config.get();
-    ok(res, { rules: after.rules });
+    ok(res, await rulesDocument());
   }),
 );
 

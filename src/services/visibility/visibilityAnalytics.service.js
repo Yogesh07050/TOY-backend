@@ -508,6 +508,13 @@ async function premiumInsights(shopIds, range, { limit = 10 } = {}) {
 
   const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
+  // §16 lists "best-performing offers", and an offer a merchant cannot name is
+  // not an answer - "offer #6" tells them nothing they can act on. The event
+  // stream stores ids, so the titles are resolved here rather than left to the
+  // client, which would otherwise need a second round trip per row to render a
+  // list it already has.
+  const titles = await listingTitles(byOffer);
+
   return {
     byBranch: byBranch.map((row) => ({
       branchId: Number(row.branch_id),
@@ -522,6 +529,7 @@ async function premiumInsights(shopIds, range, { limit = 10 } = {}) {
     bestPerformingOffers: byOffer.map((row) => ({
       listingType: row.listing_type,
       listingId: Number(row.listing_id),
+      title: titles.get(`${row.listing_type}:${row.listing_id}`) ?? null,
       impressions: num(row.organic_impressions) + num(row.featured_impressions),
       views: num(row.views),
       saves: num(row.saves),
@@ -554,6 +562,42 @@ async function premiumInsights(shopIds, range, { limit = 10 } = {}) {
           : null,
     })),
   };
+}
+
+/**
+ * Titles for a mixed set of listing rows, in two queries rather than one per
+ * row. Offers and service offers keep their names in different tables, and a
+ * shop row is named by the shop itself.
+ */
+async function listingTitles(rows) {
+  const titles = new Map();
+  const idsOf = (type) => rows.filter((row) => row.listing_type === type).map((row) => Number(row.listing_id));
+
+  const offerIds = idsOf('offer');
+  const serviceIds = idsOf('service_offer');
+  const shopIds = idsOf('shop');
+
+  const [offers, services, shops] = await Promise.all([
+    offerIds.length
+      ? query(`SELECT id, title FROM offers WHERE id IN (${offerIds.map(() => '?').join(',')})`, offerIds)
+      : [],
+    serviceIds.length
+      ? query(
+          `SELECT so.id, sv.name AS title FROM service_offers so
+             JOIN services sv ON sv.id = so.service_id
+            WHERE so.id IN (${serviceIds.map(() => '?').join(',')})`,
+          serviceIds,
+        )
+      : [],
+    shopIds.length
+      ? query(`SELECT id, name AS title FROM shops WHERE id IN (${shopIds.map(() => '?').join(',')})`, shopIds)
+      : [],
+  ]);
+
+  for (const row of offers) titles.set(`offer:${row.id}`, row.title);
+  for (const row of services) titles.set(`service_offer:${row.id}`, row.title);
+  for (const row of shops) titles.set(`shop:${row.id}`, row.title);
+  return titles;
 }
 
 // ---------------------------------------------------------------------------

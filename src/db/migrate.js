@@ -14,6 +14,7 @@ const mysql = require('mysql2/promise');
 const env = require('../config/env');
 const featureCatalogue = require('../config/featureCatalogue');
 const visibility = require('../config/visibility');
+const permissions = require('../config/permissions');
 
 const FRESH = process.argv.includes('--fresh');
 
@@ -720,6 +721,54 @@ const STATEMENT_PATCHES = [
           [limit.scope, limit.placementType, limit.appliesTo, limit.maxImpressions, limit.windowMinutes],
         );
       }
+    },
+  },
+  {
+    name: 'visibility permissions exist and Super Admin holds them',
+    // The grant patch below joins `permissions` by name, and the whole
+    // permission system resolves through that table - so without these rows the
+    // grant silently matches nothing and every Super Admin visibility screen
+    // answers 403 on an install that ran the migration but not the seeder.
+    //
+    // That is the normal deployment path: `db:seed` also inserts demo shops and
+    // offers, which nobody wants to run against production data. So the rows a
+    // *release* needs are created here, and the seeder keeps owning demo
+    // content. Found by end-to-end testing against a restored database, where
+    // the migration reported complete success and the admin screens still 403'd.
+    check: async (connection) => {
+      const [rows] = await connection.query(
+        `SELECT COUNT(*) AS missing FROM (
+           SELECT 'MANAGE_VISIBILITY' AS name UNION ALL SELECT 'MANAGE_FEATURED_CAMPAIGNS'
+           UNION ALL SELECT 'APPROVE_FEATURED_CAMPAIGN' UNION ALL SELECT 'VIEW_VISIBILITY_ANALYTICS'
+         ) wanted
+          WHERE NOT EXISTS (SELECT 1 FROM permissions p WHERE p.name = wanted.name)`,
+      );
+      return Number(rows[0].missing) > 0;
+    },
+    run: async (connection) => {
+      for (const name of [
+        'MANAGE_VISIBILITY',
+        'MANAGE_FEATURED_CAMPAIGNS',
+        'APPROVE_FEATURED_CAMPAIGN',
+        'VIEW_VISIBILITY_ANALYTICS',
+      ]) {
+        const entry = permissions.PERMISSIONS[name];
+        await connection.query(
+          `INSERT INTO permissions (name, description, category) VALUES (?, ?, ?)
+           ON DUPLICATE KEY UPDATE description = VALUES(description), category = VALUES(category)`,
+          [name, entry.description, entry.category],
+        );
+      }
+      // Super Admin holds every permission by definition (§4), and a permission
+      // added after the role was seeded is not granted retroactively by anything
+      // else.
+      await connection.query(
+        `INSERT IGNORE INTO role_permissions (role_id, permission_id)
+         SELECT r.id, p.id FROM roles r
+           JOIN permissions p ON p.name IN ('MANAGE_VISIBILITY','MANAGE_FEATURED_CAMPAIGNS',
+                                            'APPROVE_FEATURED_CAMPAIGN','VIEW_VISIBILITY_ANALYTICS')
+          WHERE r.name = 'SUPER_ADMIN'`,
+      );
     },
   },
   {
